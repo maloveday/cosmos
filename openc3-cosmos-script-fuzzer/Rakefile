@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+PLUGIN_NAME = Dir['*.gemspec'][0].split('.')[0..-2].join('.')
+
+task :require_version do
+  unless ENV['VERSION']
+    puts "VERSION is required: rake build VERSION=X.X.X"
+    exit 1
+  end
+end
+
+desc 'Build the plugin gem: rake build VERSION=X.X.X'
+task :build => [:require_version] do
+  system("gem build #{PLUGIN_NAME}") || abort('gem build failed')
+end
+
+desc 'Run the fuzzer against the bundled sample procedure (in-memory backend)'
+task :sample do
+  sh 'python microservices/FUZZER/fuzzer_cli.py --script examples/sample_test.py --in-memory --seed 1 --output sample_report.html'
+end
+
+task :default => :build

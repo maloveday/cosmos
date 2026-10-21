@@ -1,0 +1,8 @@
+VARIABLE fuzzer_job_queue openc3-script-fuzzer:jobs
+
+# Headless Script Runner fuzzer. Jobs are JSON documents pushed onto the
+# Redis list <%= fuzzer_job_queue %>; HTML reports are stored under
+# openc3-script-fuzzer:report:<job_id>.
+MICROSERVICE FUZZER script-fuzzer
+  CMD python fuzzer_microservice.py
+  ENV FUZZER_JOB_QUEUE <%= fuzzer_job_queue %>
