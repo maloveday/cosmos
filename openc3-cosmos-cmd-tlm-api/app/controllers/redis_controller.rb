@@ -28,16 +28,17 @@ class RedisController < ApplicationController
     # Check that we allow this command
     command = args[0].upcase
     if DISALLOWED_COMMANDS.include? command
-      render json: { status: 'error', message: "The #{command} command is not allowed." }, status: 422
+      render json: { status: 'error', message: "The #{command} command is not allowed." }, status: :unprocessable_entity
       return
     end
 
+    db_shard = (params[:db_shard] || 0).to_i
     if params[:ephemeral]
-      result = OpenC3::EphemeralStore.method_missing(command, args[1..-1])
+      result = OpenC3::EphemeralStore.instance(db_shard: db_shard).public_send(command, args[1..-1])
     else
-      result = OpenC3::Store.method_missing(command, args[1..-1])
+      result = OpenC3::Store.instance(db_shard: db_shard).public_send(command, args[1..-1])
     end
-    OpenC3::Logger.info("Redis command executed: #{args} - with result #{result}", user: username())
-    render json: { :result => result }, status: 201
+    OpenC3::Logger.info("Redis command executed (db_shard #{db_shard}): #{args} - with result #{result}", user: username())
+    render json: { :result => result }, status: :created
   end
 end

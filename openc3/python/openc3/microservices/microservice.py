@@ -13,9 +13,11 @@ import atexit
 import contextlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
+import time
 import traceback
 
 from openc3.environment import OPENC3_CONFIG_BUCKET
@@ -83,7 +85,13 @@ class Microservice:
         if self.error is not None:
             json["error"] = repr(self.error)
         if self.custom is not None:
-            json["custom"] = self.custom.as_json()
+            # Ruby's Hash#as_json exists but Python dicts have no as_json
+            # so allow plain dicts (or anything JSON serializable) directly
+            as_json = getattr(self.custom, "as_json", None)
+            if callable(as_json):
+                json["custom"] = as_json()
+            else:
+                json["custom"] = self.custom
         return json
 
     def __init__(self, name, is_plugin=False):
@@ -95,6 +103,7 @@ class Microservice:
         split_name = name.split("__")
         if len(split_name) != 3:
             raise RuntimeError(f"Name {name} doesn't match convention of SCOPE__TYPE__NAME")
+        microservice_type = split_name[1].upper()
 
         self.scope = split_name[0]
         global openc3_scope
@@ -110,8 +119,12 @@ class Microservice:
 
         # OpenC3.setup_open_telemetry(self.name, False)
 
+        self.temp_dir = f"{tempfile.gettempdir()}/{name}"
         # Create temp folder for this microservice
-        self.temp_dir = tempfile.TemporaryDirectory()
+        # This will already have been setup by plugin_microservice.rb if USER
+        if is_plugin or microservice_type != "USER":
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            os.mkdir(self.temp_dir)
 
         # Get microservice configuration from Redis
         self.config = MicroserviceModel.get(self.name, scope=self.scope)
@@ -127,13 +140,16 @@ class Microservice:
         if not hasattr(self, "topics") or self.topics is None:
             self.topics = []
         self.microservice_topic = f"MICROSERVICE__{self.name}"
+        self.db_shard = int(self.config.get("db_shard", 0) or 0)
 
         # Get configuration for any targets
         self.target_names = self.config.get("target_names")
         if self.target_names is None:
             self.target_names = []
         if not is_plugin:
-            System.setup_targets(self.target_names, self.temp_dir.name, scope=self.scope)
+            System.setup_targets(
+                self.target_names, self.temp_dir, scope=self.scope, descriptions=self.load_descriptions()
+            )
 
         # Use atexit to shutdown cleanly no matter how we die
         atexit.register(self.shutdown)
@@ -148,21 +164,39 @@ class Microservice:
             self.config["cmd"]
 
             # Get Microservice files from bucket storage
-            temp_dir = tempfile.TemporaryDirectory()
             bucket = OPENC3_CONFIG_BUCKET
             client = Bucket.get_client()
 
             prefix = f"{self.scope}/microservices/{self.name}/"
             file_count = 0
-            for object in client.list_objects(bucket=bucket, prefix=prefix):
-                response_target = os.path.join(temp_dir, object.key.split(prefix)[-1])
-                os.makedirs(os.path.dirname(response_target), exist_ok=True)
-                client.get_object(bucket=bucket, key=object.key, path=response_target)
-                file_count += 1
+            # Tolerate transient object store failures during startup. On a busy
+            # or underpowered cluster the bucket store (e.g. MinIO) can be
+            # briefly unreachable while many microservices start at once. Rather
+            # than crash and CrashLoopBackOff (which can outlast deploy
+            # timeouts), retry for a bounded time before giving up.
+            startup_timeout = float(os.environ.get("OPENC3_MICROSERVICE_STARTUP_BUCKET_TIMEOUT", 60))
+            startup_deadline = time.time() + startup_timeout
+            while True:
+                try:
+                    file_count = 0
+                    for object in client.list_objects(bucket=bucket, prefix=prefix):
+                        response_target = os.path.join(self.temp_dir, object.key.split(prefix)[-1])
+                        os.makedirs(os.path.dirname(response_target), exist_ok=True)
+                        client.get_object(bucket=bucket, key=object.key, path=response_target)
+                        file_count += 1
+                    break
+                except Exception as error:
+                    if time.time() >= startup_deadline:
+                        raise
+                    self.logger.warn(
+                        f"Microservice {self.name} startup: bucket access failed "
+                        f"({type(error).__name__}: {error}); retrying for up to {int(startup_timeout)}s"
+                    )
+                    time.sleep(5)
 
             # Adjust @work_dir to microservice files downloaded if files and a relative path
             if file_count > 0 and self.work_dir[0] != "/":
-                self.work_dir = os.path.join(temp_dir, self.work_dir)
+                self.work_dir = os.path.join(self.temp_dir, self.work_dir)
 
             # TODO: Check Syntax on any python files
             # ruby_filename = None
@@ -192,6 +226,11 @@ class Microservice:
     def run(self):
         self.shutdown()
 
+    # Whether System keeps packet and item descriptions. Subclasses that never
+    # use them override this to return False to reduce memory.
+    def load_descriptions(self):
+        return True
+
     def shutdown(self, state="STOPPED"):
         if self.shutdown_complete:
             return  # Nothing more to do
@@ -205,8 +244,7 @@ class Microservice:
         with contextlib.suppress(Exception):
             # Ignore Redis failures during shutdown
             MicroserviceStatusModel.set(self.as_json(), scope=self.scope)
-        if self.temp_dir is not None:
-            self.temp_dir.cleanup()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
         self.metric.shutdown()
         with contextlib.suppress(Exception):
             # Ignore Redis failures during shutdown
@@ -216,7 +254,7 @@ class Microservice:
     def setup_microservice_topic(self):
         self.topics.append(self.microservice_topic)
         thread_id = threading.get_native_id()
-        ephemeral_store_instance = EphemeralStore.instance()
+        ephemeral_store_instance = EphemeralStore.instance(db_shard=self.db_shard)
         if thread_id not in ephemeral_store_instance.topic_offsets:
             ephemeral_store_instance.topic_offsets[thread_id] = {}
         ephemeral_store_instance.topic_offsets[thread_id][self.microservice_topic] = "0-0"
@@ -232,9 +270,9 @@ class Microservice:
                         self.topics.append(new_topic)
             else:
                 raise RuntimeError(f"Invalid topics given to microservice_cmd: {topics}")
-            Topic.trim_topic(topic, msg_id)
+            Topic.trim_topic(topic, msg_id, db_shard=self.db_shard)
             return True
-        Topic.trim_topic(topic, msg_id)
+        Topic.trim_topic(topic, msg_id, db_shard=self.db_shard)
         return False
 
     def _status_thread(self):

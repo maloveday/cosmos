@@ -10,25 +10,14 @@
 # if purchased from OpenC3, Inc.
 
 import json
-import re
 import time
 from typing import Any
-
-
-try:
-    import psycopg
-    from psycopg.rows import dict_row
-
-    PSYCOPG_AVAILABLE = True
-except ImportError:
-    PSYCOPG_AVAILABLE = False
 
 from openc3.environment import OPENC3_SCOPE
 from openc3.models.model import Model
 from openc3.models.target_model import TargetModel
 from openc3.utilities.json import JsonDecoder, JsonEncoder
-from openc3.utilities.logger import Logger
-from openc3.utilities.questdb_client import QuestDBClient
+from openc3.utilities.questdb_client import QuestDBClient, TlmItem
 from openc3.utilities.store import Store
 from openc3.utilities.store_queued import StoreQueued
 
@@ -40,8 +29,18 @@ class CvtModel(Model):
     VALUE_TYPES = {"RAW", "CONVERTED", "FORMATTED"}
 
     @classmethod
-    def build_json_from_packet(cls, packet):
-        return packet.decom()
+    def build_json_from_packet(cls, packet, include_limits_states=True):
+        return packet.decom(include_limits_states=include_limits_states)
+
+    @classmethod
+    def _store_for_target(cls, target_name, scope):
+        """Get a Store instance routed to the correct db_shard for a target."""
+        return Store.instance(db_shard=Store.db_shard_for_target(target_name, scope=scope))
+
+    @classmethod
+    def _store_queued_for_target(cls, target_name, scope):
+        """Get a StoreQueued instance routed to the correct db_shard for a target."""
+        return StoreQueued.instance(db_shard=Store.db_shard_for_target(target_name, scope=scope))
 
     @classmethod
     def delete(cls, target_name: str, packet_name: str, scope: str = OPENC3_SCOPE):
@@ -49,7 +48,7 @@ class CvtModel(Model):
         key = f"{scope}__tlm__{target_name}"
         tgt_pkt_key = key + f"__{packet_name}"
         CvtModel.packet_cache[tgt_pkt_key] = None
-        Store.hdel(key, packet_name)
+        cls._store_for_target(target_name, scope).hdel(key, packet_name)
 
     @classmethod
     def set(
@@ -66,9 +65,9 @@ class CvtModel(Model):
         tgt_pkt_key = key + f"__{packet_name}"
         CvtModel.packet_cache[tgt_pkt_key] = [time.time(), hash]
         if queued:
-            StoreQueued.hset(key, packet_name, packet_json)
+            cls._store_queued_for_target(target_name, scope).hset(key, packet_name, packet_json)
         else:
-            Store.hset(key, packet_name, packet_json)
+            cls._store_for_target(target_name, scope).hset(key, packet_name, packet_json)
 
     @classmethod
     def set_json(
@@ -90,9 +89,9 @@ class CvtModel(Model):
         tgt_pkt_key = key + f"__{packet_name}"
         CvtModel.packet_cache[tgt_pkt_key] = [time.time(), hash]
         if queued:
-            StoreQueued.hset(key, packet_name, packet_json)
+            cls._store_queued_for_target(target_name, scope).hset(key, packet_name, packet_json)
         else:
-            Store.hset(key, packet_name, packet_json)
+            cls._store_for_target(target_name, scope).hset(key, packet_name, packet_json)
 
     # Get the dict for packet in the CVT
     # Note: Does not apply overrides
@@ -111,9 +110,9 @@ class CvtModel(Model):
             cache_time, pkt_hash = CvtModel.packet_cache[tgt_pkt_key]
             if (now - cache_time) < cache_timeout:
                 return pkt_hash
-        packet = Store.hget(key, packet_name)
+        packet = cls._store_for_target(target_name, scope).hget(key, packet_name)
         if packet is None:
-            raise RuntimeError(f"Packet '{target_name} {packet_name}' does not exist")
+            raise RuntimeError(f"Packet '{target_name} {packet_name}' has no current values in CVT")
         pkt_hash = json.loads(packet, cls=JsonDecoder)
         CvtModel.packet_cache[tgt_pkt_key] = [now, pkt_hash]
         return pkt_hash
@@ -143,7 +142,7 @@ class CvtModel(Model):
                 pkt_hash[f"{item_name}__C"] = value
                 pkt_hash[item_name] = value
             case _:
-                raise RuntimeError(f"Unknown type '{type}' for {target_name} {packet_name} {item_name}")
+                raise RuntimeError(f"Unknown type '{type}' for {target_name} {packet_name} {item_name} (set_item)")
         cls.set(
             pkt_hash,
             target_name=target_name,
@@ -195,266 +194,7 @@ class CvtModel(Model):
         scope: str = OPENC3_SCOPE,
     ):
         """Query historical telemetry data from TSDB"""
-        if not PSYCOPG_AVAILABLE:
-            raise RuntimeError("psycopg is required for database operations but is not available")
-
-        tables = {}
-        names = []
-        nil_count = 0
-        # Cache packet definitions to avoid repeated lookups
-        packet_cache = {}
-        # Map column names to item type info for decoding
-        item_types = {}
-        # Track calculated timestamp items: { position: { source:, format:, table_index: } }
-        calculated_items = {}
-        # Track which timestamp columns we need per table
-        needed_timestamps = {}  # { table_index: set of column names }
-        current_position = 0
-
-        # Stored timestamp items that need conversion from timestamp_ns to float seconds
-        stored_timestamp_items = {"PACKET_TIMESECONDS", "RECEIVED_TIMESECONDS"}
-        # Track stored timestamp items: { position: { column:, table_index: } }
-        stored_timestamp_positions = {}
-
-        for item in items:
-            target_name, packet_name, item_name, value_type, limits = item
-            # They will all be None when item is a None value
-            # A None value indicates a value that does not exist as returned by get_tlm_available
-            if item_name is None:
-                # We know PACKET_TIMESECONDS always exists so we can use it to fill in the None value
-                names.append(f"PACKET_TIMESECONDS as __nil{nil_count}")
-                nil_count += 1
-                current_position += 1
-                continue
-
-            table_name, _ = QuestDBClient.sanitize_table_name(target_name, packet_name, scope=scope)
-            tables[table_name] = 1
-
-            # Find the index of this table
-            index = list(tables.keys()).index(table_name)
-
-            # Check if this is a stored timestamp item (PACKET_TIMESECONDS or RECEIVED_TIMESECONDS)
-            # These are stored as timestamp_ns columns and need conversion to float seconds on read
-            if item_name in stored_timestamp_items:
-                col_name = f"T{index}.{item_name}"
-                names.append(f'"{col_name}"')
-                stored_timestamp_positions[current_position] = {
-                    "column": col_name,
-                    "table_index": index,
-                }
-                current_position += 1
-                continue
-
-            # Check if this is a calculated timestamp item (PACKET_TIMEFORMATTED or RECEIVED_TIMEFORMATTED)
-            if item_name in QuestDBClient.TIMESTAMP_ITEMS:
-                ts_info = QuestDBClient.TIMESTAMP_ITEMS[item_name]
-                calculated_items[current_position] = {
-                    "source": ts_info["source"],
-                    "format": ts_info["format"],
-                    "table_index": index,
-                }
-                # Track that we need this timestamp column for this table
-                if index not in needed_timestamps:
-                    needed_timestamps[index] = set()
-                needed_timestamps[index].add(ts_info["source"])
-                current_position += 1
-                continue
-
-            safe_item_name = QuestDBClient.sanitize_column_name(item_name)
-
-            # Look up item type info from packet definition
-            cache_key = (target_name, packet_name)
-            if cache_key not in packet_cache:
-                try:
-                    packet_cache[cache_key] = TargetModel.packet(target_name, packet_name, scope=scope)
-                except RuntimeError:
-                    packet_cache[cache_key] = None
-
-            packet_def = packet_cache[cache_key]
-            item_def = None
-            if packet_def:
-                for pkt_item in packet_def.get("items", []):
-                    if pkt_item.get("name") == item_name:
-                        item_def = pkt_item
-                        break
-
-            if value_type == "FORMATTED" or value_type == "WITH_UNITS":
-                col_name = f"T{index}.{safe_item_name}__F"
-                names.append(f'"{col_name}"')
-                # Formatted values are always strings, no special decoding needed
-                item_types[col_name] = {"data_type": "STRING", "array_size": None}
-            elif value_type == "CONVERTED":
-                col_name = f"T{index}.{safe_item_name}__C"
-                names.append(f'"{col_name}"')
-                # Converted values may have different types based on read_conversion
-                if item_def:
-                    rc = item_def.get("read_conversion")
-                    if rc and rc.get("converted_type"):
-                        item_types[col_name] = {
-                            "data_type": rc.get("converted_type"),
-                            "array_size": item_def.get("array_size"),
-                        }
-                    elif item_def.get("states"):
-                        # State values are strings
-                        item_types[col_name] = {
-                            "data_type": "STRING",
-                            "array_size": None,
-                        }
-                    else:
-                        item_types[col_name] = {
-                            "data_type": item_def.get("data_type"),
-                            "array_size": item_def.get("array_size"),
-                        }
-                else:
-                    item_types[col_name] = {"data_type": None, "array_size": None}
-            else:
-                col_name = f"T{index}.{safe_item_name}"
-                names.append(f'"{col_name}"')
-                if item_def:
-                    item_types[col_name] = {
-                        "data_type": item_def.get("data_type"),
-                        "array_size": item_def.get("array_size"),
-                    }
-                else:
-                    item_types[col_name] = {"data_type": None, "array_size": None}
-
-            current_position += 1
-            if limits:
-                names.append(f'"T{index}.{safe_item_name}__L"')
-
-        # Add needed timestamp columns to the SELECT
-        # Track which column alias maps to which timestamp source for result processing
-        # Note: We use underscores in the alias name to avoid needing quotes, which psycopg includes in returned field names
-        timestamp_columns = {}  # { "T0___ts_timestamp": { table_index: 0, source: 'timestamp' } }
-        for table_index, ts_columns in needed_timestamps.items():
-            for ts_col in ts_columns:
-                alias_name = f"T{table_index}___ts_{ts_col}"
-                names.append(f"T{table_index}.{ts_col} as {alias_name}")
-                timestamp_columns[alias_name] = {
-                    "table_index": table_index,
-                    "source": ts_col,
-                }
-
-        # Build the SQL query
-        query = f"SELECT {', '.join(names)} FROM "
-        for index, (table_name, _) in enumerate(tables.items()):
-            if index == 0:
-                query += f"{table_name} as T{index} "
-            else:
-                query += f"ASOF JOIN {table_name} as T{index} "
-
-        query_params = []
-        if start_time and not end_time:
-            query += "WHERE T0.PACKET_TIMESECONDS < %s LIMIT -1"
-            query_params.append(start_time)
-        elif start_time and end_time:
-            query += "WHERE T0.PACKET_TIMESECONDS >= %s AND T0.PACKET_TIMESECONDS < %s"
-            query_params.append(start_time)
-            query_params.append(end_time)
-
-        retry_count = 0
-        while retry_count <= 4:
-            try:
-                conn = QuestDBClient.connection()
-                with conn.cursor(binary=True, row_factory=dict_row) as cursor:
-                    cursor.execute(query, query_params or None)
-                    result = cursor.fetchall()
-
-                    if not result:
-                        return {}
-                    else:
-                        data = []
-                        # Build up a results set that is an array of arrays
-                        # Each nested array is a set of 2 items: [value, limits state]
-                        # If the item does not have limits the limits state is None
-                        for row_index, row in enumerate(result):
-                            data.append([])
-                            col_index = 0
-                            # Store timestamp values for this row: { "T0.PACKET_TIMESECONDS": datetime, ... }
-                            row_timestamps = {}
-                            for col_name, col_value in row.items():
-                                if "__L" in col_name:
-                                    # This is a limits column, add to previous item
-                                    if col_index > 0:
-                                        data[row_index][col_index - 1] = [
-                                            data[row_index][col_index - 1][0],
-                                            col_value,
-                                        ]
-                                elif col_name.startswith("__nil"):
-                                    data[row_index].append([None, None])
-                                    col_index += 1
-                                elif re.match(r"^T(\d+)___ts_(.+)$", col_name):
-                                    # This is a timestamp column for calculated items (TIMEFORMATTED)
-                                    match = re.match(r"^T(\d+)___ts_(.+)$", col_name)
-                                    table_idx = int(match.group(1))
-                                    ts_source = match.group(2)
-                                    row_timestamps[f"T{table_idx}.{ts_source}"] = col_value
-                                elif (
-                                    col_name.endswith(".PACKET_TIMESECONDS")
-                                    or col_name.endswith(".RECEIVED_TIMESECONDS")
-                                    or col_name
-                                    in (
-                                        "PACKET_TIMESECONDS",
-                                        "RECEIVED_TIMESECONDS",
-                                    )
-                                ):
-                                    # Stored timestamp column - convert from datetime to float seconds
-                                    ts_utc = QuestDBClient.pg_timestamp_to_utc(col_value)
-                                    seconds_value = QuestDBClient.format_timestamp(ts_utc, "seconds")
-                                    data[row_index].append([seconds_value, None])
-                                    col_index += 1
-                                    # Also store for calculated items (TIMEFORMATTED) that may need this
-                                    # Normalize key to T{index}.{col} format for consistency
-                                    if "." in col_name:
-                                        row_timestamps[col_name] = col_value
-                                    else:
-                                        # If no table prefix, assume T0
-                                        row_timestamps[f"T0.{col_name}"] = col_value
-                                else:
-                                    # Decode value using item type info
-                                    # QuestDB may return column names without table alias prefix
-                                    # Try both the raw column name and prefixed versions
-                                    type_info = item_types.get(col_name, {})
-                                    if not type_info:
-                                        # Try with table prefixes T0, T1, etc.
-                                        for prefix in [f"T{i}." for i in range(len(tables))]:
-                                            prefixed_name = prefix + col_name
-                                            type_info = item_types.get(prefixed_name, {})
-                                            if type_info:
-                                                break
-                                    decoded_value = QuestDBClient.decode_value(
-                                        col_value,
-                                        data_type=type_info.get("data_type"),
-                                        array_size=type_info.get("array_size"),
-                                    )
-                                    data[row_index].append([decoded_value, None])
-                                    col_index += 1
-
-                            # Insert calculated timestamp items at their positions
-                            # Insert in ascending order so positions remain valid after each insert
-                            for position in sorted(calculated_items.keys()):
-                                calc_info = calculated_items[position]
-                                ts_key = f"T{calc_info['table_index']}.{calc_info['source']}"
-                                ts_value = row_timestamps.get(ts_key)
-                                ts_utc = QuestDBClient.pg_timestamp_to_utc(ts_value)
-                                calculated_value = QuestDBClient.format_timestamp(ts_utc, calc_info["format"])
-                                data[row_index].insert(position, [calculated_value, None])
-
-                        # If we only have one row then we return a single array
-                        if len(result) == 1:
-                            data = data[0]
-                        return data
-
-            except (psycopg.Error, OSError) as e:
-                # Retry the query because various errors can occur that are recoverable
-                retry_count += 1
-                if retry_count > 4:
-                    # After the 5th retry just raise the error
-                    raise RuntimeError(f"Error querying TSDB: {str(e)}") from e
-                Logger.warn(f"TSDB: Retrying due to error: {str(e)}")
-                Logger.warn(f"TSDB: Last query: {query}")  # Log the last query for debugging
-                QuestDBClient.disconnect()
-                time.sleep(0.1)
+        return QuestDBClient.tsdb_lookup(items, start_time=start_time, end_time=end_time, scope=scope)
 
     # Return all item values and limit state from the CVT
     #
@@ -480,13 +220,18 @@ class CvtModel(Model):
         # If a start_time is passed we're doing a QuestDB lookup and directly return the results
         # TODO: This currently does NOT support the override values
         if start_time is not None:
-            return cls.tsdb_lookup(items, start_time=start_time, end_time=end_time)
+            return cls.tsdb_lookup(items, start_time=start_time, end_time=end_time, scope=scope)
 
         # First generate a lookup dict of all the items represented so we can query the CVT
         for item in items:
             cls._parse_item(now, lookups, overrides, item, cache_timeout=cache_timeout, scope=scope)
 
-        for target_packet_key, target_name, packet_name, value_keys in lookups:
+        for lookup in lookups:
+            # Set in _parse_item for an item which doesn't exist
+            if lookup is None:
+                results.append([None, None])
+                continue
+            target_packet_key, target_name, packet_name, value_keys = lookup
             if target_packet_key not in packet_lookup:
                 packet_lookup[target_packet_key] = cls.get(
                     target_name,
@@ -513,7 +258,9 @@ class CvtModel(Model):
                         item_result.insert(1, pkt_hash.get(f"{value_keys[-1]}__L"))
                 else:
                     if value_keys[-1] not in pkt_hash:
-                        raise RuntimeError(f"Item '{target_name} {packet_name} {value_keys[-1]}' does not exist")
+                        raise RuntimeError(
+                            f"Item '{target_name} {packet_name} {value_keys[-1]}' does not exist (get_tlm_values)"
+                        )
                     else:
                         item_result.insert(1, None)
             results.append(item_result)
@@ -524,12 +271,12 @@ class CvtModel(Model):
         """Return all the overrides"""
         overrides = []
         for target_name in TargetModel.names(scope):
-            all = Store.hgetall(f"{scope}__override__{target_name}")
-            if len(all) == 0:
+            all_overrides = cls._store_for_target(target_name, scope).hgetall(f"{scope}__override__{target_name}")
+            if len(all_overrides) == 0:
                 continue
             # decode the binary string keys to strings
-            all = {k.decode(): v for (k, v) in all.items()}
-            for packet_name, pkt_hash in all.items():
+            all_overrides = {k.decode(): v for (k, v) in all_overrides.items()}
+            for packet_name, pkt_hash in all_overrides.items():
                 items = json.loads(pkt_hash, cls=JsonDecoder)
                 for key, value in items.items():
                     item = {}
@@ -555,7 +302,8 @@ class CvtModel(Model):
     @classmethod
     def override(cls, target_name, packet_name, item_name, value, type="ALL", scope=OPENC3_SCOPE):
         """Override a current value table item such that it always returns the same value for the given type"""
-        pkt_hash = Store.hget(f"{scope}__override__{target_name}", packet_name)
+        store = cls._store_for_target(target_name, scope)
+        pkt_hash = store.hget(f"{scope}__override__{target_name}", packet_name)
         if pkt_hash is not None:
             pkt_hash = json.loads(pkt_hash)
         else:
@@ -572,15 +320,16 @@ class CvtModel(Model):
             case "FORMATTED" | "WITH_UNITS":
                 pkt_hash[f"{item_name}__F"] = str(value)  # Always a String
             case _:
-                raise RuntimeError(f"Unknown type '{type}' for {target_name} {packet_name} {item_name}")
+                raise RuntimeError(f"Unknown type '{type}' for {target_name} {packet_name} {item_name} (override)")
         tgt_pkt_key = f"{scope}__tlm__{target_name}__{packet_name}"
         CvtModel.override_cache[tgt_pkt_key] = [time.time(), pkt_hash]
-        Store.hset(f"{scope}__override__{target_name}", packet_name, json.dumps(pkt_hash))
+        store.hset(f"{scope}__override__{target_name}", packet_name, json.dumps(pkt_hash))
 
     # Normalize a current value table item such that it returns the actual value
     @classmethod
     def normalize(cls, target_name, packet_name, item_name, type="ALL", scope=OPENC3_SCOPE):
-        pkt_hash = Store.hget(f"{scope}__override__{target_name}", packet_name)
+        store = cls._store_for_target(target_name, scope)
+        pkt_hash = store.hget(f"{scope}__override__{target_name}", packet_name)
         if pkt_hash is not None:
             pkt_hash = json.loads(pkt_hash)
         else:
@@ -600,15 +349,15 @@ class CvtModel(Model):
                 if f"{item_name}__F" in pkt_hash:
                     pkt_hash.pop(f"{item_name}__F")
             case _:
-                raise RuntimeError(f"Unknown type '{type}' for {target_name} {packet_name} {item_name}")
+                raise RuntimeError(f"Unknown type '{type}' for {target_name} {packet_name} {item_name} (normalize)")
         tgt_pkt_key = f"{scope}__tlm__{target_name}__{packet_name}"
         if len(pkt_hash) == 0:
             if tgt_pkt_key in CvtModel.override_cache:
                 CvtModel.override_cache.pop(tgt_pkt_key)
-            Store.hdel(f"{scope}__override__{target_name}", packet_name)
+            store.hdel(f"{scope}__override__{target_name}", packet_name)
         else:
             CvtModel.override_cache[tgt_pkt_key] = [time.time(), pkt_hash]
-            Store.hset(f"{scope}__override__{target_name}", packet_name, json.dumps(pkt_hash))
+            store.hset(f"{scope}__override__{target_name}", packet_name, json.dumps(pkt_hash))
 
     @classmethod
     def determine_latest_packet_for_item(cls, target_name, item_name, cache_timeout=0.1, scope=OPENC3_SCOPE):
@@ -656,7 +405,7 @@ class CvtModel(Model):
             case "RAW":
                 types = [item_name]
             case _:
-                raise RuntimeError(f"Unknown type '{type}' for {target_name} {packet_name} {item_name}")
+                raise RuntimeError(f"Unknown type '{type}' for {target_name} {packet_name} {item_name} (get_item)")
 
         tgt_pkt_key = f"{scope}__tlm__{target_name}__{packet_name}"
         overrides = cls._get_overrides(
@@ -680,7 +429,7 @@ class CvtModel(Model):
             if (now - cache_time) < cache_timeout:
                 overrides[tgt_pkt_key] = pkt_hash
                 return pkt_hash
-        override_data = Store.hget(f"{scope}__override__{target_name}", packet_name)
+        override_data = cls._store_for_target(target_name, scope).hget(f"{scope}__override__{target_name}", packet_name)
         if override_data is not None:
             pkt_hash = json.loads(override_data)
             overrides[tgt_pkt_key] = pkt_hash
@@ -694,7 +443,13 @@ class CvtModel(Model):
     # return an ordered array of dict with keys
     @classmethod
     def _parse_item(cls, now, lookups, overrides, item, cache_timeout, scope):
-        target_name, packet_name, item_name, value_type = item
+        # Items can be a TlmItem or a list of [target_name, packet_name, item_name, value_type]
+        # with an optional trailing limits element which is only used by the QuestDB lookup
+        target_name, packet_name, item_name, value_type, _limits = TlmItem(*item)
+        # They are all None when the item doesn't exist (see get_tlm_available)
+        if item_name is None:
+            lookups.append(None)
+            return
 
         # We build lookup keys by including all the less formatted types to gracefully degrade lookups
         # This allows the user to specify FORMATTED and if there is no conversions it will simply return the RAW value

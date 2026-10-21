@@ -18,6 +18,8 @@ require 'openc3/utilities/authentication'
 require 'openc3/api/api'
 
 module OpenC3
+  saved_verbose = $VERBOSE
+  $VERBOSE = nil
   module Script
     private
     # Override the prompt_for_hazardous method to always return true since there is no user to prompt
@@ -25,6 +27,7 @@ module OpenC3
       return true
     end
   end
+  $VERBOSE = saved_verbose
 
   # The queue processor runs in a single thread and processes commands via cmd_api.
   class QueueProcessor
@@ -73,12 +76,14 @@ module OpenC3
               end
               validate = command.key?('validate') ? command['validate'] : true
               timeout = command['timeout']
-              cmd(command['target_name'], command['cmd_name'], cmd_params, queue: false, validate: validate, timeout: timeout, scope: @scope)
+              # Pass queue_username so Command History is attributed to the original
+              # author rather than the queue microservice name
+              cmd(command['target_name'], command['cmd_name'], cmd_params, queue: false, validate: validate, timeout: timeout, queue_username: command['username'], scope: @scope)
             elsif command['value']
               # Legacy format: use single string parameter for backwards compatibility
               validate = command.key?('validate') ? command['validate'] : true
               timeout = command['timeout']
-              cmd(command['value'], queue: false, validate: validate, timeout: timeout, scope: @scope)
+              cmd(command['value'], queue: false, validate: validate, timeout: timeout, queue_username: command['username'], scope: @scope)
             else
               @logger.error "QueueProcessor: Invalid command format, missing required fields"
             end

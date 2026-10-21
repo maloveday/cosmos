@@ -25,13 +25,29 @@ module OpenC3
   # While this isn't a clean separation of topics (streams) and models (key-value)
   # it helps maintain consistency as the topic and model are linked.
   class LimitsEventTopic < Topic
+    # Collect all unique target db_shards from TargetModel
+    def self._active_db_shards(scope:)
+      db_shards = Set.new([0])
+      Store.hgetall("#{scope}__openc3_targets").each do |_name, json|
+        parsed = JSON.parse(json, allow_nan: true, create_additions: true)
+        db_shards << (parsed['db_shard'] || 0).to_i
+      end
+      db_shards
+    end
+
     def self.write(event, scope:)
       case event[:type]
       when :LIMITS_CHANGE
         # The current_limits hash keeps only the current limits state of items
-        # It is used by the API to determine the overall limits state
-        field = "#{event[:target_name]}__#{event[:packet_name]}__#{event[:item_name]}"
-        Store.hset("#{scope}__current_limits", field, event[:new_limits_state])
+        # It is used by the API to determine the overall limits state.
+        # When the event originates from a stored packet in a non-PROCESS mode
+        # (LOG or DISABLE), skip updating current_limits so that historical
+        # data does not affect the real-time overall limits state or the
+        # out_of_limits API response.
+        unless event[:suppress_stored]
+          field = "#{event[:target_name]}__#{event[:packet_name]}__#{event[:item_name]}"
+          Store.hset("#{scope}__current_limits", field, event[:new_limits_state])
+        end
 
       when :LIMITS_SETTINGS
         # Limits updated in limits_api.rb to avoid circular reference to TargetModel
@@ -53,7 +69,7 @@ module OpenC3
         limits['red_high'] = event[:red_high]
         limits['green_low'] = event[:green_low] if event[:green_low] && event[:green_high]
         limits['green_high'] = event[:green_high] if event[:green_low] && event[:green_high]
-        limits_settings[event[:limits_set]] = limits
+        limits_settings[event[:limits_set].to_s] = limits
         limits_settings['persistence_setting'] = event[:persistence] if event[:persistence]
         limits_settings['enabled'] = event[:enabled] if not event[:enabled].nil?
         Store.hset("#{scope}__current_limits_settings", field, JSON.generate(limits_settings, allow_nan: true))
@@ -69,9 +85,22 @@ module OpenC3
         limits_settings['enabled'] = event[:enabled]
         Store.hset("#{scope}__current_limits_settings", field, JSON.generate(limits_settings, allow_nan: true))
 
+      when :LIMITS_STATE_COLOR
+        # Persist the state color so it survives a decom microservice restart (applied by sync_system)
+        field = "#{event[:target_name]}__#{event[:packet_name]}__#{event[:item_name]}"
+        limits_settings = Store.hget("#{scope}__current_limits_settings", field)
+        if limits_settings
+          limits_settings = JSON.parse(limits_settings, allow_nan: true, create_additions: true)
+        else
+          limits_settings = {}
+        end
+        limits_settings['state_colors'] ||= {}
+        limits_settings['state_colors'][event[:state_name].to_s] = event[:color].to_s
+        Store.hset("#{scope}__current_limits_settings", field, JSON.generate(limits_settings, allow_nan: true))
+
       when :LIMITS_SET
         sets = sets(scope: scope)
-        raise "Set '#{event[:set]}' does not exist!" unless sets.key?(event[:set])
+        raise "Limits set '#{event[:set]}' does not exist" unless sets.key?(event[:set])
 
         # Set all existing sets to "false"
         sets = sets.transform_values! { |_key, _value| "false" }
@@ -81,7 +110,10 @@ module OpenC3
         raise "Invalid limits event type '#{event[:type]}'"
       end
 
-      Topic.write_topic("#{scope}__openc3_limits_events", {event: JSON.generate(event, allow_nan: true)}, '*', 1000)
+      # Write to all active db_shards so each decom microservice can read limits events inline
+      _active_db_shards(scope: scope).each do |db_shard|
+        Topic.write_topic("#{scope}__openc3_limits_events", {event: JSON.generate(event, allow_nan: true)}, '*', 1000, db_shard: db_shard)
+      end
     end
 
     # Remove the JSON encoding to return hashes directly
@@ -160,6 +192,28 @@ module OpenC3
       end
     end
 
+    # Removes a limits set from the limits_sets hash and from the
+    # current_limits_settings of every item. Note that the set is not removed
+    # from the TargetModel packet definitions; that is cleaned up on the next
+    # plugin install. Running microservices will continue to hold the set in
+    # memory until they restart and resync from current_limits_settings.
+    def self.delete_set(set_name, scope:)
+      set_name = set_name.to_s
+      limits_settings = Store.hgetall("#{scope}__current_limits_settings")
+      # Collect all changed items and write them back in a single hmset to
+      # avoid a Redis round trip per item (this hash can be large)
+      updates = {}
+      limits_settings.each do |item, settings|
+        settings = JSON.parse(settings, allow_nan: true, create_additions: true)
+        if settings.key?(set_name)
+          settings.delete(set_name)
+          updates[item] = JSON.generate(settings, allow_nan: true)
+        end
+      end
+      Store.hmset("#{scope}__current_limits_settings", *updates.flatten) unless updates.empty?
+      Store.hdel("#{scope}__limits_sets", set_name)
+    end
+
     # Update the local System based on overall state
     def self.sync_system(scope:)
       all_limits_settings = Store.hgetall("#{scope}__current_limits_settings")
@@ -175,6 +229,12 @@ module OpenC3
             persistence = limits_settings['persistence_setting']
             limits_settings.each do |limits_set, settings|
               next unless Hash === settings
+              if limits_set == 'state_colors'
+                settings.each do |state_name, color|
+                  System.limits.set_state_color(target_name, packet_name, item_name, state_name, color)
+                end
+                next
+              end
               System.limits.set(target_name, packet_name, item_name, settings['red_low'], settings['yellow_low'], settings['yellow_high'], settings['red_high'], settings['green_low'], settings['green_high'], limits_set.to_s.intern, persistence, enabled)
             end
             if not enabled.nil?
@@ -189,51 +249,71 @@ module OpenC3
       end
     end
 
-    # Update the local system based on limits events
+    # Process a single limits event hash and update the local System accordingly.
+    # Called inline by DecomMicroservice when reading from the limits events topic.
+    def self.process_event(event, telemetry: nil)
+      telemetry ||= System.telemetry.all
+      case event['type']
+      when 'LIMITS_CHANGE'
+        # Ignore
+      when 'LIMITS_SETTINGS'
+        target_name = event['target_name']
+        packet_name = event['packet_name']
+        item_name = event['item_name']
+        target = telemetry[target_name]
+        if target
+          packet = target[packet_name]
+          if packet
+            enabled = ConfigParser.handle_true_false_nil(event['enabled'])
+            persistence = event['persistence']
+            System.limits.set(target_name, packet_name, item_name,
+                event['red_low'], event['yellow_low'], event['yellow_high'], event['red_high'],
+                event['green_low'], event['green_high'], event['limits_set'], persistence, enabled)
+          end
+        end
+
+      when 'LIMITS_ENABLE_STATE'
+        target_name = event['target_name']
+        packet_name = event['packet_name']
+        item_name = event['item_name']
+        target = telemetry[target_name]
+        if target
+          packet = target[packet_name]
+          if packet
+            enabled = ConfigParser.handle_true_false_nil(event['enabled'])
+            if enabled
+              System.limits.enable(target_name, packet_name, item_name)
+            else
+              System.limits.disable(target_name, packet_name, item_name)
+            end
+          end
+        end
+
+      when 'LIMITS_STATE_COLOR'
+        target_name = event['target_name']
+        packet_name = event['packet_name']
+        item_name = event['item_name']
+        target = telemetry[target_name]
+        if target
+          packet = target[packet_name]
+          if packet
+            System.limits.set_state_color(target_name, packet_name, item_name, event['state_name'], event['color'])
+          end
+        end
+
+      when 'LIMITS_SET'
+        System.limits_set = event['set']
+      end
+    end
+
+    # Update the local system based on limits events (standalone read loop).
+    # Still available for non-decom consumers that need to sync limits.
     def self.sync_system_thread_body(scope:, block_ms: nil)
       telemetry = System.telemetry.all
       topics = ["#{scope}__openc3_limits_events"]
       Topic.read_topics(topics, nil, block_ms) do |_topic, _msg_id, event, _redis|
         event = JSON.parse(event['event'], allow_nan: true, create_additions: true)
-        case event['type']
-        when 'LIMITS_CHANGE'
-          # Ignore
-        when 'LIMITS_SETTINGS'
-          target_name = event['target_name']
-          packet_name = event['packet_name']
-          item_name = event['item_name']
-          target = telemetry[target_name]
-          if target
-            packet = target[packet_name]
-            if packet
-              enabled = ConfigParser.handle_true_false_nil(event['enabled'])
-              persistence = event['persistence']
-              System.limits.set(target_name, packet_name, item_name,
-                  event['red_low'], event['yellow_low'], event['yellow_high'], event['red_high'],
-                  event['green_low'], event['green_high'], event['limits_set'], persistence, enabled)
-            end
-          end
-
-        when 'LIMITS_ENABLE_STATE'
-          target_name = event['target_name']
-          packet_name = event['packet_name']
-          item_name = event['item_name']
-          target = telemetry[target_name]
-          if target
-            packet = target[packet_name]
-            if packet
-              enabled = ConfigParser.handle_true_false_nil(event['enabled'])
-              if enabled
-                System.limits.enable(target_name, packet_name, item_name)
-              else
-                System.limits.disable(target_name, packet_name, item_name)
-              end
-            end
-          end
-
-        when 'LIMITS_SET'
-          System.limits_set = event['set']
-        end
+        process_event(event, telemetry: telemetry)
       end
     end
   end

@@ -337,8 +337,8 @@ class TestTsdbMicroservice(unittest.TestCase):
         self.assertIn('"1BIT" int', create_table_sql)
         # 63 bits is a long
         self.assertIn('"63BITS" long', create_table_sql)
-        # 64 bits uses DECIMAL(20, 0) for full 64-bit integer support
-        self.assertIn('"64BITS" DECIMAL(20, 0)', create_table_sql)
+        # 64 bits uses VARCHAR to avoid LONG NULL sentinel
+        self.assertIn('"64BITS" varchar', create_table_sql)
         # DERIVED items are now created as VARCHAR to avoid type conflicts
         self.assertIn('"DERIVED_GENERIC" varchar', create_table_sql)
 
@@ -951,6 +951,9 @@ class TestTsdbMicroservice(unittest.TestCase):
         # Column should be registered for JSON serialization
         self.assertIn("DEFAULT__TLM__INST__HEALTH_STATUS__JSON_ITEM", tsdb.questdb.json_columns)
 
+        # Clear error side_effect so atexit shutdown doesn't raise
+        mock_ingest.flush.side_effect = None
+
     @patch("openc3.utilities.questdb_client.Sender")
     @patch("openc3.utilities.questdb_client.psycopg.connect")
     @patch("openc3.microservices.microservice.System")
@@ -1014,6 +1017,9 @@ class TestTsdbMicroservice(unittest.TestCase):
 
         # Column should be registered for JSON serialization
         self.assertIn("DEFAULT__TLM__INST__HEALTH_STATUS__ITEM7", tsdb.questdb.json_columns)
+
+        # Clear error side_effect so atexit shutdown doesn't raise
+        mock_ingest.flush.side_effect = None
 
     @patch("openc3.microservices.tsdb_microservice.get_tlm")
     @patch("openc3.utilities.questdb_client.Sender")
@@ -1241,8 +1247,8 @@ class TestTsdbMicroservice(unittest.TestCase):
         self.assertIn('"DERIVED_FLOAT64" double', create_table_sql)
         self.assertIn('"DERIVED_INT16" int', create_table_sql)
         self.assertIn('"DERIVED_UINT32" long', create_table_sql)
-        # 64-bit integers use DECIMAL(20, 0) for full range support
-        self.assertIn('"DERIVED_INT64" DECIMAL(20, 0)', create_table_sql)
+        # 64-bit integers use VARCHAR to avoid LONG NULL sentinel
+        self.assertIn('"DERIVED_INT64" varchar', create_table_sql)
         self.assertIn('"DERIVED_STRING" varchar', create_table_sql)
         self.assertIn('"DERIVED_TIME" varchar', create_table_sql)
 
@@ -1271,8 +1277,8 @@ class TestTsdbMicroservice(unittest.TestCase):
         self.assertEqual(tsdb.questdb.float_bit_sizes.get("DEFAULT__TLM__TEST__PACKET__DERIVED_FLOAT32"), 32)
         self.assertEqual(tsdb.questdb.float_bit_sizes.get("DEFAULT__TLM__TEST__PACKET__DERIVED_FLOAT64"), 64)
 
-        # 64-bit integer columns should be registered for DECIMAL conversion
-        self.assertIn("DEFAULT__TLM__TEST__PACKET__DERIVED_INT64", tsdb.questdb.decimal_int_columns)
+        # 64-bit integer columns should be registered as VARCHAR
+        self.assertIn("DEFAULT__TLM__TEST__PACKET__DERIVED_INT64", tsdb.questdb.varchar_columns)
 
     def test_convert_value_arrays_json_serialized(self):
         """Test that all arrays are JSON serialized to avoid QuestDB type conflicts"""
@@ -1373,8 +1379,10 @@ class TestTsdbMicroservice(unittest.TestCase):
         model = MicroserviceModel(
             "DEFAULT__TSDB__TEST",
             scope="DEFAULT",
-            topics=[],
-            target_names=[],
+            topics=[
+                "DEFAULT__DECOM__{INST}__HEALTH_STATUS",
+            ],
+            target_names=["INST"],
         )
         model.create()
 
@@ -1716,15 +1724,15 @@ class TestTsdbMicroservice(unittest.TestCase):
     @patch("openc3.utilities.questdb_client.Sender")
     @patch("openc3.utilities.questdb_client.psycopg.connect")
     @patch("openc3.microservices.microservice.System")
-    def test_reconcile_skips_alter_when_decimal_types_match(self, mock_system, mock_psycopg, mock_sender, mock_get_tlm):
-        """Test that reconciliation does not ALTER when existing DECIMAL(20,0) matches desired DECIMAL(20, 0)"""
+    def test_reconcile_migrates_legacy_decimal_to_varchar(self, mock_system, mock_psycopg, mock_sender, mock_get_tlm):
+        """Test that reconciliation ALTERs legacy DECIMAL columns to VARCHAR (QuestDB 9.3.5 fixed bug #6923)"""
         mock_query = Mock()
         mock_psycopg.return_value = mock_query
         mock_cursor = Mock()
         mock_query.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
         mock_query.cursor.return_value.__exit__ = Mock(return_value=False)
 
-        # Simulate an existing table with DECIMAL(20,0) (no space, as QuestDB returns)
+        # Simulate an existing table with legacy DECIMAL(20,0) (no space, as QuestDB returns)
         mock_cursor.fetchall.return_value = [
             ("PACKET_TIMESECONDS", "TIMESTAMP_NS"),
             ("RECEIVED_TIMESECONDS", "TIMESTAMP_NS"),
@@ -1753,11 +1761,64 @@ class TestTsdbMicroservice(unittest.TestCase):
 
         TsdbMicroservice("DEFAULT__TSDB__TEST")
 
-        # Should NOT have issued any ALTER COLUMN TYPE statements
+        # Should have issued an ALTER COLUMN TYPE to migrate DECIMAL -> VARCHAR
         alter_calls = [
             call for call in mock_cursor.execute.call_args_list if "ALTER" in str(call) and "TYPE" in str(call)
         ]
-        self.assertEqual(len(alter_calls), 0, f"Should not ALTER matching DECIMAL types, but got: {alter_calls}")
+        self.assertEqual(len(alter_calls), 1, f"Expected one ALTER for DECIMAL->VARCHAR, got: {alter_calls}")
+        alter_sql = str(alter_calls[0])
+        self.assertIn("BIGVAL", alter_sql)
+        self.assertIn("varchar", alter_sql)
+
+    @patch("openc3.microservices.tsdb_microservice.get_tlm")
+    @patch("openc3.utilities.questdb_client.Sender")
+    @patch("openc3.utilities.questdb_client.psycopg.connect")
+    @patch("openc3.microservices.microservice.System")
+    def test_reconcile_quotes_column_names_with_special_chars(
+        self, mock_system, mock_psycopg, mock_sender, mock_get_tlm
+    ):
+        """ALTER/ADD COLUMN must double-quote column names so identifiers like
+        'P<_5|_>' (from COSMOS bit-level parameters) parse correctly."""
+        mock_query = Mock()
+        mock_psycopg.return_value = mock_query
+        mock_cursor = Mock()
+        mock_query.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+        mock_query.cursor.return_value.__exit__ = Mock(return_value=False)
+
+        # Existing table: one column type-mismatch, one column missing
+        mock_cursor.fetchall.return_value = [
+            ("PACKET_TIMESECONDS", "TIMESTAMP_NS"),
+            ("RECEIVED_TIMESECONDS", "TIMESTAMP_NS"),
+            ("RECEIVED_COUNT", "LONG"),
+            ("COSMOS_DATA_TAG", "SYMBOL"),
+            ("P<_5|_>", "LONG"),
+        ]
+
+        mock_get_tlm.return_value = {
+            "items": [
+                {"name": "P<_5|_>", "data_type": "UINT", "bit_size": 64},
+                {"name": "Q<_7|_>", "data_type": "INT", "bit_size": 32},
+            ]
+        }
+
+        model = MicroserviceModel(
+            "DEFAULT__TSDB__TEST",
+            scope="DEFAULT",
+            topics=["DEFAULT__DECOM__{TEST}__PKT"],
+            target_names=["TEST"],
+        )
+        model.create()
+
+        TsdbMicroservice("DEFAULT__TSDB__TEST")
+
+        executed = [str(call) for call in mock_cursor.execute.call_args_list]
+        alter_sql = next((s for s in executed if "ALTER COLUMN" in s and "P<_5|_>" in s), None)
+        add_sql = next((s for s in executed if "ADD COLUMN" in s and "Q<_7|_>" in s), None)
+
+        self.assertIsNotNone(alter_sql, f"Expected ALTER COLUMN for P<_5|_>, got: {executed}")
+        self.assertIsNotNone(add_sql, f"Expected ADD COLUMN for Q<_7|_>, got: {executed}")
+        self.assertIn('"P<_5|_>"', alter_sql)
+        self.assertIn('"Q<_7|_>"', add_sql)
 
     @patch("openc3.utilities.questdb_client.Sender")
     @patch("openc3.utilities.questdb_client.psycopg.connect")
@@ -1793,7 +1854,7 @@ class TestTsdbMicroservice(unittest.TestCase):
 
         # Simulate INTEGER to VARCHAR cast error (the reported user issue)
         error_msg = (
-            "error in line 1: table: TLM__INST__HEALTH_STATUS, column: ITEM__C; "
+            "error in line 1: table: DEFAULT__TLM__INST__HEALTH_STATUS, column: ITEM__C; "
             'cast error from protocol type: INTEGER to column type: VARCHAR","line":1'
         )
         mock_ingest.row.side_effect = [IngressError(1, error_msg), None]
@@ -1816,7 +1877,7 @@ class TestTsdbMicroservice(unittest.TestCase):
             self.assertIn("expected VARCHAR but received INTEGER", stdout.getvalue())
 
         # The column should now be tracked in varchar_columns so convert_value() will str() it
-        self.assertIn("TLM__INST__HEALTH_STATUS__ITEM__C", tsdb.questdb.varchar_columns)
+        self.assertIn("DEFAULT__TLM__INST__HEALTH_STATUS__ITEM__C", tsdb.questdb.varchar_columns)
 
         # Verify retry was called with the value cast to string
         retry_call = mock_ingest.row.call_args_list[1]

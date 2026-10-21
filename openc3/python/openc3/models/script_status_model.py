@@ -13,7 +13,7 @@ import json
 from datetime import datetime, timezone
 
 from openc3.models.model import Model
-from openc3.utilities.store import openc3_redis_cluster
+from openc3.utilities.time import to_nsec_from_epoch
 
 
 class ScriptStatusModel(Model):
@@ -55,16 +55,10 @@ class ScriptStatusModel(Model):
                 return []
             with cls.store().instance().redis_pool.get() as redis:
                 result = []
-                if openc3_redis_cluster:
-                    # No pipelining for cluster mode
-                    # because it requires using the same shard for all keys
-                    for key in keys:
-                        result.append(redis.hget(f"{cls.RUNNING_PRIMARY_KEY}__{scope}", key))
-                else:
-                    pipeline = redis.pipeline(transaction=False)
-                    for key in keys:
-                        pipeline.hget(f"{cls.RUNNING_PRIMARY_KEY}__{scope}", key)
-                    result = pipeline.execute()
+                pipeline = redis.pipeline(transaction=False)
+                for key in keys:
+                    pipeline.hget(f"{cls.RUNNING_PRIMARY_KEY}__{scope}", key)
+                result = pipeline.execute()
                 for i in range(len(result)):
                     if result[i] is not None:
                         result[i] = json.loads(result[i])
@@ -79,16 +73,10 @@ class ScriptStatusModel(Model):
                 return []
             with cls.store().instance().redis_pool.get() as redis:
                 result = []
-                if openc3_redis_cluster:
-                    # No pipelining for cluster mode
-                    # because it requires using the same shard for all keys
-                    for key in keys:
-                        result.append(redis.hget(f"{cls.COMPLETED_PRIMARY_KEY}__{scope}", key))
-                else:
-                    pipeline = redis.pipeline(transaction=False)
-                    for key in keys:
-                        pipeline.hget(f"{cls.COMPLETED_PRIMARY_KEY}__{scope}", key)
-                    result = pipeline.execute()
+                pipeline = redis.pipeline(transaction=False)
+                for key in keys:
+                    pipeline.hget(f"{cls.COMPLETED_PRIMARY_KEY}__{scope}", key)
+                result = pipeline.execute()
                 for i in range(len(result)):
                     if result[i] is not None:
                         result[i] = json.loads(result[i])
@@ -97,9 +85,9 @@ class ScriptStatusModel(Model):
     @classmethod
     def count(cls, scope, type="running"):
         if type == "running":
-            return cls.store().zcount(f"{cls.RUNNING_PRIMARY_KEY}__#{scope}__LIST", 0, "+inf")
+            return cls.store().zcount(f"{cls.RUNNING_PRIMARY_KEY}__{scope}__LIST", 0, "+inf")
         else:
-            return cls.store().zcount(f"{cls.COMPLETED_PRIMARY_KEY}__#{scope}__LIST", 0, "+inf")
+            return cls.store().zcount(f"{cls.COMPLETED_PRIMARY_KEY}__{scope}__LIST", 0, "+inf")
 
     def __init__(
         self,
@@ -187,8 +175,8 @@ class ScriptStatusModel(Model):
 
     # Update the Redis hash at primary_key and set the field "name"
     # to the JSON generated via calling as_json
-    def create(self, update=False, force=False, queued=False, isoformat=True):
-        self.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    def create(self, update=False, force=False, queued=False):
+        self.updated_at: int = to_nsec_from_epoch(datetime.now(timezone.utc))
 
         if queued:
             write_store = self.store_queued()
@@ -211,9 +199,9 @@ class ScriptStatusModel(Model):
 
             # Move to completed
             self.primary_key = f"{self.COMPLETED_PRIMARY_KEY}__{self.scope}"
-            self.create(update=False, force=force, queued=queued, isoformat=True)
+            self.create(update=False, force=force, queued=queued)
         else:
-            self.create(update=True, force=force, queued=queued, isoformat=True)
+            self.create(update=True, force=force, queued=queued)
 
     # Delete the model from the Store
     def destroy(self, queued=False):

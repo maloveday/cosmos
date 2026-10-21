@@ -15,7 +15,7 @@ Telemetry Grapher is a graphing application that allows for one or more telemetr
 
 ### File Menu Items
 
-<!-- Image sized to match up with bullets -->
+{/* Image sized to match up with bullets */}
 
 <img src={require('@site/static/img/telemetry_grapher/file_menu.png').default}
 alt="File Menu"
@@ -35,7 +35,7 @@ The Save Configuration dialog also displays a list of all saved configurations. 
 
 ### Graph Menu Items
 
-<!-- Image sized to match up with bullets -->
+{/* Image sized to match up with bullets */}
 
 <img src={require('@site/static/img/telemetry_grapher/graph_menu.png').default}
 alt="File Menu"
@@ -58,6 +58,23 @@ Editing the Start Date and Start Time will re-query the data to begin at the spe
 Changing the Min Y and Max Y values simply sets the graph scale. Deleting the Min Y and Max Y values allows the graph to scale automatically as values arrive. Compare the following graph with the minimum set to 0 and the maximum set to 100 with the first graph image (auto-scale).
 
 ![Min Max](/img/telemetry_grapher/graph_min_max.png)
+
+The Scale / Lines tab also contains the Draw Style selector and the Custom X Axis Item option.
+
+#### Draw Style
+
+The Draw Style selector changes how data series are rendered on the graph. The available options are:
+
+- **Lines** (default) - Draws connected line segments between data points. Best for time-series data where you want to see trends and continuity.
+- **Points** - Draws individual filled circles at each data point without connecting lines. Best for X-Y scatter plots or data where individual samples are more meaningful than the trend between them.
+
+#### X-Y Plots
+
+Telemetry Grapher supports X-Y plots by allowing you to choose a custom X axis item. By default, all graphs use time as the X axis. Checking the "Custom X axis item" checkbox lets you select a telemetry item from the same packet to use as the X axis instead. This plots one telemetry item against another, creating an X-Y scatter or parametric plot.
+
+All items on the graph must be from the same packet to use this feature, because items from different packets arrive at different times and cannot be correlated.
+
+When using a custom (non-time) X axis, additional Min X Axis and Max X Axis fields appear to allow you to override the automatic X axis scaling.
 
 ## Selecting Items
 

@@ -6,7 +6,7 @@ sidebar_custom_props:
   myEmoji: 🪑
 ---
 
-<!-- Be sure to edit _table.md because table.md is a generated file -->
+{/* Be sure to edit _table.md because table.md is a generated file */}
 
 ## Table Definition Files
 
@@ -15,7 +15,7 @@ Table definition files define the binary tables that can be displayed in COSMOS 
 
 The Table definition files share a lot of similarity with the [Command Configuration](command.md). You have the same data types: INT, UINT, FLOAT, STRING, BLOCK. These correspond to integers, unsigned integers, floating point numbers, strings and binary blocks of data. Additional data types of BOOL, ARRAY, OBJECT, and ANY are also available if you are using an Accessor that supports them. These are Booleans (true/false), arrays of unknown data type, objects with unknown contents, and a completely unknown data type with ANY.
 
-<div style={{"clear": 'both'}}></div>
+<div style={{ clear: "both" }}></div>
 
 # Table Keywords
 
@@ -91,7 +91,7 @@ The following keywords must follow a PARAMETER keyword.
 | Format | How to format using printf syntax. For example, '0x%0X' will display the value in hex. | True |
 
 Example Usage:
-```ruby
+```cosmos
 FORMAT_STRING "0x%0X"
 ```
 
@@ -104,7 +104,7 @@ FORMAT_STRING "0x%0X"
 | Abbreviated | Abbreviation for the units, e.g. C | True |
 
 Example Usage:
-```ruby
+```cosmos
 UNITS Celsius C
 UNITS Kilometers KM
 ```
@@ -127,7 +127,7 @@ Meta data is user specific data that can be used by custom tools for various pur
 | Meta Values | One or more values to be stored for this Meta Name | False |
 
 Example Usage:
-```ruby
+```cosmos
 META TEST "This parameter is for test purposes only"
 ```
 
@@ -147,7 +147,7 @@ Keys are often [JSONPath](https://en.wikipedia.org/wiki/JSONPath) or [XPath](htt
 | Key string | The key to access this item | True |
 
 Example Usage:
-```ruby
+```cosmos
 KEY $.book.title
 ```
 
@@ -204,7 +204,7 @@ Key value pairs allow for user friendly strings. For example, you might define s
 | Hazardous Description | String describing why this state is hazardous | False |
 
 Example Usage:
-```ruby
+```cosmos
 APPEND_PARAMETER ENABLE 32 UINT 0 1 0 "Enable setting"
   STATE FALSE 0
   STATE TRUE 1
@@ -235,12 +235,12 @@ in the TIME_OFFSET command definition of the COSMOS Demo
 [INST inst_cmds.txt](https://github.com/OpenC3/cosmos/blob/main/openc3-cosmos-init/plugins/packages/openc3-cosmos-demo/targets/INST/cmd_tlm/inst_cmds.txt)
 or [INST2 inst_cmds.txt](https://github.com/OpenC3/cosmos/blob/main/openc3-cosmos-init/plugins/packages/openc3-cosmos-demo/targets/INST2/cmd_tlm/inst_cmds.txt).
 
-:::info Multiple write conversions on command parameters
+:::info[Multiple write conversions on command parameters]
 When a command is built, each item gets written (and write conversions are run)
 to set the default value. Then items are written (again write conversions are run)
 with user provided values. Thus write conversions can be run twice. Also there are
 no guarantees which parameters have already been written. The packet itself has a
-given_values() method which can be used to retrieve a hash of the user provided
+`given_values` attribute which can be used to retrieve a hash of the user provided
 values to the command. That can be used to check parameter values passed in.
 :::
 
@@ -252,13 +252,51 @@ values to the command. That can be used to check parameter values passed in.
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
-WRITE_CONVERSION openc3/conversions/ip_write_conversion.py
+```cosmos
+# Example command with a WRITE_CONVERSION that sets a command parameter
+# based on the given values of other parameters
+COMMAND INST BLOCK BIG_ENDIAN "Send variable block of data"
+  APPEND_PARAMETER BYTE 8 UINT MIN MAX 0x55 "Byte to duplicate"
+    FORMAT_STRING "0x%0X"
+  APPEND_PARAMETER LENGTH 32 UINT MIN MAX 0 "Length of data"
+  APPEND_PARAMETER DATA 0 BLOCK "" "Variable block of data"
+    WRITE_CONVERSION block_conversion.py
+    HIDDEN # Because we're filling it in with a conversion
+
+# Implemented in INST/lib/block_conversion.py:
+from openc3.conversions.conversion import Conversion
+class BlockConversion(Conversion):
+    def call(self, value, packet, buffer):
+        # Use the packet.given_values hash to access user provided values to the command
+        byte = packet.given_values.get('BYTE', 0x55)
+        length = packet.given_values.get('LENGTH', 0)
+        return bytes([byte]) * length
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
-WRITE_CONVERSION ip_write_conversion.rb
+```cosmos
+# Example command with a WRITE_CONVERSION that sets a command parameter
+# based on the given values of other parameters
+COMMAND INST BLOCK BIG_ENDIAN "Send variable block of data"
+  APPEND_PARAMETER BYTE 8 UINT MIN MAX 0x55 "Byte to duplicate"
+    FORMAT_STRING "0x%0X"
+  APPEND_PARAMETER LENGTH 32 UINT MIN MAX 0 "Length of data"
+  APPEND_PARAMETER DATA 0 BLOCK "" "Variable block of data"
+    WRITE_CONVERSION block_conversion.rb
+    HIDDEN # Because we're filling it in with a conversion
+
+# Implemented in INST/lib/block_conversion.rb:
+require 'openc3/conversions/conversion'
+module OpenC3
+  class BlockConversion < Conversion
+    def call(value, packet, buffer)
+      # Use the packet.given_values hash to access user provided values to the command
+      byte = packet.given_values['BYTE'] || 0x55
+      length = packet.given_values['LENGTH'] || 0
+      [byte].pack('C') * length
+    end
+  end
+end
 ```
 </TabItem>
 </Tabs>
@@ -288,12 +326,12 @@ compatibility). The last line of code should return the converted
 value. The GENERIC_WRITE_CONVERSION_END keyword specifies that all lines of
 code for the conversion have been given.
 
-:::info Multiple write conversions on command parameters
+:::info[Multiple write conversions on command parameters]
 When a command is built, each item gets written (and write conversions are run)
 to set the default value. Then items are written (again write conversions are run)
 with user provided values. Thus write conversions can be run twice. Also there are
 no guarantees which parameters have already been written. The packet itself has a
-given_values() method which can be used to retrieve a hash of the user provided
+`given_values` attribute which can be used to retrieve a hash of the user provided
 values to the command. That can be used to check parameter values passed in.
 :::
 
@@ -305,7 +343,7 @@ Generic conversions are not a good long term solution. Consider creating a conve
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 APPEND_PARAMETER ITEM1 32 UINT 0 0xFFFFFFFF 0
   GENERIC_WRITE_CONVERSION_START
     int(value * 1.5) # Convert the value by a scale factor
@@ -313,7 +351,7 @@ APPEND_PARAMETER ITEM1 32 UINT 0 0xFFFFFFFF 0
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 APPEND_PARAMETER ITEM1 32 UINT 0 0xFFFFFFFF 0
   GENERIC_WRITE_CONVERSION_START
     (value * 1.5).to_i # Convert the value by a scale factor
@@ -336,12 +374,12 @@ By default OpenC3 throws an error if you try to write a value which overflows it
 | Behavior | How OpenC3 treats an overflow value. Only applies to signed and unsigned integer data types.<br/><br/>Valid Values: <span class="values">ERROR, ERROR_ALLOW_HEX, TRUNCATE, SATURATE</span> | True |
 
 Example Usage:
-```ruby
+```cosmos
 OVERFLOW TRUNCATE
 ```
 
 #### HIDDEN
-**Indicates that the parameter should not be shown to the user in the Table Manager GUI**
+<span class="badge badge--secondary since-right">Since 6.10.1</span>**Indicates that the parameter should not be shown to the user in the Table Manager GUI**
 
 Hidden parameters still exist and will be saved to the resulting binary. This is useful for padding and other essential but non-user editable fields.
 
@@ -400,8 +438,7 @@ If you have multiple rows you need a DEFAULT line for each row. If all your rows
 
 **Example File: TARGET/tables/config/MCConfigurationTable_def.txt**
 
-<!-- prettier-ignore -->
-```ruby
+```cosmos
 TABLE "MC_Configuration" BIG_ENDIAN KEY_VALUE "Memory Control Configuration Table"
   APPEND_PARAMETER "Scrub_Region_1_Start_Addr" 32 UINT 0 0x03FFFFFB 0
     FORMAT_STRING "0x%0X"

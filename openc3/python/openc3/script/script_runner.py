@@ -17,7 +17,10 @@ from openc3.utilities.extract import *
 
 
 def _script_response_error(response, message, scope=OPENC3_SCOPE):
-    if response:
+    # NOTE: check identity not truthiness - requests.Response is falsy for any
+    # non-2xx status (Response.__bool__ returns self.ok), which would otherwise
+    # report an error response (e.g. 404) as "No Response" and discard the body.
+    if response is not None:
         raise RuntimeError(f"{message} ({response.status_code}): {response.text}")
     else:
         raise RuntimeError(f"{message}: No Response")
@@ -36,7 +39,7 @@ def script_list(scope=OPENC3_SCOPE):
 
 def script_syntax_check(script, scope=OPENC3_SCOPE):
     endpoint = "/script-api/scripts/temp.py/syntax"
-    # Explicitly set the headers to plain/text so the request.body is set correctly
+    # Explicitly set the headers to text/plain so the request.body is set correctly
     headers = {"Content-Type": "text/plain"}
     response = openc3.script.SCRIPT_RUNNER_API_SERVER.request(
         "post", endpoint, json=False, data=script, headers=headers, scope=scope
@@ -118,7 +121,7 @@ def script_unlock(filename, scope=OPENC3_SCOPE):
 
 def script_instrumented(script, scope=OPENC3_SCOPE):
     endpoint = "/script-api/scripts/temp.py/instrumented"
-    # Explicitly set the headers to plain/text so the request.body is set correctly
+    # Explicitly set the headers to text/plain so the request.body is set correctly
     headers = {"Content-Type": "text/plain"}
     response = openc3.script.SCRIPT_RUNNER_API_SERVER.request(
         "post", endpoint, json=False, data=script, headers=headers, scope=scope

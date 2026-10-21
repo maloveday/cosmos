@@ -23,8 +23,8 @@
     @keydown.enter="disableButtons ? null : success()"
     @keydown.esc="disableButtons ? null : (show = false)"
   >
-    <v-card>
-      <form @submit.prevent="success">
+    <v-card class="file-open-save-card d-flex flex-column">
+      <form class="d-flex flex-column" @submit.prevent="success">
         <v-toolbar height="24">
           <v-spacer />
           <span> {{ title }} </span>
@@ -36,7 +36,7 @@
             absolute
           />
         </v-toolbar>
-        <v-card-text>
+        <v-card-text class="overflow-y-auto">
           <div class="pa-3">
             <v-row>{{ helpText }} </v-row>
             <v-row dense class="mt-5">
@@ -75,37 +75,38 @@
             <v-row dense>
               <div
                 v-show="error"
-                class="my-2 text-red"
+                class="my-2 text-red overflow-y-auto error-container"
                 style="white-space: pre-line"
               >
                 {{ error }}
               </div>
             </v-row>
-            <v-row class="mt-2">
-              <v-spacer />
-              <v-btn
-                variant="outlined"
-                class="mx-2"
-                data-test="file-open-save-cancel-btn"
-                :disabled="disableButtons"
-                @click="show = false"
-              >
-                Cancel
-              </v-btn>
-              <v-btn
-                ref="submitBtn"
-                type="submit"
-                color="primary"
-                class="mx-2"
-                data-test="file-open-save-submit-btn"
-                :disabled="disableButtons || !!error"
-                @click.prevent="success"
-              >
-                {{ submit }}
-              </v-btn>
-            </v-row>
           </div>
         </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn
+            variant="outlined"
+            class="mx-2"
+            data-test="file-open-save-cancel-btn"
+            :disabled="disableButtons"
+            @click="show = false"
+          >
+            Cancel
+          </v-btn>
+          <v-btn
+            ref="submitBtn"
+            type="submit"
+            color="primary"
+            variant="elevated"
+            class="mx-2"
+            data-test="file-open-save-submit-btn"
+            :disabled="disableButtons || !!error"
+            @click.prevent="success"
+          >
+            {{ submit }}
+          </v-btn>
+        </v-card-actions>
       </form>
     </v-card>
   </v-dialog>
@@ -223,57 +224,54 @@ export default {
       return new RegExp(expression)
     },
   },
-  created() {
-    Api.get('/openc3-api/targets').then((response) => {
-      this.targets = response.data
-      this.targets.push('__TEMP__') // Also support __TEMP__
-      const loadPromises = this.targets.map((target) => {
-        // Name not found so push the item and add a children array
-        this.items.push({
-          id: target,
-          disabled: true,
-          title: target,
-          children: [],
-          path: target,
-        })
-        // Load the targets 1 by 1 in the background
-        return this.loadFiles(target)
+  async created() {
+    const response = await Api.get('/openc3-api/targets')
+    this.targets = response.data
+    this.targets.push('__TEMP__') // Also support __TEMP__
+    const loadPromises = this.targets.map((target) => {
+      // Name not found so push the item and add a children array
+      this.items.push({
+        id: target,
+        disabled: true,
+        title: target,
+        children: [],
+        path: target,
       })
-      Promise.all(loadPromises).then(() => {
-        this.disableButtons = false
-      })
+      // Load the targets 1 by 1 in the background
+      return this.loadFiles(target)
     })
+    await Promise.all(loadPromises)
+    this.disableButtons = false
   },
   methods: {
     calcIcon: function (filename) {
       return fileIcon(filename)
     },
-    loadFiles: function (target) {
-      return Api.get(this.apiUrl, { params: { target } })
-        .then((response) => {
-          if (response.data.length === 0) {
-            // Delete from items since there is no data
-            this.items = this.items.filter((item) => item.id !== target)
-            return
-          }
-          for (let file of response.data.sort()) {
-            // Make a copy of the entire file path before calling insertFile
-            // because insertFile does recursion and needs the original path
-            this.filepath = file
-            this.insertFile(this.items, 2, file)
-          }
-          if (this.inputFilename) {
-            this.selectedFile = this.inputFilename
-          }
-          // Enable the target we just populated
-          const index = this.items.findIndex((item) => item.id === target)
-          if (index !== -1) {
-            this.items[index].disabled = false
-          }
-        })
-        .catch((error) => {
-          this.$emit('error', `Failed to connect to OpenC3. ${error}`)
-        })
+    loadFiles: async function (target) {
+      try {
+        const response = await Api.get(this.apiUrl, { params: { target } })
+        if (response.data.length === 0) {
+          // Delete from items since there is no data
+          this.items = this.items.filter((item) => item.id !== target)
+          return
+        }
+        for (let file of response.data.sort()) {
+          // Make a copy of the entire file path before calling insertFile
+          // because insertFile does recursion and needs the original path
+          this.filepath = file
+          this.insertFile(this.items, 2, file)
+        }
+        if (this.inputFilename) {
+          this.selectedFile = this.inputFilename
+        }
+        // Enable the target we just populated
+        const index = this.items.findIndex((item) => item.id === target)
+        if (index !== -1) {
+          this.items[index].disabled = false
+        }
+      } catch (error) {
+        this.$emit('error', `Failed to connect to OpenC3. ${error}`)
+      }
     },
     clear: function () {
       this.show = false
@@ -285,7 +283,12 @@ export default {
         this.selectedFile = null
       } else {
         // Search through items to find the item with id
-        this.selectedFile = this.findItem(this.items, file.id)
+        let path = this.findItem(this.items, file.id)
+        if (this.type === 'save' && path) {
+          // Strip the '*' which only indicates the file is modified on the server
+          path = path.replace(/\*$/, '')
+        }
+        this.selectedFile = path
         // Select the Submit button so return opens the file
         setTimeout(() => {
           this.$refs.submitBtn.$el.focus()
@@ -454,11 +457,20 @@ export default {
 </script>
 
 <style>
+.file-open-save-card {
+  max-height: 90vh;
+}
+.file-open-save-card form {
+  min-height: 0;
+}
 .tree-container {
   background-color: var(--color-background-base-default);
   padding: 10px;
   margin-top: 5px;
   max-height: 60vh;
   font-size: large;
+}
+.error-container {
+  max-height: 10vh;
 }
 </style>

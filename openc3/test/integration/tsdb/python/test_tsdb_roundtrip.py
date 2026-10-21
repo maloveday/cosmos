@@ -167,7 +167,7 @@ def run_roundtrip_test(questdb_client, clean_table, wait_for_data):
         # Read back using tsdb_lookup
         items = [(target_name, packet_name, "VALUE", "RAW", False)]
 
-        with patch("openc3.models.cvt_model.TargetModel") as mock_target:
+        with patch("openc3.models.target_model.TargetModel") as mock_target:
             mock_target.packet.return_value = packet_def
             end_ts = ts_to_iso(ts + len(test_values) * 1_000_000_000)
             result = CvtModel.tsdb_lookup(items, start_time=ts_iso, end_time=end_ts)
@@ -250,7 +250,7 @@ class TestIntSignedRoundtrip:
         )
 
     def test_int64_roundtrip(self, run_roundtrip_test):
-        """INT 64-bit round-trips correctly using DECIMAL column."""
+        """INT 64-bit round-trips correctly using VARCHAR column."""
         # Avoid QuestDB NULL sentinel (Long.MIN_VALUE)
         run_roundtrip_test(
             "INT64",
@@ -309,6 +309,50 @@ class TestUintUnsignedRoundtrip:
             "UINT",
             [0, 1, 4611686018427387904, 9223372036854775807],
             bit_size=64,
+        )
+
+    def test_uint64_full_range_roundtrip(self, run_roundtrip_test):
+        """UINT 64-bit full range including values above 2^63 round-trip via VARCHAR."""
+        run_roundtrip_test(
+            "UINT64_FULL",
+            "UINT",
+            [
+                0,
+                9223372036854775807,       # 2^63 - 1 (max signed long)
+                9223372036854775808,       # 2^63     (first value beyond signed long)
+                18446744073709551615,      # 2^64 - 1 (max UINT64)
+            ],
+            bit_size=64,
+        )
+
+    def test_uint128_roundtrip(self, run_roundtrip_test):
+        """UINT 128-bit values round-trip via VARCHAR without precision loss."""
+        run_roundtrip_test(
+            "UINT128",
+            "UINT",
+            [
+                0,
+                18446744073709551615,                      # 2^64 - 1
+                18446744073709551616,                      # 2^64     (first value beyond UINT64)
+                170141183460469231731687303715884105727,    # 2^127 - 1
+                340282366920938463463374607431768211455,    # 2^128 - 1 (max UINT128)
+            ],
+            bit_size=128,
+        )
+
+    def test_uint256_roundtrip(self, run_roundtrip_test):
+        """UINT 256-bit values round-trip via VARCHAR without precision loss."""
+        run_roundtrip_test(
+            "UINT256",
+            "UINT",
+            [
+                0,
+                340282366920938463463374607431768211455,    # 2^128 - 1
+                340282366920938463463374607431768211456,    # 2^128     (first value beyond UINT128)
+                # 2^256 - 1 (max UINT256) — 78 digits
+                115792089237316195423570985008687907853269984665640564039457584007913129639935,
+            ],
+            bit_size=256,
         )
 
 
@@ -574,7 +618,7 @@ class TestTimestampItemsRoundtrip:
         start_time = ts_to_iso(base_ts)
         end_time = ts_to_iso(base_ts + len(test_values) * 1_000_000_000)
 
-        with patch("openc3.models.cvt_model.TargetModel") as mock_target:
+        with patch("openc3.models.target_model.TargetModel") as mock_target:
             mock_target.packet.return_value = packet_def
             result = CvtModel.tsdb_lookup(
                 items, start_time=start_time, end_time=end_time
@@ -683,7 +727,7 @@ class TestTimestampItemsRoundtrip:
         start_time = ts_to_iso(base_ts)
         end_time = ts_to_iso(base_ts + len(test_values) * 1_000_000_000)
 
-        with patch("openc3.models.cvt_model.TargetModel") as mock_target:
+        with patch("openc3.models.target_model.TargetModel") as mock_target:
             mock_target.packet.return_value = packet_def
             result = CvtModel.tsdb_lookup(
                 items, start_time=start_time, end_time=end_time

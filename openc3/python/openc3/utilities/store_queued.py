@@ -10,9 +10,11 @@
 # if purchased from OpenC3, Inc.
 
 import atexit
+import contextlib
 import queue
 import threading
 import time
+import traceback
 
 from openc3.utilities.sleeper import Sleeper
 from openc3.utilities.store import EphemeralStore, Store, StoreMeta
@@ -32,27 +34,33 @@ def kill_thread(owner, thread, timeout=1.0):
 
 
 class StoreQueued(metaclass=StoreMeta):
-    # Variable that holds the singleton instance
-    my_instance = None
+    # Variable that holds the singleton instances per db_shard
+    my_instances = {}
 
     # Mutex used to ensure that only one instance is created
     instance_mutex = threading.Lock()
 
-    # Get the singleton instance
+    # Get the singleton instance for a given db_shard
     @classmethod
-    def instance(cls, update_interval=1):
-        if cls.my_instance:
-            return cls.my_instance
+    def instance(cls, update_interval=1, db_shard=0):
+        inst = cls.my_instances.get(db_shard)
+        if inst:
+            return inst
 
         with cls.instance_mutex:
-            cls.my_instance = cls(update_interval)
-            return cls.my_instance
+            if db_shard not in cls.my_instances:
+                cls.my_instances[db_shard] = cls(update_interval, db_shard=db_shard)
+            return cls.my_instances[db_shard]
 
-    def __init__(self, update_interval):
+    def __init__(self, update_interval, db_shard=0):
+        self.is_shutdown = False
         self.update_interval = update_interval
+        self.db_shard = db_shard
         self.store = self.store_instance()
         # Queue to hold the store requests
         self.store_queue = queue.Queue()
+        # Orders queueing against the final drain in shutdown
+        self.shutdown_mutex = threading.Lock()
         # Sleeper used to delay update thread
         self.update_sleeper = Sleeper()
 
@@ -79,7 +87,10 @@ class StoreQueued(metaclass=StoreMeta):
         while True:
             start_time = time.time()
 
-            self.process_queue()
+            try:
+                self.process_queue()
+            except Exception:
+                print(f"StoreQueued thread error (db_shard={self.db_shard}):\n{traceback.format_exc()}")
 
             # Only check whether to update at a set interval
             run_time = time.time() - start_time
@@ -95,19 +106,33 @@ class StoreQueued(metaclass=StoreMeta):
         if self.update_thread:
             kill_thread(self, self.update_thread)
         self.update_thread = None
-        # Drain the queue before shutdown
-        self.process_queue()
+        # Nothing drains the queue once the thread is gone, so from here on write
+        # straight through rather than silently dropping whatever gets queued.
+        # Drain first and flip the flag last, under the mutex, so a direct write
+        # can't be overwritten by an older queued one and nothing is queued after
+        # the drain.
+        with self.shutdown_mutex:
+            # Best effort - Redis may already be unavailable during shutdown
+            with contextlib.suppress(Exception):
+                self.process_queue()
+            self.is_shutdown = True
 
     # Record the message for pipelining by the thread
     def __getattr__(self, func):
         def method(*args, **kwargs):
-            return self.store_queue.put([func, args, kwargs])
+            # Read through __dict__ so a missing attribute can't recurse back into __getattr__
+            # is_shutdown never goes back to False, so once set the lock can be skipped
+            if not self.__dict__.get("is_shutdown"):
+                with self.__dict__["shutdown_mutex"]:
+                    if not self.is_shutdown:
+                        return self.store_queue.put([func, args, kwargs])
+            return getattr(self.store, func)(*args, **kwargs)
 
         return method
 
     # Returns the store we're working with
     def store_instance(self):
-        return Store.instance()
+        return Store.instance(db_shard=self.db_shard)
 
     def graceful_kill(self):
         # Do nothing
@@ -115,8 +140,8 @@ class StoreQueued(metaclass=StoreMeta):
 
 
 class EphemeralStoreQueued(StoreQueued):
-    # Variable that holds the singleton instance
-    my_instance = None
+    # Variable that holds the singleton instances per db_shard
+    my_instances = {}
 
     def store_instance(self):
-        return EphemeralStore.instance()
+        return EphemeralStore.instance(db_shard=self.db_shard)

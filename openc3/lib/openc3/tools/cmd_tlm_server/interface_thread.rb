@@ -221,7 +221,6 @@ module OpenC3
           else
             Logger.error connect_error.formatted
             unless @connection_failed_messages.include?(connect_error.message)
-              OpenC3.write_exception_file(connect_error)
               @connection_failed_messages << connect_error.message
             end
           end
@@ -242,7 +241,6 @@ module OpenC3
           else
             Logger.error err.formatted
             unless @connection_lost_messages.include?(err.message)
-              OpenC3.write_exception_file(err)
               @connection_lost_messages << err.message
             end
           end
@@ -255,6 +253,13 @@ module OpenC3
 
     def connect
       Logger.info "Connecting to #{@interface.name}..."
+      # Interface connect implementations typically overwrite their stream / socket
+      # so cleanly close any existing connection rather than leaking it
+      begin
+        @interface.disconnect if @interface.connected?
+      rescue => err
+        Logger.error "Disconnect: #{@interface.name}: #{err.formatted}"
+      end
       @interface.connect
       if @connection_success_callback
         @connection_success_callback.call

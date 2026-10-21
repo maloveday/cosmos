@@ -19,7 +19,7 @@ require 'openc3/models/model'
 require 'openc3/models/microservice_model'
 require 'openc3/models/target_model'
 require 'openc3/models/trigger_group_model'
-require 'openc3/models/reaction_model'
+# require 'openc3/models/reaction_model' # Remove circular require
 require 'openc3/topics/autonomic_topic'
 
 module OpenC3
@@ -50,12 +50,15 @@ module OpenC3
     STRING_TYPE = 'string'.freeze
     REGEX_TYPE = 'regex'.freeze
     TRIGGER_TYPE = 'trigger'.freeze
+    ITEM_VALUE_TYPES = ['RAW', 'CONVERTED', 'FORMATTED', 'WITH_UNITS'].freeze
 
     def self.create_unique_name(group:, scope:)
-      trigger_names = self.names(group: group, scope: scope) # comes back sorted
+      trigger_names = self.names(group: group, scope: scope)
       num = 1 # Users count with 1
-      if trigger_names[-1]
-        num = trigger_names[-1][4..-1].to_i + 1
+      unless trigger_names.empty?
+        # Extract numeric suffixes and find the max to avoid lexicographic sort issues
+        max_num = trigger_names.map { |name| name[4..-1].to_i }.max
+        num = max_num + 1
       end
       return "TRIG#{num}"
     end
@@ -97,6 +100,7 @@ module OpenC3
     end
 
     attr_reader :name, :scope, :state, :group, :enabled, :left, :operator, :right, :dependents, :roots
+    attr_accessor :label
 
     def initialize(
       name:,
@@ -104,10 +108,11 @@ module OpenC3
       group:,
       left:,
       operator:,
-      right:,
+      right: nil,
       state: false,
       enabled: true,
       dependents: nil,
+      label: nil,
       updated_at: nil
     )
       super("#{scope}#{PRIMARY_KEY}#{group}", name: name, scope: scope)
@@ -119,6 +124,7 @@ module OpenC3
       @operator = validate_operator(operator: operator)
       @right = validate_operand(operand: right, right: true)
       @dependents = dependents
+      @label = label
       @updated_at = updated_at
       selected_group = TriggerGroupModel.get(name: @group, scope: @scope)
       if selected_group.nil?
@@ -175,8 +181,29 @@ module OpenC3
       end
     end
 
-    def verify_triggers
+    # Validate the items hold a legal valueType and reference telemetry items
+    # which actually exist. Only called on create and update, never from initialize.
+    # Anything which can reject an already persisted trigger must live here rather than
+    # in validate_operand, because validate_operand runs on every from_json
+    def validate_trigger_items
+      {'left' => @left, 'right' => @right}.each do |side, operand|
+        next unless operand.is_a?(Hash) and operand['type'] == ITEM_TYPE
+        unless ITEM_VALUE_TYPES.include?(operand['valueType'])
+          raise TriggerInputError.new "invalid #{side} operand, valueType '#{operand['valueType']}' must be one of #{ITEM_VALUE_TYPES}"
+        end
+        begin
+          TargetModel.packet_item(operand['target'], operand['packet'], operand['item'], scope: @scope)
+        rescue StandardError => e
+          raise TriggerInputError.new "invalid #{side} trigger: #{e.message}"
+        end
+      end
+    end
+
+    # Validate that all root triggers exist, but do not persist dependent changes yet.
+    # Returns the list of root trigger models that need updating.
+    def validate_roots
       @dependents = [] if @dependents.nil?
+      models_to_update = []
       @roots.each do | trigger |
         model = TriggerModel.get(name: trigger, group: @group, scope: @scope)
         if model.nil?
@@ -184,25 +211,34 @@ module OpenC3
         end
         unless model.dependents.include?(@name)
           model.update_dependents(dependent: @name)
-          model.update()
+          models_to_update << model
         end
       end
+      models_to_update
+    end
+
+    # Persist dependent changes to root triggers
+    def commit_roots(models)
+      models.each { |model| model.update() }
     end
 
     def create
       unless Store.hget(@primary_key, @name).nil?
         raise TriggerInputError.new "existing trigger found: '#{@name}'"
       end
-      verify_triggers()
+      validate_trigger_items()
+      models = validate_roots()
       @updated_at = Time.now.to_nsec_from_epoch
       Store.hset(@primary_key, @name, JSON.generate(as_json, allow_nan: true))
+      commit_roots(models)
       notify(kind: 'created')
     end
 
     def update
-      verify_triggers()
+      models = validate_roots()
       @updated_at = Time.now.to_nsec_from_epoch
       Store.hset(@primary_key, @name, JSON.generate(as_json, allow_nan: true))
+      commit_roots(models)
       # No notification as this is only called via trigger_controller which already notifies
     end
 
@@ -267,6 +303,7 @@ module OpenC3
         'left' => @left,
         'operator' => @operator,
         'right' => @right,
+        'label' => @label,
         'updated_at' => @updated_at,
       }
     end

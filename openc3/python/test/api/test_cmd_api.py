@@ -228,6 +228,25 @@ class TestCmdApi(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Invalid number of arguments"):
                 func("INST", "COLLECT", "TYPE", "DURATION")
 
+    def test_cmd_records_the_original_queuing_user(self):
+        for name in [
+            "cmd",
+            "cmd_no_range_check",
+            "cmd_no_hazardous_check",
+            "cmd_no_checks",
+            "cmd_raw",
+            "cmd_raw_no_range_check",
+            "cmd_raw_no_hazardous_check",
+            "cmd_raw_no_checks",
+        ]:
+            func = globals()[name]
+            command = func("INST", "ABORT", queue_username="original_author")
+            # queue_username (author, shown as "Queued By") is recorded separately
+            # from username (executor, shown as "Executed By")
+            self.assertEqual(command["queue_username"], "original_author")
+            # username is the executing user/process, not the author
+            self.assertNotEqual(command["username"], "original_author")
+
     def test_cmd_warns_about_required_parameters(self):
         for name in [
             "cmd",
@@ -673,14 +692,19 @@ class TestCmdApi(unittest.TestCase):
             get_cmd_hazardous("INST", "COLLECT", "TYPE", "SPECIAL")
 
     def test_get_cmd_value_returns_command_values(self):
-        now = time.time()
+        before_cmd = time.time()
         cmd("INST COLLECT with TYPE NORMAL, DURATION 5")
+        after_cmd = time.time()
         time.sleep(0.001)
         self.assertEqual(get_cmd_value("inst collect type"), "NORMAL")
         self.assertEqual(get_cmd_value("inst collect type", type="RAW"), 0)
         self.assertEqual(get_cmd_value("INST COLLECT DURATION"), 5.0)
-        self.assertAlmostEqual(get_cmd_value("INST COLLECT RECEIVED_TIMESECONDS"), now, delta=0.1)
-        self.assertAlmostEqual(get_cmd_value("INST COLLECT PACKET_TIMESECONDS"), now, delta=0.1)
+        received_time = get_cmd_value("INST COLLECT RECEIVED_TIMESECONDS")
+        packet_time = get_cmd_value("INST COLLECT PACKET_TIMESECONDS")
+        self.assertGreaterEqual(received_time, before_cmd)
+        self.assertLessEqual(received_time, after_cmd)
+        self.assertGreaterEqual(packet_time, before_cmd)
+        self.assertLessEqual(packet_time, after_cmd)
         self.assertEqual(get_cmd_value("INST COLLECT RECEIVED_COUNT"), 1)
 
         cmd("INST COLLECT with TYPE NORMAL, DURATION 7")
@@ -689,13 +713,18 @@ class TestCmdApi(unittest.TestCase):
         self.assertEqual(get_cmd_value("INST COLLECT DURATION"), 7.0)
 
     def test_get_cmd_value_returns_command_values_old_style(self):
-        now = time.time()
+        before_cmd = time.time()
         cmd("INST COLLECT with TYPE NORMAL, DURATION 5")
+        after_cmd = time.time()
         time.sleep(0.001)
         self.assertEqual(get_cmd_value("inst", "collect", "type"), "NORMAL")
         self.assertEqual(get_cmd_value("INST", "COLLECT", "DURATION"), 5.0)
-        self.assertAlmostEqual(get_cmd_value("INST", "COLLECT", "RECEIVED_TIMESECONDS"), now, delta=0.1)
-        self.assertAlmostEqual(get_cmd_value("INST", "COLLECT", "PACKET_TIMESECONDS"), now, delta=0.1)
+        received_time = get_cmd_value("INST", "COLLECT", "RECEIVED_TIMESECONDS")
+        packet_time = get_cmd_value("INST", "COLLECT", "PACKET_TIMESECONDS")
+        self.assertGreaterEqual(received_time, before_cmd)
+        self.assertLessEqual(received_time, after_cmd)
+        self.assertGreaterEqual(packet_time, before_cmd)
+        self.assertLessEqual(packet_time, after_cmd)
         self.assertEqual(get_cmd_value("INST", "COLLECT", "RECEIVED_COUNT"), 1)
 
         cmd("INST COLLECT with TYPE NORMAL, DURATION 7")
@@ -741,11 +770,11 @@ class TestCmdApi(unittest.TestCase):
         self.assertEqual(get_cmd_time(), (None, None, 0, 0))
 
     def test_get_cmd_cnt_complains_about_non_existant_targets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'BLAH ABORT' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'BLAH ABORT' does not exist"):
             get_cmd_cnt("BLAH", "ABORT")
 
     def test_get_cmd_cnt_complains_about_non_existant_packets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'INST BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'INST BLAH' does not exist"):
             get_cmd_cnt("INST BLAH")
 
     def test_get_cmd_cnt_returns_the_transmit_count(self):

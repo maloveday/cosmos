@@ -1,13 +1,59 @@
 #!/bin/sh
-uv venv "$PYTHONUSERBASE"
-echo "uv pip install $@"
-uv pip install --python "$PYTHONUSERBASE" "$@"
+VENV="${PIPINSTALL_VENV:-$PYTHONUSERBASE}"
+
+# --no-sources finishes what --no-config starts. PypiUrl.build_args adds
+# --no-config when an operator has designated an index, which stops uv searching
+# a named index declared in [tool.uv].index - but a package pinned with
+# [tool.uv].sources is project metadata that survives --no-config and still
+# resolves against the index the pin names. --no-sources drops those pins so the
+# operator's index is the only one consulted. Every uv command below resolves,
+# so it applies to all of them.
+case " $* " in
+    *" --no-config "*) NO_SOURCES="--no-sources" ;;
+    *) NO_SOURCES="" ;;
+esac
+
+uv venv "$VENV" --allow-existing
+echo "uv pip install $*"
+uv pip install --python "$VENV" ${NO_SOURCES} "$@"
 if [ $? -eq 0 ]; then
     echo "Command succeeded"
-else
-    echo "Command failed - retrying with --no-index"
-    uv pip install --python "$PYTHONUSERBASE" --no-index "$@"
-    if [ $? -ne 0 ]; then
-        echo "ERROR: uv pip install failed"
+    exit 0
+fi
+
+# Collect the last arg and all preceding args
+LAST_ARG=""
+OPTS=""
+PREV=""
+for ARG in "$@"; do
+    if [ -n "$PREV" ]; then
+        OPTS="${OPTS} ${PREV}"
     fi
+    PREV="$ARG"
+done
+LAST_ARG="$PREV"
+
+# If last arg is a directory with pyproject.toml, the build may have failed
+# (e.g. Poetry package-mode = false). Try compiling and installing declared
+# dependencies only, without attempting to build the package itself.
+if [ -d "$LAST_ARG" ] && [ -f "$LAST_ARG/pyproject.toml" ]; then
+    echo "Warning: Failed to build Python package, attempting to install declared dependencies from pyproject.toml"
+    TMPFILE=$(mktemp)
+    uv pip compile ${NO_SOURCES} ${OPTS} "${LAST_ARG}/pyproject.toml" > "$TMPFILE"
+    if [ $? -eq 0 ] && [ -s "$TMPFILE" ]; then
+        uv pip install --python "$VENV" ${NO_SOURCES} ${OPTS} -r "$TMPFILE"
+        if [ $? -eq 0 ]; then
+            echo "Dependencies installed successfully"
+            rm -f "$TMPFILE"
+            exit 0
+        fi
+    fi
+    rm -f "$TMPFILE"
+fi
+
+echo "Warning: Install failed - retrying with --no-index"
+uv pip install --python "$VENV" --no-index ${NO_SOURCES} "$@"
+if [ $? -ne 0 ]; then
+    echo "ERROR: uv pip install failed"
+    exit 1
 fi

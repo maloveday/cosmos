@@ -68,16 +68,11 @@ export default {
   created() {
     this.api = new OpenC3Api()
 
-    // Remove double bracket escaping. This means they actually have an item
-    // with a bracket in the name, not an array index.
-    if (this.parameters[2].includes('[[')) {
-      this.parameters[2] = this.parameters[2]
-        .replace('[[', '[')
-        .replace(']]', ']')
-    }
+    const parsed = this.parseItemName(this.parameters[2])
+    this.parameters[2] = parsed.name
 
     this.api
-      .get_limits(this.parameters[0], this.parameters[1], this.parameters[2])
+      .get_limits(this.parameters[0], this.parameters[1], parsed.name)
       .then((data) => {
         this.limitsSettings = data
       })
@@ -89,10 +84,10 @@ export default {
 
     this.appliedSettings.forEach((setting) => {
       if (setting[0] === 'MIN_VALUE') {
-        this.minValue = parseInt(setting[1])
+        this.minValue = Number.parseInt(setting[1])
       }
       if (setting[0] === 'MAX_VALUE') {
-        this.maxValue = parseInt(setting[1])
+        this.maxValue = Number.parseInt(setting[1])
       }
     })
     this.width = this.setWidth(this.parameters[4], 'px', this.width)
@@ -188,10 +183,6 @@ export default {
       if (this.minValue && this.minValue == limitsSettings[0]) {
         lowValue = limitsSettings[0]
       }
-      let highValue = limitsSettings[3] - 10 * this.scale
-      if (this.maxValue && this.maxValue == limitsSettings[3]) {
-        highValue = limitsSettings[3]
-      }
 
       if (value.raw) {
         if (value.raw === '-Infinity') {
@@ -206,7 +197,7 @@ export default {
       } else if (value > this.max) {
         return 100
       } else {
-        const result = parseInt((value - lowValue) / this.scale)
+        const result = Number.parseInt((value - lowValue) / this.scale)
         if (result > 100) {
           return 100
         } else if (result < 0) {

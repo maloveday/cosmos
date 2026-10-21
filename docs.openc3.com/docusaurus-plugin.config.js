@@ -17,8 +17,7 @@ const config = {
   favicon: "img/favicon.png",
 
   future: {
-    experimental_faster: true,
-    v4: true
+    v4: true,
   },
 
   // Set the production url of your site here
@@ -39,7 +38,7 @@ const config = {
     hooks: {
       onBrokenMarkdownLinks: "throw",
       onBrokenMarkdownImages: "throw",
-    }
+    },
   },
 
   // Even if you don't use internalization, you can use this field to set useful
@@ -55,6 +54,11 @@ const config = {
       "@docusaurus/plugin-client-redirects",
       {
         redirects: [
+          { to: "/docs/guides/podman", from: "/docs/getting-started/podman" },
+          {
+            to: "/docs/meta/requirements",
+            from: "/docs/getting-started/requirements",
+          },
           { to: "/docs/", from: "/docs/v5/" },
           { to: "/docs/tools", from: "/docs/v5/tools" },
           {
@@ -67,10 +71,10 @@ const config = {
           },
           { to: "/docs/getting-started/upgrading", from: "/docs/v5/upgrading" },
           {
-            to: "/docs/getting-started/requirements",
+            to: "/docs/meta/requirements",
             from: "/docs/v5/requirements",
           },
-          { to: "/docs/getting-started/podman", from: "/docs/v5/podman" },
+          { to: "/docs/guides/podman", from: "/docs/v5/podman" },
           { to: "/docs/configuration/format", from: "/docs/v5/format" },
           { to: "/docs/configuration/plugins", from: "/docs/v5/plugins" },
           { to: "/docs/configuration/target", from: "/docs/v5/target" },
@@ -142,7 +146,12 @@ const config = {
         ],
       },
     ],
-    require.resolve("docusaurus-lunr-search"),
+    [
+      require.resolve("./plugins/docusaurus-search/src/index.js"),
+      {
+        maxHits: "25", // Default is "5", increase to show more results
+      },
+    ],
   ],
 
   presets: [
@@ -183,7 +192,7 @@ const config = {
             label: "Documentation",
           },
           {
-            to: "https://openc3.com/enterprise/",
+            to: "https://openc3.com/cosmos-enterprise/",
             label: "Enterprise",
           },
         ],

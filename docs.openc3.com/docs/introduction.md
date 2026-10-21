@@ -14,25 +14,36 @@ COSMOS is a suite of applications that can be used to control a set of embedded 
 
 COSMOS is a cloud native, containerized, microservice oriented command and control system. See the [Architecture](/docs/getting-started/architecture) page for a detailed breakdown of both the Core and Enterprise architectures.
 
+Watch this video for a demo and walkthrough of COSMOS:
+
+<div style={{textAlign: 'center'}}>
+  <iframe
+    width="960"
+    height="540"
+    src="https://www.youtube.com/embed/-5SGDS-MnuE"
+    title="COSMOS Demo and Walkthrough"
+    frameBorder="0"
+    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+    allowFullScreen
+    style={{maxWidth: '100%', aspectRatio: '16 / 9', height: 'auto'}}
+  ></iframe>
+</div>
+
 ## Helpful Hints
 
 Throughout this guide there are a number of small-but-handy pieces of
 information that can make using COSMOS easier, more interesting, and less
 hazardous. Here's what to look out for.
 
-:::note ProTips™ help you get more from COSMOS
-These are tips and tricks that will help you be a COSMOS wizard!
-:::
-
-:::info Notes are handy pieces of information
+:::info[Notes are handy pieces of information]
 These are for the extra tidbits sometimes necessary to understand COSMOS.
 :::
 
-:::warning Warnings help you not blow things up
+:::warning[Warnings help you not blow things up]
 Be aware of these messages if you wish to avoid certain death.
 :::
 
-:::note Find a problem in the documentation or in COSMOS itself?
+:::note[Find a problem in the documentation or in COSMOS itself?]
 Both using and hacking on COSMOS should be fun, simple, and easy, so if for
 some reason you find it's a pain, please [create an issue](https://github.com/OpenC3/cosmos/issues/new/choose) on
 GitHub describing your experience so we can make it better.

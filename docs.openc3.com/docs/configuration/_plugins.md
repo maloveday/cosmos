@@ -6,7 +6,7 @@ sidebar_custom_props:
   myEmoji: 🔌
 ---
 
-<!-- Be sure to edit _plugins.md because plugins.md is a generated file -->
+{/* Be sure to edit _plugins.md because plugins.md is a generated file */}
 
 ## Introduction
 
@@ -47,6 +47,70 @@ Microservices are persistent running backend code that runs within the COSMOS en
 ### Script Engines
 
 Script Engines enhance Script Runner by providing the implementation of a new file type and language. The new language must be implemented in either Ruby or Python but can support any custom Domain Specific Language (DSL). For a real example see our [CSTOL](https://github.com/OpenC3/openc3-cosmos-script-engine-cstol) implementation.
+
+## Installation Process
+
+Plugin installation happens in two phases via the Admin Plugins tab or the `./openc3.sh cli load` command.
+
+### Phase 1: Extract Variables
+
+COSMOS uploads the plugin gem file to an internal gem server and extracts the gem contents to a temporary directory. It then reads and parses the `plugin.txt` file to extract all `VARIABLE` definitions along with their descriptions and options. These variables are returned to the Admin Plugins UI where the user can set values before proceeding to Phase 2.
+
+### Phase 2: Deploy
+
+Once variables are set, COSMOS registers the plugin model in Redis and installs the Ruby gem. If the plugin contains Python dependencies (`pyproject.toml` or `requirements.txt`), COSMOS creates an isolated [UV](https://docs.astral.sh/uv/) virtual environment for the plugin at `/gems/plugin_venvs/<plugin>/.venv` and installs the dependencies into it. This gives each plugin full dependency isolation — different plugins can require different versions of the same package without conflicts.
+
+COSMOS supports two formats for declaring Python dependencies:
+
+- **`pyproject.toml`** (recommended) — When paired with a `uv.lock` file, enables reproducible installs via `uv sync --frozen`. COSMOS uses `uv sync` for `pyproject.toml`-based plugins.
+- **`requirements.txt`** — COSMOS uses `uv pip install -r requirements.txt` for requirements-based plugins.
+
+System Python packages (those shipped in the COSMOS Docker image) are pre-seeded into the UV download cache, so plugins that depend on those packages reuse them without re-downloading. If the UV install fails for any reason, COSMOS falls back to a shared pip install and logs a warning.
+
+Dependencies are resolved against the `pypi_url` Admin Console setting, falling back to the `PYPI_URL` environment variable and then to public PyPI. When that setting names an index other than `https://pypi.org`, COSMOS treats it as authoritative and passes uv `--no-config --no-sources`, so a plugin cannot resolve around it using an index declared in its own `[tool.uv].index` table or a `[tool.uv].sources` pin. A plugin depending on a package published only to its author's private index therefore fails to install unless your index serves that package too.
+
+This applies only to the paths where uv resolves — `requirements.txt` plugins, and `pyproject.toml` plugins with no `uv.lock`. A plugin shipping a `uv.lock` installs with `uv sync --frozen`, which reuses the registry and wheel URLs already recorded in that lock and never consults an index, so a locked plugin still downloads from whatever index its author locked against.
+
+Shipping a `uv.lock` is still recommended, including for air-gapped deployments. COSMOS first tries `uv sync --frozen` offline against its seeded package cache. If the URLs recorded in the lock are unreachable, for example because they point at public PyPI from an air-gapped network, COSMOS falls back to resolving the plugin's `pyproject.toml` against the configured `pypi_url` index, so the install still succeeds as long as that index serves the packages. This fallback ignores the versions pinned in `uv.lock`. To keep those pins in an air-gapped deployment, generate the lock against the same mirror, e.g. `uv lock --no-config --no-sources --default-index <mirror-url>`, so the recorded URLs point at an index the deployment can reach.
+
+After installing dependencies, COSMOS parses `plugin.txt` again with [ERB](/docs/configuration/format#erb) variable substitution applied and deploys each component declared in the file: targets, interfaces, routers, microservices, tools, widgets, and script engines.
+
+### Target Deployment
+
+When a target is deployed, its files are extracted from the gem's `targets/<FOLDER>/` directory and uploaded to the configuration bucket under `<SCOPE>/targets/<TARGET_NAME>/`. This `targets/` path represents the original, read-only target configuration as shipped by the plugin.
+
+COSMOS also creates an archive zip in `<SCOPE>/target_archives/<TARGET_NAME>/` which stores versioned snapshots of the target configuration. Each archive is identified by a SHA256 hash so previous versions can be restored.
+
+The `<SCOPE>/targets_modified/<TARGET_NAME>/` path stores user-editable modifications to targets. When a user edits screens, scripts, or other target files through the COSMOS UI, those changes are written to `targets_modified/` rather than overwriting the originals in `targets/`. This separation means user customizations survive plugin upgrades — COSMOS reads from `targets_modified/` first and falls back to `targets/` for unmodified files. When a plugin is upgraded, files that the user has not modified are updated from the new plugin while user modifications in `targets_modified/` are preserved.
+
+Target deployment also automatically creates several microservices for each target:
+
+- **DECOM** — Decommutates raw telemetry packets into individual data items
+- **COMMANDLOG** — Logs raw command packets to the bucket storage
+- **PACKETLOG** — Logs raw telemetry packets to the bucket storage
+- **CLEANUP** — Removes old log files based on the configured retention time
+- **TSDB** — Writes decommutated data to the time series database
+- **MULTI** — Parent microservice that manages child processes for orderly startup and shutdown
+
+### Interface and Router Deployment
+
+Interfaces and routers each create a corresponding microservice that the operator starts as a running process. The microservice handles the physical connection (TCP, UDP, serial, etc.) and routes commands and telemetry to the appropriate Valkey pub/sub topics.
+
+### Tool Deployment
+
+Tool files (HTML, JavaScript, CSS, fonts) are extracted from the gem's `tools/<FOLDER>/` directory and uploaded to the tools bucket. Files are uploaded in dependency order: fonts first, then CSS, then HTML and JavaScript. This ensures assets are available when the tool's page loads. Tools appear in the COSMOS navigation bar after installation.
+
+### Widget Deployment
+
+Widget JavaScript files and source maps are extracted and uploaded to the tools bucket. Widgets become available for use in Telemetry Viewer screens after installation.
+
+### Microservice Deployment
+
+Custom microservice files are extracted from the gem's `microservices/<FOLDER>/` directory and uploaded to the config bucket under `<SCOPE>/microservices/<MICROSERVICE_NAME>/`. The COSMOS operator watches Redis for new microservice definitions and starts them as running processes.
+
+### Uninstallation
+
+When a plugin is uninstalled, COSMOS destroys all its components in dependency order: microservices are stopped first (with a wait period for graceful shutdown), then interfaces, routers, tools, widgets, targets, and script engines are removed. All associated files are deleted from both the configuration and tools buckets, and Redis state is cleaned up.
 
 ## Plugin Directory Structure
 

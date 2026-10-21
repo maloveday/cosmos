@@ -63,15 +63,15 @@ module OpenC3
 
     describe "get_limits" do
       it "complains about non-existent targets" do
-        expect { @api.get_limits("BLAH", "HEALTH_STATUS", "TEMP1") }.to raise_error(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist")
+        expect { @api.get_limits("BLAH", "HEALTH_STATUS", "TEMP1") }.to raise_error(RuntimeError, "Packet definition 'BLAH HEALTH_STATUS' does not exist")
       end
 
       it "complains about non-existent packets" do
-        expect { @api.get_limits("INST", "BLAH", "TEMP1") }.to raise_error(RuntimeError, "Packet 'INST BLAH' does not exist")
+        expect { @api.get_limits("INST", "BLAH", "TEMP1") }.to raise_error(RuntimeError, "Packet definition 'INST BLAH' does not exist")
       end
 
       it "complains about non-existent items" do
-        expect { @api.get_limits("INST", "HEALTH_STATUS", "BLAH") }.to raise_error(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist")
+        expect { @api.get_limits("INST", "HEALTH_STATUS", "BLAH") }.to raise_error(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist (TargetModel)")
       end
 
       it "gets limits for an item" do
@@ -94,15 +94,15 @@ module OpenC3
 
     describe "set_limits" do
       it "complains about non-existent targets" do
-        expect { @api.set_limits("BLAH", "HEALTH_STATUS", "TEMP1", 0.0, 10.0, 20.0, 30.0) }.to raise_error(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist")
+        expect { @api.set_limits("BLAH", "HEALTH_STATUS", "TEMP1", 0.0, 10.0, 20.0, 30.0) }.to raise_error(RuntimeError, "Packet definition 'BLAH HEALTH_STATUS' does not exist")
       end
 
       it "complains about non-existent packets" do
-        expect { @api.set_limits("INST", "BLAH", "TEMP1", 0.0, 10.0, 20.0, 30.0) }.to raise_error(RuntimeError, "Packet 'INST BLAH' does not exist")
+        expect { @api.set_limits("INST", "BLAH", "TEMP1", 0.0, 10.0, 20.0, 30.0) }.to raise_error(RuntimeError, "Packet definition 'INST BLAH' does not exist")
       end
 
       it "complains about non-existent items" do
-        expect { @api.set_limits("INST", "HEALTH_STATUS", "BLAH", 0.0, 10.0, 20.0, 30.0) }.to raise_error(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist")
+        expect { @api.set_limits("INST", "HEALTH_STATUS", "BLAH", 0.0, 10.0, 20.0, 30.0) }.to raise_error(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist while setting limits")
       end
 
       it "creates a CUSTOM limits set" do
@@ -132,6 +132,89 @@ module OpenC3
         expect(item['limits']['enabled']).to be false
         expect(item['limits']['DEFAULT']).to eql({ 'red_low' => 1.0, 'yellow_low' => 2.0, 'yellow_high' => 5.0,
                                                   'red_high' => 6.0, 'green_low' => 3.0, 'green_high' => 4.0 })
+      end
+    end
+
+    describe "set_state_color" do
+      it "complains about non-existent targets" do
+        expect { @api.set_state_color("BLAH", "HEALTH_STATUS", "GROUND1STATUS", "CONNECTED", "RED") }.to raise_error(RuntimeError, "Packet definition 'BLAH HEALTH_STATUS' does not exist")
+      end
+
+      it "complains about non-existent packets" do
+        expect { @api.set_state_color("INST", "BLAH", "GROUND1STATUS", "CONNECTED", "RED") }.to raise_error(RuntimeError, "Packet definition 'INST BLAH' does not exist")
+      end
+
+      it "complains about non-existent items" do
+        expect { @api.set_state_color("INST", "HEALTH_STATUS", "BLAH", "CONNECTED", "RED") }.to raise_error(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist while setting state color")
+      end
+
+      it "complains about non-existent states" do
+        expect { @api.set_state_color("INST", "HEALTH_STATUS", "GROUND1STATUS", "BLAH", "RED") }.to raise_error(RuntimeError, "State 'BLAH' does not exist for item 'INST HEALTH_STATUS GROUND1STATUS'")
+      end
+
+      it "complains about invalid colors" do
+        expect { @api.set_state_color("INST", "HEALTH_STATUS", "GROUND1STATUS", "CONNECTED", "PURPLE") }.to raise_error(RuntimeError, "Invalid state color 'PURPLE'. Must be one of GREEN, YELLOW, RED.")
+      end
+
+      it "changes the color of a state" do
+        item = @api.get_item("INST", "HEALTH_STATUS", "GROUND1STATUS")
+        expect(item['states']['CONNECTED']['color']).to eql("GREEN")
+        @api.set_state_color("INST", "HEALTH_STATUS", "GROUND1STATUS", "CONNECTED", "RED")
+        item = @api.get_item("INST", "HEALTH_STATUS", "GROUND1STATUS")
+        expect(item['states']['CONNECTED']['color']).to eql("RED")
+        expect(item['limits']['enabled']).to be true
+      end
+
+      it "accepts lowercase state names and colors" do
+        @api.set_state_color("INST", "HEALTH_STATUS", "GROUND1STATUS", "connected", "yellow")
+        item = @api.get_item("INST", "HEALTH_STATUS", "GROUND1STATUS")
+        expect(item['states']['CONNECTED']['color']).to eql("YELLOW")
+      end
+
+      it "writes a LIMITS_STATE_COLOR event" do
+        @api.set_state_color("INST", "HEALTH_STATUS", "GROUND1STATUS", "UNAVAILABLE", "RED")
+        event = @api.get_limits_events.last[1]
+        expect(event['type']).to eql("LIMITS_STATE_COLOR")
+        expect(event['target_name']).to eql("INST")
+        expect(event['packet_name']).to eql("HEALTH_STATUS")
+        expect(event['item_name']).to eql("GROUND1STATUS")
+        expect(event['state_name']).to eql("UNAVAILABLE")
+        expect(event['color']).to eql("RED")
+      end
+
+      it "updates the running decom microservice in realtime" do
+        with_decom_microservice do
+          @api.set_state_color("INST", "HEALTH_STATUS", "GROUND1STATUS", "CONNECTED", "RED")
+          sleep 0.05 # Allow the event to be processed
+          item = System.telemetry.packet('INST', 'HEALTH_STATUS').get_item('GROUND1STATUS')
+          expect(item.state_colors['CONNECTED']).to eql(:RED)
+        end
+      end
+
+      it "clears the color of a state when passed nil" do
+        @api.set_state_color("INST", "HEALTH_STATUS", "GROUND1STATUS", "CONNECTED", "RED")
+        item = @api.get_item("INST", "HEALTH_STATUS", "GROUND1STATUS")
+        expect(item['states']['CONNECTED']['color']).to eql("RED")
+        @api.set_state_color("INST", "HEALTH_STATUS", "GROUND1STATUS", "CONNECTED", nil)
+        item = @api.get_item("INST", "HEALTH_STATUS", "GROUND1STATUS")
+        expect(item['states']['CONNECTED']).to_not have_key('color')
+      end
+
+      it "does not validate the color when clearing" do
+        expect { @api.set_state_color("INST", "HEALTH_STATUS", "GROUND1STATUS", "CONNECTED", nil) }.to_not raise_error
+      end
+
+      it "complains about non-existent states when clearing" do
+        expect { @api.set_state_color("INST", "HEALTH_STATUS", "GROUND1STATUS", "BLAH", nil) }.to raise_error(RuntimeError, /State 'BLAH' does not exist/)
+      end
+
+      it "writes a LIMITS_STATE_COLOR event with nil color when clearing" do
+        @api.set_state_color("INST", "HEALTH_STATUS", "GROUND1STATUS", "UNAVAILABLE", nil)
+        event = @api.get_limits_events.last[1]
+        expect(event['type']).to eql("LIMITS_STATE_COLOR")
+        expect(event['state_name']).to eql("UNAVAILABLE")
+        expect(event).to have_key('color') # Key present with an explicit nil, matching the Python test
+        expect(event['color']).to be_nil
       end
     end
 
@@ -191,6 +274,46 @@ module OpenC3
         expect(@api.get_limits_set).to eql "TVAC"
         @api.set_limits_set("DEFAULT")
         expect(@api.get_limits_set).to eql "DEFAULT"
+      end
+    end
+
+    describe "delete_limits_set" do
+      it "complains about deleting the DEFAULT limits set" do
+        expect { @api.delete_limits_set("DEFAULT") }.to raise_error(RuntimeError, "Cannot delete the DEFAULT limits set")
+      end
+
+      it "complains about deleting the current limits set" do
+        @api.set_limits_set("TVAC")
+        expect { @api.delete_limits_set("TVAC") }.to raise_error(RuntimeError, /Cannot delete the current limits set 'TVAC'/)
+      end
+
+      it "complains about non-existent limits sets" do
+        expect { @api.delete_limits_set("NOPE") }.to raise_error(RuntimeError, "Limits set 'NOPE' does not exist")
+      end
+
+      it "deletes a limits set from the list of sets" do
+        expect(@api.get_limits_sets).to eql ['DEFAULT', 'TVAC']
+
+        @api.delete_limits_set("TVAC")
+
+        expect(@api.get_limits_sets).to eql ['DEFAULT']
+      end
+
+      it "removes the set from current_limits_settings but leaves the TargetModel definition" do
+        @api.set_limits("INST", "HEALTH_STATUS", "TEMP1", 0.0, 10.0, 20.0, 30.0) # creates CUSTOM
+        expect(@api.get_limits_sets).to include('CUSTOM')
+        settings = Store.hget("DEFAULT__current_limits_settings", "INST__HEALTH_STATUS__TEMP1")
+        expect(settings).to include('CUSTOM')
+
+        @api.delete_limits_set("CUSTOM")
+
+        expect(@api.get_limits_sets).to_not include('CUSTOM')
+        # current_limits_settings is cleaned up
+        settings = Store.hget("DEFAULT__current_limits_settings", "INST__HEALTH_STATUS__TEMP1")
+        expect(settings).to_not include('CUSTOM')
+        # The TargetModel packet definition is intentionally left alone
+        # (cleaned up on the next plugin install)
+        expect(@api.get_limits("INST", "HEALTH_STATUS", "TEMP1").keys).to include('CUSTOM')
       end
     end
 
@@ -337,15 +460,15 @@ module OpenC3
 
     describe "limits_enabled?" do
       it "complains about non-existent targets" do
-        expect { @api.limits_enabled?("BLAH", "HEALTH_STATUS", "TEMP1") }.to raise_error(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist")
+        expect { @api.limits_enabled?("BLAH", "HEALTH_STATUS", "TEMP1") }.to raise_error(RuntimeError, "Packet definition 'BLAH HEALTH_STATUS' does not exist")
       end
 
       it "complains about non-existent packets" do
-        expect { @api.limits_enabled?("INST", "BLAH", "TEMP1") }.to raise_error(RuntimeError, "Packet 'INST BLAH' does not exist")
+        expect { @api.limits_enabled?("INST", "BLAH", "TEMP1") }.to raise_error(RuntimeError, "Packet definition 'INST BLAH' does not exist")
       end
 
       it "complains about non-existent items" do
-        expect { @api.limits_enabled?("INST", "HEALTH_STATUS", "BLAH") }.to raise_error(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist")
+        expect { @api.limits_enabled?("INST", "HEALTH_STATUS", "BLAH") }.to raise_error(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist (TargetModel)")
       end
 
       it "returns whether limits are enable for an item" do
@@ -355,15 +478,15 @@ module OpenC3
 
     describe "enable_limits" do
       it "complains about non-existent targets" do
-        expect { @api.enable_limits("BLAH", "HEALTH_STATUS", "TEMP1") }.to raise_error(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist")
+        expect { @api.enable_limits("BLAH", "HEALTH_STATUS", "TEMP1") }.to raise_error(RuntimeError, "Packet definition 'BLAH HEALTH_STATUS' does not exist")
       end
 
       it "complains about non-existent packets" do
-        expect { @api.enable_limits("INST", "BLAH", "TEMP1") }.to raise_error(RuntimeError, "Packet 'INST BLAH' does not exist")
+        expect { @api.enable_limits("INST", "BLAH", "TEMP1") }.to raise_error(RuntimeError, "Packet definition 'INST BLAH' does not exist")
       end
 
       it "complains about non-existent items" do
-        expect { @api.enable_limits("INST", "HEALTH_STATUS", "BLAH") }.to raise_error(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist")
+        expect { @api.enable_limits("INST", "HEALTH_STATUS", "BLAH") }.to raise_error(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist (TargetModel)")
       end
 
       it "enables limits for an item" do
@@ -377,15 +500,15 @@ module OpenC3
 
     describe "disable_limits" do
       it "complains about non-existent targets" do
-        expect { @api.disable_limits("BLAH", "HEALTH_STATUS", "TEMP1") }.to raise_error(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist")
+        expect { @api.disable_limits("BLAH", "HEALTH_STATUS", "TEMP1") }.to raise_error(RuntimeError, "Packet definition 'BLAH HEALTH_STATUS' does not exist")
       end
 
       it "complains about non-existent packets" do
-        expect { @api.disable_limits("INST", "BLAH", "TEMP1") }.to raise_error(RuntimeError, "Packet 'INST BLAH' does not exist")
+        expect { @api.disable_limits("INST", "BLAH", "TEMP1") }.to raise_error(RuntimeError, "Packet definition 'INST BLAH' does not exist")
       end
 
       it "complains about non-existent items" do
-        expect { @api.disable_limits("INST", "HEALTH_STATUS", "BLAH") }.to raise_error(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist")
+        expect { @api.disable_limits("INST", "HEALTH_STATUS", "BLAH") }.to raise_error(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist (TargetModel)")
       end
 
       it "disables limits for an item" do

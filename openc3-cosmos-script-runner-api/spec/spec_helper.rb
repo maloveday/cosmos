@@ -38,14 +38,13 @@ if !ENV['OPENC3_NO_SIMPLECOV']
     require 'simplecov-cobertura'
     SimpleCov.formatter = SimpleCov::Formatter::CoberturaFormatter
     # simplecov_json_formatter formatter supports SonarQube
-    # require 'simplecov_json_formatter'
     # SimpleCov.formatter = SimpleCov::Formatter::JSONFormatter
   else
     SimpleCov.formatter = SimpleCov::Formatter::HTMLFormatter
   end
   SimpleCov.start do
     merge_timeout 60 * 60 # merge the last hour of results
-    add_filter '/spec/' # no coverage on spec files
+    skip '/spec/' # no coverage on spec files
     root = File.dirname(__FILE__)
     root.to_s
   end
@@ -78,8 +77,8 @@ ENV['OPENC3_BUCKET_PASSWORD'] = 'openc3bucketpassword'
 ENV['OPENC3_SCOPE'] = 'DEFAULT'
 ENV['OPENC3_CLOUD'] = 'aws'
 
-$openc3_scope = ENV['OPENC3_SCOPE']
-$openc3_token = ENV['OPENC3_API_PASSWORD']
+$openc3_scope = ENV.fetch('OPENC3_SCOPE', 'DEFAULT')
+$openc3_token = ENV.fetch('OPENC3_API_PASSWORD', 'password')
 $openc3_mock_token = 'mock_token'
 
 # Mock the HTTP request for OpenC3Authentication
@@ -97,8 +96,8 @@ def mock_redis
   require 'mock_redis'
   redis = MockRedis.new
   allow(Redis).to receive(:new).and_return(redis)
-  OpenC3::Store.instance_variable_set(:@instance, nil)
-  OpenC3::EphemeralStore.instance_variable_set(:@instance, nil)
+  OpenC3::Store.instance_variable_set(:@instances, [])
+  OpenC3::EphemeralStore.instance_variable_set(:@instances, [])
   redis
 end
 

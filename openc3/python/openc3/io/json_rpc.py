@@ -62,8 +62,6 @@ class JsonRpc(dict):
 class JsonRpcRequest(JsonRpc):
     """Represents a JSON Remote Procedure Call Request"""
 
-    DANGEROUS_METHODS = ["__send__", "send", "instance_eval", "instance_exec"]
-
     def __init__(self, id: int, method_name: str, *args, **kwargs):
         """Constructor
 
@@ -307,7 +305,7 @@ def convert_json_class(object_):
             for key, value in object_.items():
                 object_[key] = convert_json_class(value)
             return object_
-    elif isinstance(object_, (tuple, list)):
+    elif isinstance(object_, tuple | list):
         object_ = list(object_)
         for index, value in enumerate(object_):
             object_[index] = convert_json_class(value)
@@ -332,7 +330,7 @@ def _is_latin_text(text):
 
 
 def _convert_bytearray_to_string_raw(object_):
-    if isinstance(object_, (bytes, bytearray)):
+    if isinstance(object_, bytes | bytearray):
         try:
             decoded = object_.decode()
             # Check if all characters are in the expected Latin range
@@ -347,7 +345,7 @@ def _convert_bytearray_to_string_raw(object_):
         for key, value in object_.items():
             object_[key] = _convert_bytearray_to_string_raw(value)
         return object_
-    if isinstance(object_, (tuple, list)):
+    if isinstance(object_, tuple | list):
         object_ = list(object_)
         for index, value in enumerate(object_):
             object_[index] = _convert_bytearray_to_string_raw(value)

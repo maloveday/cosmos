@@ -31,13 +31,32 @@ module OpenC3
           packet.write(name.to_s, value, type)
         end
       end
-      packet.received_time = Time.now.sys
+      stored = inject_tlm_hash.fetch('stored', false)
+      packet.stored = stored.to_s.downcase == 'true'
+      received_time = inject_tlm_hash['received_time']
+      packet.received_time = received_time.nil? ? Time.now.sys : Time.from_nsec_from_epoch(received_time).sys
       packet.received_count = TargetModel.increment_telemetry_count(packet.target_name, packet.packet_name, 1, scope: @scope)
       TelemetryTopic.write_packet(packet, scope: @scope)
-    # If the inject_tlm parameters are bad we rescue so
-    # interface_microservice and decom_microservice can continue
-    rescue => e
-      @logger.error "inject_tlm error due to #{e.message}"
+    end
+
+    def handle_inject_tlm_with_ack(inject_tlm_json, msg_id)
+      inject_tlm_hash = JSON.parse(inject_tlm_json, allow_nan: true, create_additions: true)
+      target_name = inject_tlm_hash['target_name']
+      ack_topic = "{#{@scope}__ACKCMD}TARGET__#{target_name}"
+      begin
+        handle_inject_tlm(inject_tlm_json)
+        msg_hash = {
+          id: msg_id,
+          result: 'SUCCESS'
+        }
+      rescue => error
+        @logger.error "inject_tlm error due to #{error.message}"
+        msg_hash = {
+          id: msg_id,
+          result: error.message
+        }
+      end
+      Topic.write_topic(ack_topic, msg_hash)
     end
 
     def handle_build_cmd(build_cmd_json, msg_id)
@@ -47,6 +66,7 @@ module OpenC3
       cmd_params = build_cmd_hash['cmd_params']
       range_check = build_cmd_hash['range_check']
       raw = build_cmd_hash['raw']
+      db_shard = Store.db_shard_for_target(target_name, scope: @scope)
       ack_topic = "{#{@scope}__ACKCMD}TARGET__#{target_name}"
       begin
         command = System.commands.build_cmd(target_name, cmd_name, cmd_params, range_check, raw)
@@ -65,17 +85,17 @@ module OpenC3
       rescue => error
         msg_hash = {
           id: msg_id,
-          result: 'ERROR',
-          message: error.message
+          result: error.message
         }
       end
-      Topic.write_topic(ack_topic, msg_hash)
+      Topic.write_topic(ack_topic, msg_hash, db_shard: db_shard)
     end
 
     def handle_get_tlm_buffer(get_tlm_buffer_json, msg_id)
       get_tlm_buffer_hash = JSON.parse(get_tlm_buffer_json, allow_nan: true, create_additions: true)
       target_name = get_tlm_buffer_hash['target_name']
       packet_name = get_tlm_buffer_hash['packet_name']
+      db_shard = Store.db_shard_for_target(target_name, scope: @scope)
       ack_topic = "{#{@scope}__ACKCMD}TARGET__#{target_name}"
       begin
         packet = System.telemetry.packet(target_name, packet_name)
@@ -97,11 +117,10 @@ module OpenC3
       rescue => error
         msg_hash = {
           id: msg_id,
-          result: 'ERROR',
-          message: error.message
+          result: error.message
         }
       end
-      Topic.write_topic(ack_topic, msg_hash)
+      Topic.write_topic(ack_topic, msg_hash, db_shard: db_shard)
     end
   end
 end

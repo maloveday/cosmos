@@ -17,8 +17,10 @@ from openc3.api.tlm_api import tlm
 from openc3.environment import OPENC3_SCOPE
 from openc3.script.exceptions import CheckError
 from openc3.utilities.extract import (
+    compare_values,
     extract_fields_from_check_text,
     extract_fields_from_tlm_text,
+    extract_operator_and_operand_from_comparison,
 )
 
 
@@ -544,7 +546,7 @@ def _check(*args, type="CONVERTED", scope=OPENC3_SCOPE):
     target_name, packet_name, item_name, comparison_to_eval = _check_process_args(args, "check")
     value = tlm(target_name, packet_name, item_name, type=type, scope=scope)
     if comparison_to_eval:
-        return _check_eval(target_name, packet_name, item_name, comparison_to_eval, value)
+        return _check_comparison(target_name, packet_name, item_name, comparison_to_eval, value)
     else:
         print(f"CHECK: {_upcase(target_name, packet_name, item_name)} == {value}")
 
@@ -788,54 +790,84 @@ def _openc3_script_wait(
     value_type,
     timeout,
     polling_rate,
-    exp_to_eval,
+    comparison,
     scope,
 ):
+    """Waits for the comparison to be true or the timeout to expire.
+    The comparison is a callable which takes the telemetry value and returns True or False.
+    """
     value = None
     end_time = time.time() + timeout
-    if exp_to_eval and not exp_to_eval.isascii():
-        raise RuntimeError("ERROR: Invalid comparison to non-ascii value")
+    while True:
+        work_start = time.time()
+        value = tlm(target_name, packet_name, item_name, type=value_type, scope=scope)
+        if comparison and comparison(value):
+            return True, value
+        if time.time() >= end_time:
+            break
 
-    try:
-        while True:
-            work_start = time.time()
+        delta = time.time() - work_start
+        sleep_time = polling_rate - delta
+        end_delta = end_time - time.time()
+        if end_delta < sleep_time:
+            sleep_time = end_delta
+        if sleep_time < 0:
+            sleep_time = 0
+        canceled = openc3_script_sleep(sleep_time)
+
+        if canceled:
             value = tlm(target_name, packet_name, item_name, type=value_type, scope=scope)
-            try:
-                if eval(exp_to_eval):
-                    return True, value
-            # We get TypeError when trying to eval None >= 0 (for example)
-            # In this case we just continue and see if eventually we get a good value from tlm()
-            except TypeError:
-                pass
-            if time.time() >= end_time:
-                break
-
-            delta = time.time() - work_start
-            sleep_time = polling_rate - delta
-            end_delta = end_time - time.time()
-            if end_delta < sleep_time:
-                sleep_time = end_delta
-            if sleep_time < 0:
-                sleep_time = 0
-            canceled = openc3_script_sleep(sleep_time)
-
-            if canceled:
-                value = tlm(target_name, packet_name, item_name, type=value_type, scope=scope)
-                try:
-                    if eval(exp_to_eval):
-                        return True, value
-                    else:
-                        return False, value
-                # We get TypeError when trying to eval None >= 0 (for example)
-                except TypeError:
-                    return False, value
-
-    except NameError as error:
-        parts = error.args[0].split("'")
-        new_error = NameError(f"Uninitialized constant {parts[1]}. Did you mean '{parts[1]}' as a string?")
-        raise new_error from error
+            if comparison and comparison(value):
+                return True, value
+            else:
+                return False, value
 
     return False, value
+
+
+def _comparison_implementation(comparison_to_eval):
+    """Builds a callable which compares a telemetry value against the given comparison string,
+    e.g. "> 1". Returns None if there is no comparison, e.g. a check with no comparison.
+    Raises if the comparison is invalid, e.g. an unsupported operator or unparsable operand.
+    """
+    if not comparison_to_eval:
+        return None
+    if not comparison_to_eval.isascii():
+        raise RuntimeError("ERROR: Invalid comparison to non-ascii value")
+
+    operator, operand = extract_operator_and_operand_from_comparison(comparison_to_eval)
+    if operator is None:
+        return None
+    return lambda value: compare_values(value, operator, operand)
+
+
+def _tolerance_implementation(expected_value, tolerance):
+    """Builds a callable which checks a telemetry value is within the given tolerance"""
+
+    def _comparison(value):
+        try:
+            return (expected_value - abs(tolerance)) <= value <= (expected_value + abs(tolerance))
+        except TypeError:
+            return False
+
+    return _comparison
+
+
+def _array_tolerance_implementation(array_size, expected_value, tolerance):
+    """Builds a callable which checks every telemetry value is within the given tolerance"""
+
+    def _comparison(values):
+        try:
+            if not isinstance(values, list) or len(values) != array_size:
+                return False
+            return all(
+                (expected_value[i] - abs(tolerance[i])) <= values[i] <= (expected_value[i] + abs(tolerance[i]))
+                for i in range(array_size)
+            )
+        except TypeError:
+            return False
+
+    return _comparison
 
 
 # Wait for a converted telemetry item to pass a comparison
@@ -849,10 +881,6 @@ def _openc3_script_wait_value(
     polling_rate=DEFAULT_TLM_POLLING_RATE,
     scope=OPENC3_SCOPE,
 ):
-    if comparison_to_eval:
-        exp_to_eval = "value " + comparison_to_eval
-    else:
-        exp_to_eval = None
     return _openc3_script_wait(
         target_name,
         packet_name,
@@ -860,7 +888,7 @@ def _openc3_script_wait_value(
         value_type,
         timeout,
         polling_rate,
-        exp_to_eval,
+        _comparison_implementation(comparison_to_eval),
         scope,
     )
 
@@ -876,7 +904,6 @@ def _openc3_script_wait_tolerance(
     polling_rate=DEFAULT_TLM_POLLING_RATE,
     scope=OPENC3_SCOPE,
 ):
-    exp_to_eval = f"(value >= ({expected_value} - {abs(tolerance)}) and value <= ({expected_value} + {abs(tolerance)}))"
     return _openc3_script_wait(
         target_name,
         packet_name,
@@ -884,7 +911,7 @@ def _openc3_script_wait_tolerance(
         value_type,
         timeout,
         polling_rate,
-        exp_to_eval,
+        _tolerance_implementation(expected_value, tolerance),
         scope,
     )
 
@@ -901,12 +928,6 @@ def _openc3_script_wait_array_tolerance(
     polling_rate=DEFAULT_TLM_POLLING_RATE,
     scope=OPENC3_SCOPE,
 ):
-    statements = []
-    for i in range(array_size):
-        statements.append(
-            f"(value[{i}] >= ({expected_value[i]} - {abs(tolerance[i])}) and value[{i}] <= ({expected_value[i]} + {abs(tolerance[i])}))"
-        )
-    exp_to_eval = " and ".join(statements)
     return _openc3_script_wait(
         target_name,
         packet_name,
@@ -914,7 +935,7 @@ def _openc3_script_wait_array_tolerance(
         value_type,
         timeout,
         polling_rate,
-        exp_to_eval,
+        _array_tolerance_implementation(array_size, expected_value, tolerance),
         scope,
     )
 
@@ -955,26 +976,25 @@ def _openc3_script_wait_expression(exp_to_eval, timeout, polling_rate, globals=N
     return None
 
 
-def _check_eval(target_name, packet_name, item_name, comparison_to_eval, value):
-    string = "value " + comparison_to_eval
+def _check_comparison(target_name, packet_name, item_name, comparison_to_eval, value):
     check_str = f"CHECK: {_upcase(target_name, packet_name, item_name)} {comparison_to_eval}"
     # Show user the check against a quoted string
-    # Note: We have to preserve the original 'value' variable because we're going to eval against it
     if isinstance(value, str):
         value_str = f"'{value}'"
     else:
         value_str = value
     with_value = f"with value == {value_str}"
-    try:
-        if eval(string):
-            print(f"{check_str} success {with_value}")
-        else:
-            message = f"{check_str} failed {with_value}"
-            raise CheckError(message)
-    except NameError as error:
-        parts = error.args[0].split("'")
-        new_error = NameError(f"Uninitialized constant {parts[1]}. Did you mean '{parts[1]}' as a string?")
-        raise new_error from error
+
+    operator, operand = extract_operator_and_operand_from_comparison(comparison_to_eval)
+    if not _valid_comparison(value, operator, operand):
+        message = "Invalid comparison for types"
+        raise CheckError(message)
+
+    if compare_values(value, operator, operand):
+        print(f"{check_str} success {with_value}")
+    else:
+        message = f"{check_str} failed {with_value}"
+        raise CheckError(message)
 
 
 def _frange(value):
@@ -984,6 +1004,24 @@ def _frange(value):
         return f"{value:.6}"
     else:
         return value
+
+
+def _valid_comparison(value, operator, operand):
+    """Returns whether the value and operand can be meaningfully compared with the operator.
+    Note this is only used by check() because wait() polls until the value changes.
+    """
+    if operator is None:
+        return True
+
+    if operator in [">=", "<=", ">", "<"]:
+        if value is None or operand is None:
+            return False
+        if isinstance(value, list) or isinstance(operand, list):
+            return False
+        if isinstance(value, str) != isinstance(operand, str):
+            return False
+    # Note 'in' does not need a check here because the parser already requires a list operand
+    return True
 
 
 # Interesting formatter to a specific number of significant digits:

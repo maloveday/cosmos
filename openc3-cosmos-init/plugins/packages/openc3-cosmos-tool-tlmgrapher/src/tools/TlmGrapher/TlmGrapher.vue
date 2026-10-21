@@ -344,6 +344,7 @@ export default {
             legendPosition: vueGraph.legendPosition,
             lines: vueGraph.lines,
             xAxisItem: vueGraph.xAxisItem,
+            drawStyle: vueGraph.drawStyle,
           }
           // Only add the start and end time if we have both
           // This prevents adding just the start time and having the graph
@@ -648,13 +649,12 @@ export default {
       }
 
       let graphs = config.graphs
-      for (let graph of graphs) {
+      for (let _graph of graphs) {
         await this.addGraph(false) // Don't check existing graphs
       }
       await this.$nextTick()
-      const that = this
-      graphs.forEach(function (graph, i) {
-        let vueGraph = that.$refs[`graph${i}`][0]
+      graphs.forEach((graph, i) => {
+        let vueGraph = this.$refs[`graph${i}`][0]
         vueGraph.title = graph.title
         vueGraph.fullWidth = graph.fullWidth
         vueGraph.fullHeight = graph.fullHeight
@@ -663,6 +663,9 @@ export default {
         vueGraph.graphStartDateTime = graph.graphStartDateTime
         vueGraph.graphEndDateTime = graph.graphEndDateTime
         vueGraph.moveLegend(graph.legendPosition)
+        if (graph.drawStyle) {
+          vueGraph.drawStyle = graph.drawStyle
+        }
         vueGraph.addItems([...graph.items])
         vueGraph.lines = graph.lines
         vueGraph.xAxisItem = graph.xAxisItem

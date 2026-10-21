@@ -8,9 +8,9 @@
 # See LICENSE.md for more details.
 */
 
-// @ts-check
 import { test, expect } from './../fixture'
 import * as fs from 'fs'
+import * as path from 'path'
 
 test.use({
   toolPath: '/tools/admin/plugins',
@@ -18,168 +18,55 @@ test.use({
   storageState: 'adminStorageState.json',
 })
 
+// The list of plugins that ship with COSMOS, parsed from the same file the
+// backend uses so this test covers every entry. Entries marked
+// "# Enterprise only" are only installed in the Enterprise edition.
+const DEFAULT_PLUGINS_FILE = path.resolve(
+  __dirname,
+  '../../../openc3/data/config/default_plugins.yaml',
+)
+const defaultPlugins = fs
+  .readFileSync(DEFAULT_PLUGINS_FILE, 'utf8')
+  .split('\n')
+  .filter((line) => line.startsWith('- '))
+  .map((line) => ({
+    name: line.slice(2).replace(/#.*/, '').trim(),
+    enterpriseOnly: line.includes('Enterprise only'),
+  }))
+// Enterprise replaces these with openc3-enterprise-tool-base and
+// openc3-cosmos-enterprise-tool-admin so they are not installed there
+const coreOnly = ['openc3-cosmos-tool-admin', 'openc3-tool-base']
+const installedDefaultPlugins = defaultPlugins
+  .filter((plugin) =>
+    process.env.ENTERPRISE === '1'
+      ? !coreOnly.includes(plugin.name)
+      : !plugin.enterpriseOnly,
+  )
+  .map((plugin) => plugin.name)
+
 test('shows and hides built-in tools', async ({ page, utils }) => {
+  expect(defaultPlugins.length).toBeGreaterThan(0)
+  expect(installedDefaultPlugins.length).toBeGreaterThan(0)
+
   // Ensure we're showing all the rows in the table
   await page.getByRole('combobox').filter({ hasText: '10' }).click()
   await page.getByText('All', { exact: true }).click()
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-demo',
-  )
-  if (process.env.ENTERPRISE === '1') {
-    await expect(page.locator('id=openc3-tool')).not.toContainText(
-      'openc3-cosmos-enterprise-tool-admin',
-    )
-    await expect(page.locator('id=openc3-tool')).not.toContainText(
-      'openc3-enterprise-tool-base',
-    )
-    await expect(page.locator('id=openc3-tool')).not.toContainText(
-      'openc3-cosmos-tool-autonomic',
-    )
-    await expect(page.locator('id=openc3-tool')).not.toContainText(
-      'openc3-cosmos-tool-calendar',
-    )
-    await expect(page.locator('id=openc3-tool')).not.toContainText(
-      'openc3-cosmos-tool-cmdhistory',
-    )
-    await expect(page.locator('id=openc3-tool')).not.toContainText(
-      'openc3-cosmos-tool-grafana',
-    )
-    await expect(page.locator('id=openc3-tool')).not.toContainText(
-      'openc3-cosmos-tool-logexplorer',
-    )
-    await expect(page.locator('id=openc3-tool')).not.toContainText(
-      'openc3-cosmos-tool-notebooks',
-    )
-    await expect(page.locator('id=openc3-tool')).not.toContainText(
-      'openc3-cosmos-tool-systemhealth',
-    )
-  } else {
-    await expect(page.locator('id=openc3-tool')).not.toContainText(
-      'openc3-cosmos-tool-admin',
-    )
-    await expect(page.locator('id=openc3-tool')).not.toContainText(
-      'openc3-tool-base',
-    )
-  }
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-cmdsender',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-cmdtlmserver',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-dataextractor',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-dataviewer',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-docs',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-handbooks',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-iframe',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-limitsmonitor',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-packetviewer',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-scriptrunner',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-tablemanager',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-tlmgrapher',
-  )
-  await expect(page.locator('id=openc3-tool')).not.toContainText(
-    'openc3-cosmos-tool-tlmviewer',
-  )
+  const plugins = page.locator('id=openc3-tool')
 
-  await page.locator('text=Show Default Tools').click()
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-demo',
-  )
-  if (process.env.ENTERPRISE === '1') {
-    await expect(page.locator('id=openc3-tool')).toContainText(
-      'openc3-cosmos-enterprise-tool-admin',
-    )
-    await expect(page.locator('id=openc3-tool')).toContainText(
-      'openc3-enterprise-tool-base',
-    )
-    await expect(page.locator('id=openc3-tool')).toContainText(
-      'openc3-cosmos-tool-autonomic',
-    )
-    await expect(page.locator('id=openc3-tool')).toContainText(
-      'openc3-cosmos-tool-calendar',
-    )
-    await expect(page.locator('id=openc3-tool')).toContainText(
-      'openc3-cosmos-tool-cmdhistory',
-    )
-    await expect(page.locator('id=openc3-tool')).toContainText(
-      'openc3-cosmos-tool-grafana',
-    )
-    await expect(page.locator('id=openc3-tool')).toContainText(
-      'openc3-cosmos-tool-logexplorer',
-    )
-    await expect(page.locator('id=openc3-tool')).toContainText(
-      'openc3-cosmos-tool-notebooks',
-    )
-    await expect(page.locator('id=openc3-tool')).toContainText(
-      'openc3-cosmos-tool-systemhealth',
-    )
-  } else {
-    await expect(page.locator('id=openc3-tool')).toContainText(
-      'openc3-cosmos-tool-admin',
-    )
-    await expect(page.locator('id=openc3-tool')).toContainText(
-      'openc3-tool-base',
+  // Non default plugins are shown and no plugin from the default list is
+  await expect(plugins).toContainText('openc3-cosmos-demo')
+  for (const plugin of defaultPlugins) {
+    await expect(plugins, `${plugin.name} should be hidden`).not.toContainText(
+      plugin.name,
     )
   }
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-cmdsender',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-cmdtlmserver',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-dataextractor',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-dataviewer',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-docs',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-handbooks',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-iframe',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-limitsmonitor',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-packetviewer',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-scriptrunner',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-tablemanager',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-tlmgrapher',
-  )
-  await expect(page.locator('id=openc3-tool')).toContainText(
-    'openc3-cosmos-tool-tlmviewer',
-  )
+
+  // Showing the default tools shows every installed plugin from the list
+  await page.locator('text=Show Default Tools').click()
+  await expect(plugins).toContainText('openc3-cosmos-demo')
+  for (const name of installedDefaultPlugins) {
+    await expect(plugins, `${name} should be shown`).toContainText(name)
+  }
 })
 
 test('downloads the demo plugin', async ({ page, utils }) => {
@@ -229,6 +116,70 @@ test('shows targets associated with plugins', async ({ page, utils }) => {
       .locator('[data-test=plugin-list] div:has-text("openc3-cosmos-demo")')
       .first(),
   ).toContainText('TEMPLATED')
+})
+
+test('prompts before closing dirty plugin editor on ESC', async ({
+  page,
+  utils,
+}) => {
+  const plugin = 'openc3-cosmos-demo'
+  // Open the edit dialog for the demo plugin
+  await page
+    .locator('[data-test=plugin-list-item]')
+    .filter({ hasText: plugin })
+    .locator('[data-test=plugin-actions]')
+    .click()
+  await page.locator('[data-test=edit-plugin]').click()
+  await expect(page.locator('.v-dialog:has-text("Variables")')).toBeVisible()
+
+  // Switch to the plugin.txt tab where the Ace editor is
+  await page.getByRole('tab', { name: 'plugin.txt' }).click()
+  await utils.sleep(500)
+
+  // Press ESC without making changes - dialog should close immediately
+  await page.keyboard.press('Escape')
+  await expect(
+    page.locator('.v-dialog:has-text("Variables")'),
+  ).not.toBeVisible()
+
+  // Reopen the edit dialog
+  await page
+    .locator('[data-test=plugin-list-item]')
+    .filter({ hasText: plugin })
+    .locator('[data-test=plugin-actions]')
+    .click()
+  await page.locator('[data-test=edit-plugin]').click()
+  await expect(page.locator('.v-dialog:has-text("Variables")')).toBeVisible()
+
+  // Switch to the plugin.txt tab
+  await page.getByRole('tab', { name: 'plugin.txt' }).click()
+  await utils.sleep(500)
+
+  // Type something into the Ace editor to make it dirty
+  await page.locator('.v-dialog .editor textarea').first().fill('# dirty edit')
+  await utils.sleep(500)
+
+  // Press ESC - should show the unsaved changes confirmation dialog
+  await page.keyboard.press('Escape')
+  await expect(page.getByText('You have unsaved changes')).toBeVisible()
+
+  // Click Cancel to stay in the editor
+  await page.locator('[data-test="confirm-dialog-cancel"]').click()
+  // The plugin dialog should still be open
+  await expect(page.locator('.v-dialog:has-text("Variables")')).toBeVisible()
+
+  // Press ESC again to re-trigger the confirmation
+  await page.keyboard.press('Escape')
+  await expect(page.getByText('You have unsaved changes')).toBeVisible()
+
+  // This time confirm closing without saving
+  await page
+    .locator('[data-test="confirm-dialog-close without saving"]')
+    .click()
+  // The plugin dialog should now be closed
+  await expect(
+    page.locator('.v-dialog:has-text("Variables")'),
+  ).not.toBeVisible()
 })
 
 // Playwright requires a separate test.describe to then call test.use
@@ -450,8 +401,14 @@ test.describe(() => {
     await expect(page.locator('.v-dialog:has-text("Variables")')).toBeVisible()
     await page.locator('data-test=edit-submit').click()
     await expect(page.locator('.v-dialog:has-text("Modified")')).toBeVisible()
-    // Check the delete box
-    await page.locator('text=DELETE MODIFIED').click()
+    // Without Version History (Core, or Enterprise with it disabled) the
+    // dialog offers to delete the modified files; check it to take the
+    // plugin's version. With Version History there is no checkbox and the
+    // plugin's version is taken, with the prior content versioned.
+    const deleteModified = page.locator('text=DELETE MODIFIED')
+    if (await deleteModified.isVisible()) {
+      await deleteModified.click()
+    }
     await page.locator('data-test=modified-plugin-submit').click()
     await expect(page.locator('[data-test=plugin-alert]')).toContainText(
       'Started installing',

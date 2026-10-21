@@ -18,6 +18,7 @@
 # https://www.rubydoc.info/gems/redis/Redis/Commands/SortedSets
 
 require 'openc3/models/model'
+require 'openc3/models/timeline_model'
 require 'openc3/topics/timeline_topic'
 require 'securerandom'
 
@@ -28,6 +29,11 @@ module OpenC3
 
   class ActivityModel < Model
     MAX_DURATION = Time::SEC_PER_DAY
+    # Grace window (in seconds) to allow creating activities slightly in the past.
+    # This handles race conditions where real-time activity notifications arrive
+    # after the start time has already passed (e.g. from external systems).
+    # This is consistent with the -15 second window in the timeline microservice.
+    START_GRACE_SECONDS = 15
     PRIMARY_KEY = '__openc3_timelines'.freeze # MUST be equal to `TimelineModel::PRIMARY_KEY` minus the leading __
     # See run_activity(activity) in openc3/lib/openc3/microservices/timeline_microservice.rb
     VALID_KINDS = %w(command script reserve expire)
@@ -212,7 +218,7 @@ module OpenC3
     end
 
     # validate the input to the rules we have created for timelines.
-    # - A task's start MUST NOT be in the past.
+    # - A task's start MUST NOT be more than START_GRACE_SECONDS in the past.
     # - A task's start MUST be before the stop.
     # - A task CAN NOT be longer than MAX_DURATION (86400) in seconds.
     # - A task MUST have a kind.
@@ -230,8 +236,8 @@ module OpenC3
       rescue NoMethodError
         raise ActivityInputError.new "start and stop must be seconds: #{start}, #{stop}"
       end
-      if now_f >= start and kind != 'expire'
-        raise ActivityInputError.new "activity must be in the future, current_time: #{now_f} vs #{start}"
+      if now_f >= start + START_GRACE_SECONDS and kind != 'expire'
+        raise ActivityInputError.new "activity must not be more than #{START_GRACE_SECONDS} seconds in the past, current_time: #{now_f} vs #{start}"
       elsif duration > MAX_DURATION and kind != 'expire'
         raise ActivityInputError.new "activity can not be longer than #{MAX_DURATION} seconds"
       elsif duration <= 0
@@ -262,6 +268,12 @@ module OpenC3
     # Update the Redis hash at primary_key and set the score equal to the start Epoch time
     # the member is set to the JSON generated via calling as_json
     def create(overlap: true, username: nil)
+      # Validate that the timeline exists in this scope before creating activities.
+      # Activities must be attached to an existing timeline within the same scope.
+      unless TimelineModel.get(name: @name, scope: @scope)
+        raise ActivityError.new "timeline '#{@name}' does not exist in scope '#{@scope}'"
+      end
+
       if @recurring['end'] and @recurring['frequency'] and @recurring['span']
         # First validate the initial recurring activity ... all others are just offsets
         validate_input(start: @start, stop: @stop, kind: @kind, data: @data)

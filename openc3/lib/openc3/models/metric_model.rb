@@ -16,25 +16,76 @@
 # if purchased from OpenC3, Inc.
 
 require 'openc3/models/model'
+require 'openc3/models/db_sharded_model'
 
 module OpenC3
   class MetricModel < EphemeralModel
+    include DbShardedModel
+
     PRIMARY_KEY = '__openc3__metric'.freeze
+    # Process level metrics (cpu, memory) reported by the operator on behalf of
+    # the microservices it spawned. These live in their own hash so that the
+    # operator and the microservice are never two writers of one field - each
+    # write replaces the whole values hash, so sharing a field would have them
+    # clobbering each other every cycle. The two are merged back together on
+    # read by get/names/all, so callers see a single row per microservice.
+    PROCESS_PRIMARY_KEY = '__openc3__process_metric'.freeze
+    METRIC_EXPIRE_SECONDS = 3600 # Expire metrics after 1 hour
 
     attr_accessor :values
+    attr_accessor :db_shard
+
+    # Look up db_shard from the corresponding MicroserviceModel.
+    def self._lookup_db_shard(name, scope:) # NOSONAR
+      json = Store.hget('openc3_microservices', name)
+      json ? (JSON.parse(json, allow_nan: true, create_additions: true)['db_shard'] || 0).to_i : 0
+    end
+
+    # Collect all unique db_shard values from MicroserviceModels.
+    def self._collect_db_shards(scope:)
+      db_shards = Set.new([0])
+      Store.hgetall('openc3_microservices').each do |name, json|
+        next if scope and name.split("__")[0] != scope
+        db_shards << (JSON.parse(json, allow_nan: true, create_additions: true)['db_shard'] || 0).to_i
+      end
+      db_shards
+    end
 
     # NOTE: The following three class methods are used by the ModelController
     # and are reimplemented to enable various Model class methods to work
     def self.get(name:, scope:)
-      super("#{scope}#{PRIMARY_KEY}", name: name)
+      _merge_entries(
+        _db_sharded_get("#{scope}#{PRIMARY_KEY}", name: name, scope: scope),
+        _db_sharded_get("#{scope}#{PROCESS_PRIMARY_KEY}", name: name, scope: scope)
+      )
     end
 
     def self.names(scope:)
-      super("#{scope}#{PRIMARY_KEY}")
+      names = _db_sharded_names("#{scope}#{PRIMARY_KEY}", scope: scope)
+      names.concat(_db_sharded_names("#{scope}#{PROCESS_PRIMARY_KEY}", scope: scope))
+      names.uniq.sort
     end
 
     def self.all(scope:)
-      super("#{scope}#{PRIMARY_KEY}")
+      result = _db_sharded_all("#{scope}#{PRIMARY_KEY}", scope: scope)
+      _db_sharded_all("#{scope}#{PROCESS_PRIMARY_KEY}", scope: scope).each do |name, process_entry|
+        result[name] = _merge_entries(result[name], process_entry)
+      end
+      result
+    end
+
+    # Combine a microservice's self reported metrics with the process metrics
+    # the operator reported for it. The microservice's own values win on a key
+    # collision - a process that can measure itself knows better than the
+    # operator watching from outside.
+    def self._merge_entries(entry, process_entry)
+      return entry unless process_entry
+      return process_entry unless entry
+
+      entry['values'] = (process_entry['values'] || {}).merge(entry['values'] || {})
+      updated_at = [entry['updated_at'], process_entry['updated_at']].compact.max
+      entry['updated_at'] = updated_at if updated_at
+      entry
     end
 
     # Sets (updates) the redis hash of this model
@@ -42,23 +93,44 @@ module OpenC3
     def self.set(json, scope:, queued: true)
       json[:scope] = scope
       json.transform_keys!(&:to_sym)
-      self.new(**json).create(force: true, queued: queued)
+      self.new(**json).create(force: true, queued: queued, expire_seconds: METRIC_EXPIRE_SECONDS)
+    end
+
+    # Sets (updates) the process metrics reported by the operator for a
+    # microservice it spawned. See PROCESS_PRIMARY_KEY.
+    def self.set_process(json, scope:, queued: true)
+      json[:scope] = scope
+      json.transform_keys!(&:to_sym)
+      json[:primary_key] = PROCESS_PRIMARY_KEY
+      self.new(**json).create(force: true, queued: queued, expire_seconds: METRIC_EXPIRE_SECONDS)
     end
 
     def self.destroy(scope:, name:)
-      EphemeralStore.hdel("#{scope}#{PRIMARY_KEY}", name)
+      db_shard = _db_shard_for_name(name, scope: scope)
+      store.instance(db_shard: db_shard).hdel("#{scope}#{PRIMARY_KEY}", name)
+      store.instance(db_shard: db_shard).hdel("#{scope}#{PROCESS_PRIMARY_KEY}", name)
     end
 
-    def initialize(name:, values: {}, scope:)
-      super("#{scope}#{PRIMARY_KEY}", name: name, scope: scope)
+    def initialize(name:, values: {}, db_shard: 0, scope:, primary_key: PRIMARY_KEY)
+      super("#{scope}#{primary_key}", name: name, scope: scope)
       @values = values
+      @db_shard = db_shard.to_i
+    end
+
+    def create(update: false, force: false, queued: false, expire_seconds: nil)
+      _db_sharded_create(@db_shard, update: update, force: force, queued: queued, expire_seconds: expire_seconds)
+    end
+
+    def destroy
+      _db_sharded_destroy(@db_shard)
     end
 
     def as_json(*a)
       {
         'name' => @name,
         'updated_at' => @updated_at,
-        'values' => @values.as_json(*a)
+        'values' => @values.as_json(*a),
+        'db_shard' => @db_shard,
       }
     end
 
@@ -74,37 +146,64 @@ module OpenC3
     end
 
     def self.redis_metrics
+      # This prevents a circular dependency
+      require 'openc3/models/scope_model' # NOSONAR
+      require 'openc3/models/target_model' # NOSONAR
+
+      db_shards = Set.new
+      OpenC3::ScopeModel.names.each do |scope|
+        targets = OpenC3::TargetModel.all(scope: scope)
+        targets.each do |_target_name, target_hash|
+          db_shards << target_hash['db_shard'].to_i
+        end
+      end
+
       result = {}
+      db_shards.each do |index|
+        db_shard_result = {}
+        metrics = OpenC3::Store.instance(db_shard: index).info("all")
+        db_shard_result["redis_connected_clients_total"] = metrics['connected_clients']
+        db_shard_result["redis_used_memory_rss_total"] = metrics['used_memory_rss']
+        db_shard_result["redis_commands_processed_total"] = metrics['total_commands_processed']
+        db_shard_result["redis_iops"] = metrics['instantaneous_ops_per_sec']
+        db_shard_result["redis_instantaneous_input_kbps"] = metrics['instantaneous_input_kbps']
+        db_shard_result["redis_instantaneous_output_kbps"] = metrics['instantaneous_output_kbps']
+        db_shard_result["redis_instantaneous_eventloop_cps"] = metrics['instantaneous_eventloop_cycles_per_sec']
+        db_shard_result["redis_instantaneous_eventloop_duration_usec"] = metrics['instantaneous_eventloop_duration_usec']
+        db_shard_result["redis_cpu_sys"] = metrics['used_cpu_sys']
+        db_shard_result["redis_cpu_user"] = metrics['used_cpu_user']
+        db_shard_result["redis_error_noauth_total"] = metrics['errorstat_NOAUTH'].to_s.split("count=")[-1].to_i
+        db_shard_result["redis_error_noperm_total"] = metrics['errorstat_NOPERM'].to_s.split("count=")[-1].to_i
+        db_shard_result["redis_hget_p50_seconds"], db_shard_result["redis_hget_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hget'])
+        db_shard_result["redis_hgetall_p50_seconds"], db_shard_result["redis_hgetall_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hgetall'])
+        db_shard_result["redis_hset_p50_seconds"], db_shard_result["redis_hset_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hset'])
+        db_shard_result["redis_xadd_p50_seconds"], db_shard_result["redis_xadd_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xadd'])
+        db_shard_result["redis_xread_p50_seconds"], db_shard_result["redis_xread_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xread'])
+        db_shard_result["redis_xrevrange_p50_seconds"], db_shard_result["redis_xrevrange_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xrevrange'])
+        db_shard_result["redis_xtrim_p50_seconds"], db_shard_result["redis_xtrim_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xtrim'])
 
-      metrics = OpenC3::Store.info("all")
-      result['redis_connected_clients_total'] = metrics['connected_clients']
-      result['redis_used_memory_rss_total'] = metrics['used_memory_rss']
-      result['redis_commands_processed_total'] = metrics['total_commands_processed']
-      result['redis_iops'] = metrics['instantaneous_ops_per_sec']
-      result['redis_instantaneous_input_kbps'] = metrics['instantaneous_input_kbps']
-      result['redis_instantaneous_output_kbps'] = metrics['instantaneous_output_kbps']
-      result['redis_hget_p50_seconds'], result['redis_hget_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hget'])
-      result['redis_hgetall_p50_seconds'], result['redis_hgetall_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hgetall'])
-      result['redis_hset_p50_seconds'], result['redis_hset_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hset'])
-      result['redis_xadd_p50_seconds'], result['redis_xadd_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xadd'])
-      result['redis_xread_p50_seconds'], result['redis_xread_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xread'])
-      result['redis_xrevrange_p50_seconds'], result['redis_xrevrange_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xrevrange'])
-      result['redis_xtrim_p50_seconds'], result['redis_xtrim_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xtrim'])
-
-      metrics = OpenC3::EphemeralStore.info("all")
-      result['redis_ephemeral_connected_clients_total'] = metrics['connected_clients']
-      result['redis_ephemeral_used_memory_rss_total'] = metrics['used_memory_rss']
-      result['redis_ephemeral_commands_processed_total'] = metrics['total_commands_processed']
-      result['redis_ephemeral_iops'] = metrics['instantaneous_ops_per_sec']
-      result['redis_ephemeral_instantaneous_input_kbps'] = metrics['instantaneous_input_kbps']
-      result['redis_ephemeral_instantaneous_output_kbps'] = metrics['instantaneous_output_kbps']
-      result['redis_ephemeral_hget_p50_seconds'], result['redis_ephemeral_hget_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hget'])
-      result['redis_ephemeral_hgetall_p50_seconds'], result['redis_ephemeral_hgetall_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hgetall'])
-      result['redis_ephemeral_hset_p50_seconds'], result['redis_ephemeral_hset_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hset'])
-      result['redis_ephemeral_xadd_p50_seconds'], result['redis_ephemeral_xadd_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xadd'])
-      result['redis_ephemeral_xread_p50_seconds'], result['redis_ephemeral_xread_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xread'])
-      result['redis_ephemeral_xrevrange_p50_seconds'], result['redis_ephemeral_xrevrange_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xrevrange'])
-      result['redis_ephemeral_xtrim_p50_seconds'], result['redis_ephemeral_xtrim_p99_seconds'] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xtrim'])
+        metrics = OpenC3::EphemeralStore.instance(db_shard: index).info("all")
+        db_shard_result["redis_ephemeral_connected_clients_total"] = metrics['connected_clients']
+        db_shard_result["redis_ephemeral_used_memory_rss_total"] = metrics['used_memory_rss']
+        db_shard_result["redis_ephemeral_commands_processed_total"] = metrics['total_commands_processed']
+        db_shard_result["redis_ephemeral_iops"] = metrics['instantaneous_ops_per_sec']
+        db_shard_result["redis_ephemeral_instantaneous_input_kbps"] = metrics['instantaneous_input_kbps']
+        db_shard_result["redis_ephemeral_instantaneous_output_kbps"] = metrics['instantaneous_output_kbps']
+        db_shard_result["redis_ephemeral_instantaneous_eventloop_cps"] = metrics['instantaneous_eventloop_cycles_per_sec']
+        db_shard_result["redis_ephemeral_instantaneous_eventloop_duration_usec"] = metrics['instantaneous_eventloop_duration_usec']
+        db_shard_result["redis_ephemeral_cpu_sys"] = metrics['used_cpu_sys']
+        db_shard_result["redis_ephemeral_cpu_user"] = metrics['used_cpu_user']
+        db_shard_result["redis_ephemeral_error_noauth_total"] = metrics['errorstat_NOAUTH'].to_s.split("count=")[-1].to_i
+        db_shard_result["redis_ephemeral_error_noperm_total"] = metrics['errorstat_NOPERM'].to_s.split("count=")[-1].to_i
+        db_shard_result["redis_ephemeral_hget_p50_seconds"], db_shard_result["redis_ephemeral_hget_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hget'])
+        db_shard_result["redis_ephemeral_hgetall_p50_seconds"], db_shard_result["redis_ephemeral_hgetall_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hgetall'])
+        db_shard_result["redis_ephemeral_hset_p50_seconds"], db_shard_result["redis_ephemeral_hset_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_hset'])
+        db_shard_result["redis_ephemeral_xadd_p50_seconds"], db_shard_result["redis_ephemeral_xadd_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xadd'])
+        db_shard_result["redis_ephemeral_xread_p50_seconds"], db_shard_result["redis_ephemeral_xread_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xread'])
+        db_shard_result["redis_ephemeral_xrevrange_p50_seconds"], db_shard_result["redis_ephemeral_xrevrange_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xrevrange'])
+        db_shard_result["redis_ephemeral_xtrim_p50_seconds"], db_shard_result["redis_ephemeral_xtrim_p99_seconds"] = redis_extract_p50_and_p99_seconds(metrics['latency_percentiles_usec_xtrim'])
+        result[index] = db_shard_result
+      end
 
       return result
     end

@@ -165,9 +165,14 @@ pnpm lint                     # ESLint, run from the openc3-cosmos-init/plugins/
 
 ### API Tests (Rails)
 
+The Rails APIs depend on the local `openc3` gem, which must be built first (see
+Ruby Tests above). Set `OPENC3_DEVEL` to the path of the local `openc3` gem so
+Bundler resolves it from source instead of trying to fetch it from RubyGems.
+
 ```bash
-cd openc3-cosmos-cmd-tlm-api && bundle exec rspec
-cd openc3-cosmos-script-runner-api && bundle exec rspec
+export OPENC3_DEVEL=../openc3
+cd openc3-cosmos-cmd-tlm-api && bundle install && bundle exec rspec
+cd openc3-cosmos-script-runner-api && bundle install && bundle exec rspec
 ```
 
 ### Playwright E2E Tests
@@ -202,7 +207,7 @@ PWDEBUG=1 pnpm test:parallel --headed     # Debug mode
 - **Ruff** - Python linter and formatter (fast Rust-based replacement for flake8/black)
 - **Vue.js 3 + Vuetify 3** - Frontend UI framework
 - **Vite** - Frontend build tool
-- **pnpm 10** - Frontend package management (monorepo workspace)
+- **pnpm 11** - Frontend package management (monorepo workspace)
 - **Node.js 24** - JavaScript runtime
 - **Docker Compose** - Container orchestration
 - **Valkey** - Caching, pub/sub, ephemeral state
@@ -210,23 +215,6 @@ PWDEBUG=1 pnpm test:parallel --headed     # Debug mode
 - **Playwright** - E2E testing
 
 ## Code Style
-
-### Installing Hooks
-
-After cloning the repository, install git hooks to ensure code quality and consistency:
-
-```bash
-./hooks/install.sh
-```
-
-This installs:
-
-- **pre-commit** - Automatically updates copyright years in modified files to the current year
-
-### File Headers
-
-- When modifying any file, update the "Copyright YYYY OpenC3, Inc." line in the file header to the current year (2026). Do NOT modify the Ball Aerospace copyright line.
-- The pre-commit hook automatically handles this if installed.
 
 ### Ruby
 
@@ -258,8 +246,15 @@ This installs:
 ### JavaScript/TypeScript
 
 - ESLint 9 with Vue parser
-- Prettier for formatting
+- Prettier for formatting (enforced via `prettier/prettier` ESLint rule)
 - Config in `openc3-cosmos-init/plugins/eslint.config.mjs`
+- **After editing Vue/JS files, always run the linter** to catch formatting issues before committing:
+  ```bash
+  cd openc3-cosmos-init/plugins/packages/<package-name>
+  pnpm lint              # check for issues
+  pnpm lint --fix        # auto-fix formatting
+  ```
+- CI runs `pnpm lint --max-warnings 0` — any warning fails the build
 
 ## Plugin Development
 
@@ -276,3 +271,17 @@ Generate new plugins: `./openc3.sh cli generate plugin MyPlugin`
 ## Enterprise vs Core
 
 Set `ENTERPRISE=1` environment variable for Enterprise features. Enterprise uses Keycloak authentication. Core uses simple password authentication.
+
+## Commit Message Format
+
+[Conventional Commits v1.0.0](https://www.conventionalcommits.org/en/v1.0.0/).
+Run `/commit-message` to generate one from the staged changes -
+`.claude/commands/commit-message.md` is the authority on format, so the rules
+live in one place rather than being duplicated here.
+
+**Guidelines:**
+
+- Subject line: imperative mood, lowercase, no period, max 72 chars
+- Body: explain what and why (not how), keep concise (2-4 lines max)
+- Scope: component/module affected
+- Always include Claude Code attribution footer

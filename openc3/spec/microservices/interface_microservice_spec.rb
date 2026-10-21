@@ -27,6 +27,8 @@ module OpenC3
   describe InterfaceMicroservice do
     before(:each) do
       # This must be here in order to work when running more than this individual file
+      saved_verbose = $VERBOSE
+      $VERBOSE = nil
       class TestInterface < Interface
         def initialize(hostname = "default", port = 12345)
           @hostname = hostname
@@ -77,6 +79,7 @@ module OpenC3
           @data = data
         end
       end
+      $VERBOSE = saved_verbose
 
       mock_redis()
       setup_system()
@@ -189,6 +192,63 @@ module OpenC3
       end
     end
 
+    describe "interface_details directive" do
+      # Drive the command handler block directly. receive_commands is stubbed so
+      # the block runs once with a crafted message and its return value (which
+      # becomes the ack payload) is captured.
+      def handle_interface_details(interface)
+        handler = InterfaceCmdHandlerThread.new(interface, double("tlm").as_null_object, scope: "DEFAULT")
+        result = nil
+        allow(InterfaceTopic).to receive(:receive_commands) do |*_args, **_kwargs, &block|
+          result = block.call("{DEFAULT__CMD}INTERFACE__INST_INT",
+                              "#{(Time.now.to_f * 1000).to_i}-0",
+                              { 'interface_details' => 'true' }, nil)
+        end
+        handler.run
+        result
+      end
+
+      it "returns the interface details as JSON" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        interface = im.instance_variable_get(:@interface)
+        expect(JSON.parse(handle_interface_details(interface))['name']).to eql "INST_INT"
+        im.shutdown
+        sleep 0.1 # Allow threads to exit
+      end
+
+      it "returns the error message instead of raising if details raises" do
+        # A custom interface with a broken details implementation must not take
+        # down the microservice, so the error is returned as the ack instead.
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        interface = im.instance_variable_get(:@interface)
+        allow(interface).to receive(:details).and_raise('boom')
+        expect(handle_interface_details(interface)).to eql 'boom'
+        im.shutdown
+        sleep 0.1 # Allow threads to exit
+      end
+    end
+
+    describe "handle_packet" do
+      it "does not write the status model after cancel_thread is set" do
+        # A packet already buffered can be returned from read() after stop()
+        # sets @cancel_thread and destroys the status model. handle_packet must
+        # not re-create the status model in that window (orphaned model bug).
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        interface = im.instance_variable_get(:@interface)
+        interface.connect
+        packet = interface.read
+        expect(packet).to_not be_nil
+
+        # Simulate stop() having run: @cancel_thread set, status model destroyed
+        im.instance_variable_set(:@cancel_thread, true)
+        expect(InterfaceStatusModel).to_not receive(:set)
+        im.send(:handle_packet, packet)
+
+        im.shutdown
+        sleep 0.1 # Allow threads to exit
+      end
+    end
+
     describe "run" do
       it "handles exceptions in connect" do
         $connect_raise = true
@@ -237,23 +297,213 @@ module OpenC3
         end
       end
 
+      describe "connection error logging" do
+        def raised(error)
+          raise error
+        rescue Exception => e
+          e
+        end
+
+        it "does not log a backtrace for expected connection failures" do
+          im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+          allow(im).to receive(:disconnect)
+          errors = []
+          allow(im.instance_variable_get(:@logger)).to receive(:error) { |msg, **| errors << msg }
+          im.handle_connection_failed("default:12345", raised(Errno::ECONNREFUSED.new))
+          expect(errors.length).to eql 1
+          expect(errors[0]).to include("failed due to")
+          im.shutdown
+        end
+
+        it "logs an unexpected connection failure backtrace only once per message" do
+          im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+          allow(im).to receive(:disconnect)
+          errors = []
+          allow(im.instance_variable_get(:@logger)).to receive(:error) { |msg, **| errors << msg }
+          im.handle_connection_failed("default:12345", raised(ArgumentError.new("bad thing")))
+          expect(errors.length).to eql 2
+          expect(errors[1]).to include("interface_microservice_spec.rb")
+          errors.clear
+          im.handle_connection_failed("default:12345", raised(ArgumentError.new("bad thing")))
+          expect(errors.length).to eql 1
+          expect(errors[0]).to_not include("interface_microservice_spec.rb")
+          im.shutdown
+        end
+
+        it "does not log a backtrace for expected lost connections" do
+          im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+          allow(im).to receive(:disconnect)
+          errors = []
+          allow(im.instance_variable_get(:@logger)).to receive(:error) { |msg, **| errors << msg }
+          im.handle_connection_lost(raised(Errno::ECONNRESET.new))
+          expect(errors).to be_empty
+          im.shutdown
+        end
+
+        it "logs an unexpected lost connection backtrace only once per message" do
+          im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+          allow(im).to receive(:disconnect)
+          errors = []
+          allow(im.instance_variable_get(:@logger)).to receive(:error) { |msg, **| errors << msg }
+          im.handle_connection_lost(raised(ArgumentError.new("bad thing")))
+          expect(errors.length).to eql 1
+          expect(errors[0]).to include("interface_microservice_spec.rb")
+          errors.clear
+          im.handle_connection_lost(raised(ArgumentError.new("bad thing")))
+          expect(errors).to be_empty
+          im.shutdown
+        end
+
+        it "logs a backtrace for each exception class with the same message" do
+          im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+          allow(im).to receive(:disconnect)
+          errors = []
+          allow(im.instance_variable_get(:@logger)).to receive(:error) { |msg, **| errors << msg }
+          im.handle_connection_failed("default:12345", raised(ArgumentError.new("bad thing")))
+          im.handle_connection_failed("default:12345", raised(TypeError.new("bad thing")))
+          im.handle_connection_lost(raised(ArgumentError.new("bad thing")))
+          im.handle_connection_lost(raised(TypeError.new("bad thing")))
+          expect(errors.count { |msg| msg.include?("interface_microservice_spec.rb") }).to eql 4
+          im.shutdown
+        end
+
+        it "logs backtraces again only after a user requested connect" do
+          im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+          allow(im).to receive(:disconnect)
+          errors = []
+          allow(im.instance_variable_get(:@logger)).to receive(:error) { |msg, **| errors << msg }
+          log_both = lambda do
+            errors.clear
+            im.handle_connection_failed("default:12345", raised(ArgumentError.new("bad thing")))
+            im.handle_connection_lost(raised(ArgumentError.new("lost thing")))
+            errors.count { |msg| msg.include?("interface_microservice_spec.rb") }
+          end
+          expect(log_both.call).to eql 2
+          expect(log_both.call).to eql 0 # Already seen
+
+          # Connection Success does not clear them, otherwise an error on the first
+          # read after every reconnect would log its backtrace every time
+          im.connect
+          expect(log_both.call).to eql 0
+
+          im.instance_variable_get(:@interface).state = 'ATTEMPTING'
+          im.attempting # A user requested connect clears them
+          expect(log_both.call).to eql 2
+          im.shutdown
+        end
+      end
+
       it "sends a command to the interface" do
         im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
         all = InterfaceStatusModel.all(scope: "DEFAULT")
         expect(all["INST_INT"]["state"]).to eql("ATTEMPTING")
 
-        expect(CommandDecomTopic).to receive(:write_packet) do |command, scope|
-          expect(command.target_name).to eql("INST")
-          expect(command.packet_name).to eql("ABORT")
-          expect(scope).to eql({:scope => "DEFAULT"})
+        # Capture the command in the main thread so the expectations reliably
+        # fail the example rather than raising inside the interface thread
+        # (RSpec's ExpectationNotMetError is not a StandardError and would be
+        # swallowed when the interface thread dies).
+        captured = nil
+        allow(CommandDecomTopic).to receive(:write_packet) do |command, _scope|
+          captured = command
         end
         Thread.new { im.run }
         sleep 0.01
         all = InterfaceStatusModel.all(scope: "DEFAULT")
         expect(all["INST_INT"]["state"]).to eql "CONNECTED"
 
-        @api.cmd("INST", "ABORT")
+        # queue_username is the original author (shown as "Queued By"), passed
+        # by the queue microservice when a command is released from a queue
+        @api.cmd("INST", "ABORT", queue_username: "DEFAULT__MULTI__INST")
         sleep 0.01
+        im.shutdown
+
+        expect(captured).to_not be_nil
+        expect(captured.target_name).to eql("INST")
+        expect(captured.packet_name).to eql("ABORT")
+        expect(captured.extra['queue_username']).to eql("DEFAULT__MULTI__INST")
+      end
+
+      it "acks SUCCESS for a write protocol STOP but rejects a DISCONNECT" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        interface = im.instance_variable_get(:@interface)
+        published = []
+        allow(CommandTopic).to receive(:write_packet) { |command, **| published << command.packet_name }
+        allow(CommandDecomTopic).to receive(:write_packet)
+        Thread.new { im.run }
+        sleep 0.01
+
+        protocol = Protocol.new
+        interface.write_protocols << protocol
+        # STOP means the protocol handled the command, so it is acked and published
+        allow(protocol).to receive(:write_packet).and_return(:STOP)
+        @api.cmd("INST", "ABORT")
+        expect(published).to eql ["ABORT"]
+
+        # DISCONNECT means nothing was written, so the command is rejected and not published
+        allow(protocol).to receive(:write_packet).and_return(:DISCONNECT)
+        expect { @api.cmd("INST", "ABORT") }.to raise_error(/write_packet requested disconnect/)
+        expect(published).to eql ["ABORT"]
+        im.shutdown
+      end
+
+      it "identifies a routed command against the routed target" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        captured = nil
+        allow(CommandTopic).to receive(:write_packet) do |command, _scope|
+          captured = command
+        end
+        Thread.new { im.run }
+        sleep 0.01
+
+        # A router that did not identify the buffer forwards it unidentified
+        packet = Packet.new(nil, nil)
+        packet.buffer = System.commands.build_cmd("INST", "ABORT").buffer
+        RouterTopic.route_command(packet, ['INST'], scope: 'DEFAULT')
+        sleep 0.05
+        im.shutdown
+
+        expect(captured).to_not be_nil
+        expect([captured.target_name, captured.packet_name]).to eql(["INST", "ABORT"])
+      end
+
+      it "sends an unidentified routed command as UNKNOWN" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        captured = nil
+        allow(CommandTopic).to receive(:write_packet) do |command, _scope|
+          captured = command
+        end
+        # INST has a catch-all command, so force identification to fail
+        allow(System.commands).to receive(:identify).and_return(nil)
+        # Sent on behalf of the routed target, so UNKNOWN itself need not be enabled
+        im.instance_variable_get(:@interface).cmd_target_enabled.delete('UNKNOWN')
+        Thread.new { im.run }
+        sleep 0.01
+
+        # An unidentified buffer as a router would forward it
+        packet = Packet.new(nil, nil)
+        packet.buffer = "\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+        RouterTopic.route_command(packet, ['INST'], scope: 'DEFAULT')
+        sleep 0.05
+        im.shutdown
+
+        expect(captured).to_not be_nil
+        expect([captured.target_name, captured.packet_name]).to eql(["UNKNOWN", "UNKNOWN"])
+        expect(captured.packet_name).to eql("UNKNOWN")
+        expect(captured.buffer(false)).to eql("\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF")
+      end
+
+      it "drops an unidentified routed command for a disabled target" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        im.instance_variable_get(:@interface).cmd_target_enabled['INST'] = false
+        expect(CommandTopic).to_not receive(:write_packet)
+        allow(System.commands).to receive(:identify).and_return(nil)
+        Thread.new { im.run }
+        sleep 0.01
+
+        packet = Packet.new(nil, nil)
+        packet.buffer = "\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+        RouterTopic.route_command(packet, ['INST'], scope: 'DEFAULT')
+        sleep 0.05
         im.shutdown
       end
 
@@ -314,6 +564,125 @@ module OpenC3
         interface = im.instance_variable_get(:@interface)
         expect(interface.instance_variable_get(:@hostname)).to eql 'test-host'
         expect(interface.instance_variable_get(:@port)).to eql 54321
+        im.shutdown
+      end
+    end
+
+    describe "already connected" do
+      it "ignores connect_interface on a CONNECTED interface" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        sleep 0.01
+        interface = im.instance_variable_get(:@interface)
+        interface.reconnect_delay = 0.01 # Override the reconnect delay to be quick
+
+        capture_io do |stdout|
+          Thread.new { im.run }
+          sleep 0.01 # Allow to start
+          all = InterfaceStatusModel.all(scope: "DEFAULT")
+          expect(all["INST_INT"]["state"]).to eql "CONNECTED"
+
+          @api.connect_interface("INST_INT")
+          sleep 0.2 # Allow the connect request to be processed
+          expect(stdout.string).to include("Connect ignored, already connected")
+          # The existing connection is left alone
+          expect(stdout.string).not_to include("Connection Lost")
+          expect($disconnect_count).to eql 0
+          all = InterfaceStatusModel.all(scope: "DEFAULT")
+          expect(all["INST_INT"]["state"]).to eql "CONNECTED"
+
+          im.shutdown
+        end
+      end
+
+      it "connects if the state is CONNECTED but the interface is not" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        interface = im.instance_variable_get(:@interface)
+        interface.state = 'CONNECTED'
+        interface.instance_variable_set(:@connected, false)
+        im.attempting()
+        expect(interface.state).to eql 'ATTEMPTING'
+        im.shutdown
+      end
+
+      it "cleanly disconnects an existing connection before connecting" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        interface = im.instance_variable_get(:@interface)
+        interface.state = 'ATTEMPTING'
+        interface.instance_variable_set(:@connected, true)
+        im.connect()
+        # The old connection was closed rather than being abandoned
+        expect($disconnect_count).to eql 1
+        expect(interface.state).to eql 'CONNECTED'
+        im.shutdown
+      end
+
+      it "disconnects even if the interface reports it is not connected" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        interface = im.instance_variable_get(:@interface)
+        interface.state = 'CONNECTED'
+        interface.instance_variable_set(:@connected, false)
+        im.disconnect(false)
+        expect($disconnect_count).to eql 1
+        expect(interface.state).to eql 'DISCONNECTED'
+        im.shutdown
+      end
+
+      # The no-op check in attempting() must not block the reconnect path in
+      # disconnect() or a failed cleanup leaves the interface stuck in CONNECTED
+      it "still reconnects if the interface disconnect raises" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        interface = im.instance_variable_get(:@interface)
+        interface.reconnect_delay = 0.01 # Override the reconnect delay to be quick
+        interface.state = 'CONNECTED'
+        interface.instance_variable_set(:@connected, true)
+        allow(interface).to receive(:disconnect).and_raise('test-error')
+
+        capture_io do |stdout|
+          im.disconnect()
+          expect(stdout.string).to include("Disconnect: INST_INT")
+          expect(stdout.string).not_to include("Connect ignored, already connected")
+        end
+        expect(interface.state).to eql 'ATTEMPTING'
+
+        allow(interface).to receive(:disconnect).and_call_original # Allow a clean shutdown
+        im.shutdown
+      end
+
+      it "cleans up on shutdown even if the interface disconnect raises" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        interface = im.instance_variable_get(:@interface)
+        stream_log_pair = double("StreamLogPair", shutdown: [], cleanup: nil)
+        interface.stream_log_pair = stream_log_pair
+        expect(InterfaceStatusModel.get_model(name: "INST_INT", scope: "DEFAULT")).not_to be_nil
+        allow(interface).to receive(:disconnect).and_raise('test-error')
+
+        capture_io do |stdout|
+          im.shutdown
+          expect(stdout.string).to include("Disconnect failed during stop")
+        end
+        expect(InterfaceStatusModel.get_model(name: "INST_INT", scope: "DEFAULT")).to be_nil
+        expect(stream_log_pair).to have_received(:shutdown)
+        interface.stream_log_pair = nil # Don't leak the double past this example
+      end
+
+      it "still reconnects if the interface disconnect leaves it connected" do
+        im = InterfaceMicroservice.new("DEFAULT__INTERFACE__INST_INT")
+        interface = im.instance_variable_get(:@interface)
+        interface.reconnect_delay = 0.01 # Override the reconnect delay to be quick
+        interface.state = 'CONNECTED'
+        interface.instance_variable_set(:@connected, true)
+        # Disconnect does nothing so connected? still reports true afterwards
+        allow(interface).to receive(:disconnect)
+
+        capture_io do |stdout|
+          im.disconnect()
+          expect(stdout.string).not_to include("Connect ignored, already connected")
+        end
+        expect(interface).to have_received(:disconnect)
+        expect(interface.connected?).to be true
+        expect(interface.state).to eql 'ATTEMPTING'
+
+        allow(interface).to receive(:disconnect).and_call_original # Allow a clean shutdown
         im.shutdown
       end
     end

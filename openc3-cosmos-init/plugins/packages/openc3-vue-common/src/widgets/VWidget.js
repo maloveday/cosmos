@@ -19,6 +19,15 @@ import { TimeFilters } from '@/util'
 import Widget from './Widget'
 import FormatValueBase from './FormatValueBase'
 import { limitsColor, astroStatus } from './LimitsColor'
+
+// A value fades from AGING_START to AGING_MIN by AGING_RATE on every update
+// where it didn't change. The screen uses AGING_UPDATES to know when the fade
+// is done and it can stop pushing unchanged values to the widget.
+export const AGING_START = 80
+export const AGING_MIN = 30
+export const AGING_RATE = 5
+export const AGING_UPDATES = Math.ceil((AGING_START - AGING_MIN) / AGING_RATE)
+
 export default {
   mixins: [Widget, TimeFilters, FormatValueBase],
   // ValueWidget can either get it's value and limitsState directly through props
@@ -46,8 +55,8 @@ export default {
       appliedTimeZone: 'local',
       curValue: null,
       prevValue: null,
-      grayLevel: 80,
-      grayRate: 5,
+      grayLevel: AGING_START,
+      grayRate: AGING_RATE,
       valueId: null,
       arrayIndex: null,
       viewDetails: false,
@@ -65,16 +74,7 @@ export default {
         {
           title: 'Graph',
           action: () => {
-            window.open(
-              '/tools/tlmgrapher/' +
-                encodeURIComponent(this.parameters[0]) +
-                '/' +
-                encodeURIComponent(this.parameters[1]) +
-                '/' +
-                encodeURIComponent(this.parameters[2]) +
-                '/',
-              '_blank',
-            )
+            window.open(this.tlmGrapherUrl, '_blank')
           },
         },
       ],
@@ -82,15 +82,18 @@ export default {
   },
   watch: {
     _counter: function (newVal, oldVal) {
-      if (this.curValue !== this.prevValue) {
-        this.grayLevel = 80
+      // Refresh the computed value before comparing: this watcher runs before
+      // rendering, and the screen stops updates once the fade is complete.
+      const value = this._value
+      if (value !== this.prevValue) {
+        this.grayLevel = AGING_START
       } else {
         this.grayLevel -= this.grayRate
-        if (this.grayLevel < 30) {
-          this.grayLevel = 30
+        if (this.grayLevel < AGING_MIN) {
+          this.grayLevel = AGING_MIN
         }
       }
-      this.prevValue = this.curValue
+      this.prevValue = value
     },
   },
   computed: {
@@ -163,22 +166,27 @@ export default {
       }
       return ''
     },
+    tlmGrapherUrl() {
+      let url =
+        '/tools/tlmgrapher/' +
+        encodeURIComponent(this.parameters[0]) +
+        '/' +
+        encodeURIComponent(this.parameters[1]) +
+        '/' +
+        encodeURIComponent(this.parameters[2])
+      if (this.arrayIndex !== null) {
+        // square brackets must be encoded, unencoded they break the keycloak redirect_uri
+        url += encodeURIComponent(`[${this.arrayIndex}]`)
+      }
+      return url + '/'
+    },
   },
   created() {
     // If they're not passing us the value and limitsState we have to register
     if (this.value === null || this.limitsState === null) {
-      // Remove double bracket escaping. This means they actually have an item
-      // with a bracket in the name, not an array index.
-      if (this.parameters[2].includes('[[')) {
-        this.parameters[2] = this.parameters[2]
-          .replace('[[', '[')
-          .replace(']]', ']')
-      } else if (this.parameters[2].includes('[')) {
-        // Brackets mean array indexes (normally, but see above)
-        let match = this.parameters[2].match(/\[(\d+)\]/)
-        this.arrayIndex = parseInt(match[1])
-        this.parameters[2] = this.parameters[2].replace(match[0], '')
-      }
+      const parsed = this.parseItemName(this.parameters[2])
+      this.parameters[2] = parsed.name
+      this.arrayIndex = parsed.arrayIndex
       this.valueId = `${this.parameters[0]}__${this.parameters[1]}__${
         this.parameters[2]
       }__${this.getType()}`
@@ -221,8 +229,7 @@ export default {
         }
         return this.formatValueBase(value, this.formatString)
       } catch (e) {
-        // eslint-disable-next-line
-        console.log(
+        console.error(
           `${this.valueId} formatValue on ${value} with ${this.formatString} failed due to ${e}`,
         )
         return value

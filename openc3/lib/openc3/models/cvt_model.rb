@@ -15,11 +15,10 @@
 # This file may also be used under the terms of a commercial license
 # if purchased from OpenC3, Inc.
 
-require 'set'
 require 'openc3/utilities/store'
 require 'openc3/utilities/store_queued'
 require 'openc3/utilities/questdb_client'
-require 'openc3/models/target_model'
+# require 'openc3/models/target_model' # Circular require
 
 module OpenC3
   class CvtModel
@@ -27,8 +26,18 @@ module OpenC3
     @@override_cache = {}
 
     VALUE_TYPES = [:RAW, :CONVERTED, :FORMATTED]
-    def self.build_json_from_packet(packet)
-      packet.decom
+    def self.build_json_from_packet(packet, include_limits_states: true)
+      packet.decom(include_limits_states: include_limits_states)
+    end
+
+    # Get a Store instance routed to the correct db_shard for a target
+    def self.store_for_target(target_name, scope:)
+      Store.instance(db_shard: Store.db_shard_for_target(target_name, scope: scope))
+    end
+
+    # Get a StoreQueued instance routed to the correct db_shard for a target
+    def self.store_queued_for_target(target_name, scope:)
+      StoreQueued.instance(db_shard: Store.db_shard_for_target(target_name, scope: scope))
     end
 
     # Delete the current value table for a target
@@ -36,7 +45,7 @@ module OpenC3
       key = "#{scope}__tlm__#{target_name}"
       tgt_pkt_key = key + "__#{packet_name}"
       @@packet_cache[tgt_pkt_key] = nil
-      Store.hdel(key, packet_name)
+      store_for_target(target_name, scope: scope).hdel(key, packet_name)
     end
 
     # Set the current value table for a target, packet
@@ -46,9 +55,9 @@ module OpenC3
       tgt_pkt_key = key + "__#{packet_name}"
       @@packet_cache[tgt_pkt_key] = [Time.now, hash]
       if queued
-        StoreQueued.hset(key, packet_name, packet_json)
+        store_queued_for_target(target_name, scope: scope).hset(key, packet_name, packet_json)
       else
-        Store.hset(key, packet_name, packet_json)
+        store_for_target(target_name, scope: scope).hset(key, packet_name, packet_json)
       end
     end
 
@@ -60,9 +69,9 @@ module OpenC3
       tgt_pkt_key = key + "__#{packet_name}"
       @@packet_cache[tgt_pkt_key] = [Time.now, hash]
       if queued
-        StoreQueued.hset(key, packet_name, packet_json)
+        store_queued_for_target(target_name, scope: scope).hset(key, packet_name, packet_json)
       else
-        Store.hset(key, packet_name, packet_json)
+        store_for_target(target_name, scope: scope).hset(key, packet_name, packet_json)
       end
     end
 
@@ -76,8 +85,8 @@ module OpenC3
         cache_time, hash = @@packet_cache[tgt_pkt_key]
         return hash if hash and (now - cache_time) < cache_timeout
       end
-      packet = Store.hget(key, packet_name)
-      raise "Packet '#{target_name} #{packet_name}' does not exist" unless packet
+      packet = store_for_target(target_name, scope: scope).hget(key, packet_name)
+      raise "Packet '#{target_name} #{packet_name}' has no current values in CVT" unless packet
       hash = JSON.parse(packet, allow_nan: true, create_additions: true)
       @@packet_cache[tgt_pkt_key] = [now, hash]
       hash
@@ -98,7 +107,7 @@ module OpenC3
         hash["#{item_name}__C"] = value
         hash[item_name] = value
       else
-        raise "Unknown type '#{type}' for #{target_name} #{packet_name} #{item_name}"
+        raise "Unknown type '#{type}' for #{target_name} #{packet_name} #{item_name} (set_item)"
       end
       set(hash, target_name: target_name, packet_name: packet_name, queued: queued, scope: scope)
     end
@@ -126,251 +135,7 @@ module OpenC3
     end
 
     def self.tsdb_lookup(items, start_time:, end_time: nil, scope: $openc3_scope)
-      tables = {}
-      names = []
-      nil_count = 0
-      # Cache packet definitions to avoid repeated lookups
-      packet_cache = {}
-      # Map column names to item type info for decoding
-      item_types = {}
-      # Track calculated timestamp items: { position => { source:, format:, table_index: } }
-      calculated_items = {}
-      # Track which timestamp columns we need per table
-      needed_timestamps = {} # { table_index => Set of column names }
-      current_position = 0
-
-      # Stored timestamp items that need conversion from timestamp_ns to float seconds
-      stored_timestamp_items = Set.new(['PACKET_TIMESECONDS', 'RECEIVED_TIMESECONDS'])
-      # Track stored timestamp items: { position => { column:, table_index: } }
-      stored_timestamp_positions = {}
-
-      items.each do |item|
-        target_name, packet_name, orig_item_name, value_type, limits = item
-        # They will all be nil when item is a nil value
-        # A nil value indicates a value that does not exist as returned by get_tlm_available
-        if orig_item_name.nil?
-          # We know PACKET_TIMESECONDS always exists so we can use it to fill in the nil value
-          names << "PACKET_TIMESECONDS as __nil#{nil_count}"
-          nil_count += 1
-          current_position += 1
-          next
-        end
-        table_name = QuestDBClient.sanitize_table_name(target_name, packet_name, scope: scope)
-        tables[table_name] = 1
-        index = tables.find_index {|k,v| k == table_name }
-
-        # Check if this is a stored timestamp item (PACKET_TIMESECONDS or RECEIVED_TIMESECONDS)
-        # These are stored as timestamp_ns columns and need conversion to float seconds on read
-        if stored_timestamp_items.include?(orig_item_name)
-          col_name = "T#{index}.#{orig_item_name}"
-          names << "\"#{col_name}\""
-          stored_timestamp_positions[current_position] = { column: col_name, table_index: index }
-          current_position += 1
-          next
-        end
-
-        # Check if this is a calculated timestamp item (PACKET_TIMEFORMATTED or RECEIVED_TIMEFORMATTED)
-        if QuestDBClient::TIMESTAMP_ITEMS.key?(orig_item_name)
-          ts_info = QuestDBClient::TIMESTAMP_ITEMS[orig_item_name]
-          calculated_items[current_position] = {
-            source: ts_info[:source],
-            format: ts_info[:format],
-            table_index: index
-          }
-          # Track that we need this timestamp column for this table
-          needed_timestamps[index] ||= Set.new
-          needed_timestamps[index] << ts_info[:source]
-          current_position += 1
-          next
-        end
-
-        safe_item_name = QuestDBClient.sanitize_column_name(orig_item_name)
-
-        # Look up item type info from packet definition
-        cache_key = [target_name, packet_name]
-        unless packet_cache.key?(cache_key)
-          begin
-            packet_cache[cache_key] = TargetModel.packet(target_name, packet_name, scope: scope)
-          rescue RuntimeError
-            packet_cache[cache_key] = nil
-          end
-        end
-
-        packet_def = packet_cache[cache_key]
-        item_def = nil
-        if packet_def
-          packet_def['items']&.each do |pkt_item|
-            if pkt_item['name'] == orig_item_name
-              item_def = pkt_item
-              break
-            end
-          end
-        end
-
-        case value_type
-        when 'FORMATTED', 'WITH_UNITS'
-          col_name = "T#{index}.#{safe_item_name}__F"
-          names << "\"#{col_name}\""
-          # Formatted values are always strings, no special decoding needed
-          item_types[col_name] = { 'data_type' => 'STRING', 'array_size' => nil }
-        when 'CONVERTED'
-          col_name = "T#{index}.#{safe_item_name}__C"
-          names << "\"#{col_name}\""
-          # Converted values may have different types based on read_conversion
-          if item_def
-            rc = item_def['read_conversion']
-            if rc && rc['converted_type']
-              item_types[col_name] = { 'data_type' => rc['converted_type'], 'array_size' => item_def['array_size'] }
-            elsif item_def['states']
-              # State values are strings
-              item_types[col_name] = { 'data_type' => 'STRING', 'array_size' => nil }
-            else
-              item_types[col_name] = { 'data_type' => item_def['data_type'], 'array_size' => item_def['array_size'] }
-            end
-          else
-            item_types[col_name] = { 'data_type' => nil, 'array_size' => nil }
-          end
-        else
-          col_name = "T#{index}.#{safe_item_name}"
-          names << "\"#{col_name}\""
-          if item_def
-            item_types[col_name] = { 'data_type' => item_def['data_type'], 'array_size' => item_def['array_size'] }
-          else
-            item_types[col_name] = { 'data_type' => nil, 'array_size' => nil }
-          end
-        end
-        current_position += 1
-        if limits
-          names << "\"T#{index}.#{safe_item_name}__L\""
-        end
-      end
-
-      # Add needed timestamp columns to the SELECT
-      # Track which column alias maps to which timestamp source for result processing
-      # Note: We use underscores in the alias name to avoid needing quotes, which QuestDB includes in returned field names
-      timestamp_columns = {} # { "T0___ts_timestamp" => { table_index: 0, source: 'timestamp' } }
-      needed_timestamps.each do |table_index, ts_columns|
-        ts_columns.each do |ts_col|
-          alias_name = "T#{table_index}___ts_#{ts_col}"
-          names << "T#{table_index}.#{ts_col} as #{alias_name}"
-          timestamp_columns[alias_name] = { table_index: table_index, source: ts_col }
-        end
-      end
-
-      # Build the SQL query
-      query = "SELECT #{names.join(", ")} FROM "
-      tables.each_with_index do |(table_name, _), index|
-        if index == 0
-          query += "#{table_name} as T#{index} "
-        else
-          query += "ASOF JOIN #{table_name} as T#{index} "
-        end
-      end
-      query_params = []
-      if start_time && !end_time
-        query += "WHERE T0.PACKET_TIMESECONDS < $1 LIMIT -1"
-        query_params << start_time
-      elsif start_time && end_time
-        query += "WHERE T0.PACKET_TIMESECONDS >= $1 AND T0.PACKET_TIMESECONDS < $2"
-        query_params << start_time
-        query_params << end_time
-      end
-
-      retry_count = 0
-      begin
-        conn = QuestDBClient.connection
-        result = conn.exec_params(query, query_params)
-        if result.nil? or result.ntuples == 0
-          return {}
-        else
-          data = []
-          # Build up a results set that is an array of arrays
-          # Each nested array is a set of 2 items: [value, limits state]
-          # If the item does not have limits the limits state is nil
-          result.each_with_index do |tuples, row_num|
-            data[row_num] ||= []
-            row_index = 0
-            # Store timestamp values for this row: { "T0.PACKET_TIMESECONDS" => Time, ... }
-            row_timestamps = {}
-            tuples.each do |tuple|
-              col_name = tuple[0]
-              col_value = tuple[1]
-              if col_name.include?("__L")
-                data[row_num][row_index - 1][1] = col_value
-              elsif col_name =~ /^__nil/
-                data[row_num][row_index] = [nil, nil]
-                row_index += 1
-              elsif col_name =~ /^T(\d+)___ts_(.+)$/
-                # This is a timestamp column for calculated items (TIMEFORMATTED)
-                table_idx = $1.to_i
-                ts_source = $2
-                row_timestamps["T#{table_idx}.#{ts_source}"] = col_value
-              elsif col_name.end_with?('.PACKET_TIMESECONDS', '.RECEIVED_TIMESECONDS') || col_name == 'PACKET_TIMESECONDS' || col_name == 'RECEIVED_TIMESECONDS'
-                # Stored timestamp column - convert from datetime to float seconds
-                ts_utc = QuestDBClient.pg_timestamp_to_utc(col_value)
-                seconds_value = QuestDBClient.format_timestamp(ts_utc, :seconds)
-                data[row_num][row_index] = [seconds_value, nil]
-                row_index += 1
-                # Also store for calculated items (TIMEFORMATTED) that may need this
-                # Normalize key to T{index}.{col} format for consistency
-                if col_name.include?('.')
-                  row_timestamps[col_name] = col_value
-                else
-                  row_timestamps["T0.#{col_name}"] = col_value
-                end
-              else
-                # Decode value using item type info
-                # QuestDB may return column names without table alias prefix
-                # Try both the raw column name and prefixed versions
-                type_info = item_types[col_name]
-                unless type_info
-                  tables.length.times do |i|
-                    prefixed_name = "T#{i}.#{col_name}"
-                    type_info = item_types[prefixed_name]
-                    break if type_info
-                  end
-                  type_info ||= {}
-                end
-                decoded_value = QuestDBClient.decode_value(
-                  col_value,
-                  data_type: type_info['data_type'],
-                  array_size: type_info['array_size']
-                )
-                data[row_num][row_index] = [decoded_value, nil]
-                row_index += 1
-              end
-            end
-
-            # Insert calculated timestamp items at their positions
-            # Insert in ascending order so positions remain valid after each insert
-            calculated_items.keys.sort.each do |position|
-              calc_info = calculated_items[position]
-              ts_key = "T#{calc_info[:table_index]}.#{calc_info[:source]}"
-              ts_value = row_timestamps[ts_key]
-              ts_utc = QuestDBClient.pg_timestamp_to_utc(ts_value)
-              calculated_value = QuestDBClient.format_timestamp(ts_utc, calc_info[:format])
-              data[row_num].insert(position, [calculated_value, nil])
-            end
-          end
-          # If we only have one row then we return a single array
-          if result.ntuples == 1
-            data = data[0]
-          end
-          return data
-        end
-      rescue IOError, PG::Error => e
-        # Retry the query because various errors can occur that are recoverable
-        retry_count += 1
-        if retry_count > 4
-          # After the 5th retry just raise the error
-          raise "Error querying TSDB: #{e.message}"
-        end
-        Logger.warn("TSDB: Retrying due to error: #{e.message}")
-        Logger.warn("TSDB: Last query: #{query}") # Log the last query for debugging
-        QuestDBClient.disconnect
-        sleep 0.1
-        retry
-      end
+      QuestDBClient.tsdb_lookup(items, start_time: start_time, end_time: end_time, scope: scope)
     end
 
     # Return all item values and limit state from the CVT
@@ -443,7 +208,7 @@ module OpenC3
     def self.overrides(scope: $openc3_scope)
       overrides = []
       TargetModel.names(scope: scope).each do |target_name|
-        all = Store.hgetall("#{scope}__override__#{target_name}")
+        all = store_for_target(target_name, scope: scope).hgetall("#{scope}__override__#{target_name}")
         next if all.nil? or all.empty?
         all.each do |packet_name, hash|
           items = JSON.parse(hash, allow_nan: true, create_additions: true)
@@ -472,7 +237,7 @@ module OpenC3
     # Override a current value table item such that it always returns the same value
     # for the given type
     def self.override(target_name, packet_name, item_name, value, type: :ALL, scope: $openc3_scope)
-      hash = Store.hget("#{scope}__override__#{target_name}", packet_name)
+      hash = store_for_target(target_name, scope: scope).hget("#{scope}__override__#{target_name}", packet_name)
       hash = JSON.parse(hash, allow_nan: true, create_additions: true) if hash
       hash ||= {} # In case the above didn't create anything
       case type
@@ -487,17 +252,17 @@ module OpenC3
       when :FORMATTED, :WITH_UNITS
         hash["#{item_name}__F"] = value.to_s # Always a String
       else
-        raise "Unknown type '#{type}' for #{target_name} #{packet_name} #{item_name}"
+        raise "Unknown type '#{type}' for #{target_name} #{packet_name} #{item_name} (override)"
       end
 
       tgt_pkt_key = "#{scope}__tlm__#{target_name}__#{packet_name}"
       @@override_cache[tgt_pkt_key] = [Time.now, hash]
-      Store.hset("#{scope}__override__#{target_name}", packet_name, JSON.generate(hash.as_json, allow_nan: true))
+      store_for_target(target_name, scope: scope).hset("#{scope}__override__#{target_name}", packet_name, JSON.generate(hash.as_json, allow_nan: true))
     end
 
     # Normalize a current value table item such that it returns the actual value
     def self.normalize(target_name, packet_name, item_name, type: :ALL, scope: $openc3_scope)
-      hash = Store.hget("#{scope}__override__#{target_name}", packet_name)
+      hash = store_for_target(target_name, scope: scope).hget("#{scope}__override__#{target_name}", packet_name)
       hash = JSON.parse(hash, allow_nan: true, create_additions: true) if hash
       hash ||= {} # In case the above didn't create anything
       case type
@@ -512,16 +277,17 @@ module OpenC3
       when :FORMATTED, :WITH_UNITS
         hash.delete("#{item_name}__F")
       else
-        raise "Unknown type '#{type}' for #{target_name} #{packet_name} #{item_name}"
+        raise "Unknown type '#{type}' for #{target_name} #{packet_name} #{item_name} (normalize)"
       end
 
       tgt_pkt_key = "#{scope}__tlm__#{target_name}__#{packet_name}"
+      store = store_for_target(target_name, scope: scope)
       if hash.empty?
         @@override_cache.delete(tgt_pkt_key)
-        Store.hdel("#{scope}__override__#{target_name}", packet_name)
+        store.hdel("#{scope}__override__#{target_name}", packet_name)
       else
         @@override_cache[tgt_pkt_key] = [Time.now, hash]
-        Store.hset("#{scope}__override__#{target_name}", packet_name, JSON.generate(hash.as_json, allow_nan: true))
+        store.hset("#{scope}__override__#{target_name}", packet_name, JSON.generate(hash.as_json, allow_nan: true))
       end
     end
 
@@ -561,7 +327,7 @@ module OpenC3
       when :RAW
         types = [item_name]
       else
-        raise "Unknown type '#{type}' for #{target_name} #{packet_name} #{item_name}"
+        raise "Unknown type '#{type}' for #{target_name} #{packet_name} #{item_name} (get_item)"
       end
 
       tgt_pkt_key = "#{scope}__tlm__#{target_name}__#{packet_name}"
@@ -579,7 +345,7 @@ module OpenC3
           return hash
         end
       end
-      override_data = Store.hget("#{scope}__override__#{target_name}", packet_name)
+      override_data = store_for_target(target_name, scope: scope).hget("#{scope}__override__#{target_name}", packet_name)
       if override_data
         hash = JSON.parse(override_data, allow_nan: true, create_additions: true)
         overrides[tgt_pkt_key] = hash

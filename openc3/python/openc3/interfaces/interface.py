@@ -33,6 +33,9 @@ class WriteRejectError(RuntimeError):
 class Interface:
     """Defines all the attributes and methods common to all interface classes used by OpenC3."""
 
+    # Matches the Ruby Time#iso8601(6) output format so details() is identical in both languages
+    DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
     # Initialize default attribute values
     def __init__(self):
         self.state = "DISCONNECTED"
@@ -74,7 +77,7 @@ class Interface:
         self.name = self.__class__.__name__
         self.scheduler = None
         self.scheduler_thread = None
-        self.cancel_scheduler_thread = False
+        self.scheduler_cancel = None
 
     # @return [Integer] The number of connected clients
     def num_clients(self):
@@ -101,6 +104,10 @@ class Interface:
 
         periodic_cmds = self.options.get("PERIODIC_CMD")
         if periodic_cmds:
+            # Each scheduler thread gets its own cancel event so a reconnect can never
+            # revive a thread from a previous connection that has not exited yet
+            if self.scheduler_cancel:
+                self.scheduler_cancel.set()
             self.scheduler = schedule.Scheduler()
 
             for log_dont_log, period, cmd_string in periodic_cmds:
@@ -112,8 +119,10 @@ class Interface:
                     cmd_string=cmd_string,
                 )
 
-            self.cancel_scheduler_thread = False
-            self.scheduler_thread = threading.Thread(target=self.scheduler_thread_body, daemon=True)
+            self.scheduler_cancel = threading.Event()
+            self.scheduler_thread = threading.Thread(
+                target=self.scheduler_thread_body, args=(self.scheduler, self.scheduler_cancel), daemon=True
+            )
             self.scheduler_thread.start()
 
     # Called immediately after the interface is connected.
@@ -136,8 +145,8 @@ class Interface:
     # subclass.
     def disconnect(self):
         periodic_cmds = self.options.get("PERIODIC_CMD")
-        if periodic_cmds and self.scheduler_thread:
-            self.cancel_scheduler_thread = True
+        if periodic_cmds and self.scheduler_cancel:
+            self.scheduler_cancel.set()
 
         for protocol in self.read_protocols + self.write_protocols:
             protocol.disconnect_reset()
@@ -180,7 +189,7 @@ class Interface:
                     if not blank_test:
                         protocol.read_protocol_input_base(data, extra)
                     data, extra = protocol.read_data(data, extra)
-                    if not blank_test:
+                    if not blank_test and data != "STOP" and data != "DISCONNECT":
                         protocol.read_protocol_output_base(data, extra)
                     if data == "DISCONNECT":
                         Logger.info(
@@ -189,10 +198,6 @@ class Interface:
                         return None
                     if data == "STOP":
                         break
-                    if blank_test:
-                        # This means the blank test returned something so we can log
-                        protocol.read_protocol_input_base("", None)
-                        protocol.read_protocol_output_base(data, extra)
                 if data == "STOP":
                     continue
 
@@ -240,7 +245,8 @@ class Interface:
                         f"{self.name}: Protocol {protocol.__class__.__name__} write_packet requested disconnect"
                     )
                     self.disconnect()
-                    return
+                    # Nothing was written so reject rather than report success
+                    raise WriteRejectError(f"Protocol {protocol.__class__.__name__} write_packet requested disconnect")
                 if packet == "STOP":
                     return
 
@@ -254,7 +260,8 @@ class Interface:
                 if data == "DISCONNECT":
                     Logger.info(f"{self.name}: Protocol {protocol.__class__.__name__} write_data requested disconnect")
                     self.disconnect()
-                    return
+                    # Nothing was written so reject rather than report success
+                    raise WriteRejectError(f"Protocol {protocol.__class__.__name__} write_data requested disconnect")
                 if data == "STOP":
                     return
 
@@ -359,7 +366,8 @@ class Interface:
         other_interface.bytes_read = self.bytes_read
         other_interface.bytes_written = self.bytes_written
         if self.stream_log_pair:
-            other_interface.stream_log_pair = self.stream_log_pair[:]
+            # The new interface takes over the running stream logs
+            other_interface.stream_log_pair = self.stream_log_pair
         # num_clients is per interface so don't copy
         # read_queue_size is the number of packets in the queue so don't copy
         # write_queue_size is the number of packets in the queue so don't copy
@@ -534,11 +542,11 @@ class Interface:
         result["read_raw_data"] = self.read_raw_data
         result["written_raw_data"] = self.written_raw_data
         if self.read_raw_data_time is not None:
-            result["read_raw_data_time"] = self.read_raw_data_time.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            result["read_raw_data_time"] = self.read_raw_data_time.strftime(self.DATETIME_FORMAT)
         else:
             result["read_raw_data_time"] = None
         if self.written_raw_data_time is not None:
-            result["written_raw_data_time"] = self.written_raw_data_time.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            result["written_raw_data_time"] = self.written_raw_data_time.strftime(self.DATETIME_FORMAT)
         else:
             result["written_raw_data_time"] = None
 
@@ -569,19 +577,14 @@ class Interface:
             except Exception:
                 Logger.error(f"Error sending periodic cmd({cmd_string}):\n{traceback.format_exc()}")
 
-    def scheduler_thread_body(self):
+    def scheduler_thread_body(self, scheduler, cancel):
         next_time = time.time()
-        while True:
-            if self.cancel_scheduler_thread:
-                break
+        while not cancel.is_set():
+            scheduler.run_pending()
 
-            self.scheduler.run_pending()
-
-            if self.cancel_scheduler_thread:
-                break
             next_time = next_time + 0.1  # Max 10 Hz
             sleep_time = next_time - time.time()
             if sleep_time > 0.1:
-                time.sleep(0.1)
+                cancel.wait(0.1)
             elif sleep_time > 0:
-                time.sleep(sleep_time)
+                cancel.wait(sleep_time)

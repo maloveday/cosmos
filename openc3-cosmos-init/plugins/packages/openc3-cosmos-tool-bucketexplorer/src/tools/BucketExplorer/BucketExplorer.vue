@@ -54,6 +54,17 @@
         <v-spacer />
         <v-btn
           v-if="selectedFiles.length > 0"
+          color="error"
+          variant="elevated"
+          prepend-icon="mdi-delete-sweep"
+          class="mr-2"
+          data-test="delete-selected"
+          @click="deleteMultipleFiles"
+        >
+          Delete {{ selectedFiles.length }} Selected
+        </v-btn>
+        <v-btn
+          v-if="selectedFiles.length > 0"
           color="primary"
           variant="elevated"
           prepend-icon="mdi-download-multiple"
@@ -65,7 +76,7 @@
         </v-btn>
         <v-text-field
           v-model="search"
-          label="Search"
+          label="Search current directory"
           prepend-inner-icon="mdi-magnify"
           clearable
           variant="outlined"
@@ -267,16 +278,17 @@
           <v-card-text>
             <div class="pa-3">
               <v-row>
-                <v-text-field
+                <v-number-input
                   v-model="refreshInterval"
-                  min="1"
-                  max="3600"
-                  step="1"
-                  type="number"
+                  control-variant="stacked"
+                  :min="1"
+                  :max="3600"
+                  :step="1"
                   label="Refresh Interval (s)"
                   :rules="[rules.required, rules.min]"
                   data-test="refresh-interval"
-              /></v-row>
+                />
+              </v-row>
               <v-row class="mt-5">
                 <v-spacer />
                 <v-btn
@@ -303,6 +315,13 @@
         </v-form>
       </v-card>
     </v-dialog>
+    <delete-progress-dialog
+      v-model="deleteProgress.show"
+      :total="deleteProgress.total"
+      :done="deleteProgress.done"
+      :failed="deleteProgress.failed"
+      :complete="deleteProgress.complete"
+    />
     <output-dialog
       v-if="showDialog"
       v-model="showDialog"
@@ -320,12 +339,19 @@ import { Api } from '@openc3/js-common/services'
 import { formatBytesToString } from '@openc3/js-common/utils'
 import { OutputDialog, TopBar } from '@openc3/vue-common/components'
 import axios from 'axios'
-import { downloadBase64File } from './helper'
+import DeleteProgressDialog from './DeleteProgressDialog.vue'
+import {
+  downloadBase64File,
+  runPool,
+  storageName,
+  storageQueryString,
+} from './helper'
 
 export default {
   components: {
     TopBar,
     OutputDialog,
+    DeleteProgressDialog,
   },
   data() {
     const refreshIntervalKey = 'bucketExplorerRefreshInterval'
@@ -351,6 +377,13 @@ export default {
       file: null,
       files: [],
       selectedFiles: [],
+      deleteProgress: {
+        show: false,
+        complete: false,
+        total: 0,
+        done: 0,
+        failed: [],
+      },
       showDialog: false,
       dialogName: '',
       dialogContent: '',
@@ -421,10 +454,16 @@ export default {
   },
   watch: {
     // This is the upload function that is activated when the file gets set
-    file: async function () {
+    file: function () {
       if (this.file === null) return
       this.uploadFilePath = `${this.path}${this.file.name}`
       this.uploadPathDialog = true
+    },
+    // Drop selections that no longer exist after refresh/delete
+    files: function (newFiles) {
+      if (this.selectedFiles.length === 0) return
+      const names = new Set(newFiles.map((f) => f.name))
+      this.selectedFiles = this.selectedFiles.filter((name) => names.has(name))
     },
   },
   created() {
@@ -563,14 +602,10 @@ export default {
       this.update()
     },
     viewFile(filename) {
-      let root = this.root.toUpperCase()
-      if (this.mode === 'volume') {
-        root = root.slice(1)
-      }
       Api.get(
         `/openc3-api/storage/download_file/${encodeURIComponent(
           this.path,
-        )}${filename}?${this.mode}=OPENC3_${root}_${this.mode.toUpperCase()}`,
+        )}${filename}${storageQueryString(this.mode, this.root)}`,
       ).then((response) => {
         this.dialogName = filename
         this.dialogFilename = filename
@@ -580,33 +615,25 @@ export default {
       })
     },
     downloadFile(filename) {
-      let root = this.root.toUpperCase()
-      let api = 'download'
-      if (this.mode === 'volume') {
-        api = 'download_file'
-        root = root.slice(1)
-      }
+      // Buckets return a presigned URL and volumes return a single use stream URL.
+      // Either way the browser downloads the file directly so large files work.
+      const api = this.mode === 'volume' ? 'volume_download' : 'download'
       Api.get(
         `/openc3-api/storage/${api}/${encodeURIComponent(
           this.path,
-        )}${filename}?${this.mode}=OPENC3_${root}_${this.mode.toUpperCase()}`,
+        )}${filename}${storageQueryString(this.mode, this.root)}`,
       )
         .then((response) => {
-          if (this.mode === 'bucket') {
-            // For buckets, use the presigned URL
-            const link = document.createElement('a')
-            link.href = response.data.url
-            link.setAttribute('download', filename)
-            link.click()
-          } else {
-            // For volumes, use the helper to download base64 data
-            downloadBase64File(response.data.contents, filename)
-          }
+          const link = document.createElement('a')
+          link.href = response.data.url
+          link.setAttribute('download', filename)
+          link.click()
         })
-
-        .catch((response) => {
+        .catch((error) => {
+          const message = error?.response?.data?.message
           this.$notify.caution({
-            title: `Unable to download file ${this.path}${filename} from bucket ${this.root}`,
+            title: `Unable to download file ${this.path}${filename} from ${this.mode} ${this.root}`,
+            body: message,
           })
         })
     },
@@ -614,16 +641,11 @@ export default {
       if (this.selectedFiles.length === 0) return
 
       try {
-        let root = this.root.toUpperCase()
-        if (this.mode === 'volume') {
-          root = root.slice(1)
-        }
-
         const response = await Api.post(
           '/openc3-api/storage/download_multiple_files',
           {
             data: {
-              [this.mode]: `OPENC3_${root}_${this.mode.toUpperCase()}`,
+              [this.mode]: storageName(this.mode, this.root),
               path: this.path,
               files: this.selectedFiles,
             },
@@ -658,11 +680,11 @@ export default {
       const { data: presignedRequest } = await Api.get(
         `/openc3-api/storage/upload/${encodeURIComponent(
           this.uploadFilePath,
-        )}?bucket=OPENC3_${this.root.toUpperCase()}_BUCKET`,
+        )}${storageQueryString('bucket', this.root)}`,
       )
       // This pushes the file into storage by using the fields in the presignedRequest
       // See storage_controller.rb get_upload_presigned_request()
-      const response = await axios({
+      await axios({
         ...presignedRequest,
         data: this.file,
       })
@@ -679,35 +701,59 @@ export default {
       this.file = null
       this.uploadPathDialog = false
     },
+    doDelete(filename) {
+      return Api.delete(
+        `/openc3-api/storage/delete/${encodeURIComponent(
+          this.path,
+        )}${filename}${storageQueryString(this.mode, this.root)}`,
+      )
+    },
     deleteFile(filename) {
-      let root = this.root.toUpperCase()
-      if (this.mode === 'volume') {
-        root = root.slice(1)
-      }
       this.$dialog
         .confirm(`Are you sure you want to delete: ${filename}`, {
           okText: 'Delete',
           cancelText: 'Cancel',
         })
-        .then((dialog) => {
-          return Api.delete(
-            `/openc3-api/storage/delete/${encodeURIComponent(
-              this.path,
-            )}${filename}?${
-              this.mode
-            }=OPENC3_${root}_${this.mode.toUpperCase()}`,
-          )
-        })
-        .then((response) => {
-          this.updateFiles()
-        })
-        .catch((err) => {})
+        .then(() => this.doDelete(filename))
+        .then(() => this.updateFiles())
+        .catch(() => {})
+    },
+    async deleteMultipleFiles() {
+      if (this.selectedFiles.length === 0) return
+      const filesToDelete = [...this.selectedFiles]
+      const total = filesToDelete.length
+      try {
+        await this.$dialog.confirm(
+          `Are you sure you want to delete ${total} selected file${
+            total > 1 ? 's' : ''
+          }? This cannot be undone.`,
+          { okText: 'Delete', cancelText: 'Cancel' },
+        )
+      } catch {
+        return
+      }
+      this.deleteProgress.total = total
+      this.deleteProgress.done = 0
+      this.deleteProgress.failed = []
+      this.deleteProgress.complete = false
+      this.deleteProgress.show = true
+
+      const results = await runPool(filesToDelete, 6, (f) =>
+        this.doDelete(f).finally(() => {
+          this.deleteProgress.done += 1
+        }),
+      )
+      results.forEach((r, i) => {
+        if (r.status === 'rejected') {
+          this.deleteProgress.failed.push(filesToDelete[i])
+        }
+      })
+
+      this.selectedFiles = []
+      this.deleteProgress.complete = true
+      this.updateFiles()
     },
     deleteDirectory(dirname) {
-      let root = this.root.toUpperCase()
-      if (this.mode === 'volume') {
-        root = root.slice(1)
-      }
       this.$dialog
         .confirm(
           `Are you sure you want to delete the directory "${dirname}" and ALL its contents? This cannot be undone.`,
@@ -720,7 +766,7 @@ export default {
           return Api.delete(
             `/openc3-api/storage/delete_directory/${encodeURIComponent(
               this.path,
-            )}${dirname}?${this.mode}=OPENC3_${root}_${this.mode.toUpperCase()}`,
+            )}${dirname}${storageQueryString(this.mode, this.root)}`,
           )
         })
         .then((response) => {
@@ -741,12 +787,8 @@ export default {
     updateFiles() {
       this.updating = true
       const currentRequestId = ++this.requestId
-      let root = this.root.toUpperCase()
-      if (this.mode === 'volume') {
-        root = root.slice(1)
-      }
       Api.get(
-        `/openc3-api/storage/files/OPENC3_${root}_${this.mode.toUpperCase()}/${
+        `/openc3-api/storage/files/${storageName(this.mode, this.root)}/${
           this.path
         }`,
       )

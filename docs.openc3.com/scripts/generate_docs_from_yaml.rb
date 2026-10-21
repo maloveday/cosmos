@@ -83,15 +83,20 @@ class CosmosMetaTag
     modifiers = {}
     meta.each do |keyword, data|
       page << "\n#{'#' * @level} #{keyword}\n"
+      # Handle deprecated keyword with a note box
       if data['deprecated']
-        page << ":::note Deprecated\n"
+        page << ":::note[Deprecated]\n"
         page << "#{data['deprecated']}\n"
         page << ":::\n\n"
       end
+
+      # The since badge is displayed on the right side of the summary line if it exists
       since_badge = data['since'] ? "<span class=\"badge badge--secondary since-right\">Since #{data['since']}</span>" : ""
       page << "#{since_badge}**#{data['summary']}**\n\n"
 
       page << "#{data['description']}\n\n" if data['description']
+
+      # Handle warning keyword with a note box
       if data['warning']
         page << ":::warning\n"
         page << "#{data['warning']}\n"
@@ -102,7 +107,7 @@ class CosmosMetaTag
       end
       if data['example']
         page << "\nExample Usage:\n"
-        page << "```ruby\n"
+        page << "```cosmos\n"
         page << "#{data['example'].strip}\n"
         page << "```\n"
         # If this is a screen, check to see if there is an image for the widget
@@ -114,14 +119,14 @@ class CosmosMetaTag
         page << "\n<Tabs groupId=\"script-language\">\n"
         if data['python_example']
           page << "<TabItem value=\"python\" label=\"Python\">\n"
-          page << "```python\n"
+          page << "```cosmos\n"
           page << "#{data['python_example'].strip}\n"
           page << "```\n"
           page << "</TabItem>\n"
         end
         if data['ruby_example']
           page << "<TabItem value=\"ruby\" label=\"Ruby\">\n"
-          page << "```ruby\n"
+          page << "```cosmos\n"
           page << "#{data['ruby_example'].strip}\n"
           page << "```\n"
           page << "</TabItem>\n"
@@ -131,12 +136,19 @@ class CosmosMetaTag
       saved_level = @level
       if data['modifiers']
         bump_level = false
-        unless @modifiers.values.include?(data['modifiers'].keys)
+        keys = data['modifiers'].keys
+        # A subset of an already documented modifier list (e.g. ROUTER vs INTERFACE)
+        # is described by reference rather than repeated
+        superset = @modifiers.find { |_, other| other != keys and (keys - other).empty? and (other - keys).length < keys.length }
+        if superset
+          missing = superset[1] - keys
+          page << "\n#{keyword} accepts the [#{superset[0]} Modifiers](##{superset[0].downcase}-modifiers) except #{missing.join(', ')}.\n"
+        elsif not @modifiers.values.include?(keys)
           if bump_level == false
             bump_level = true
             @level += 1
           end
-          @modifiers[keyword] = data['modifiers'].keys
+          @modifiers[keyword] = keys
           page << "\n#{'#' * (@level - 1)} #{keyword} Modifiers\n"
           page << "The following keywords must follow a #{keyword} keyword.\n"
           build_page(data['modifiers'], page)

@@ -81,6 +81,7 @@
         }"
         :items="rows"
         :custom-filter="filter"
+        :filter-keys="filterKeys"
         :sort-by="sortBy"
         :loading="loading > 0"
         multi-sort
@@ -143,24 +144,24 @@
           <v-card-text>
             <div class="pa-3">
               <v-row>
-                <v-text-field
+                <v-number-input
                   v-model="optionsRefreshInterval"
-                  min="1"
-                  max="3600"
-                  step="1"
-                  type="number"
+                  control-variant="stacked"
+                  :min="1"
+                  :max="3600"
+                  :step="1"
                   label="Refresh Interval (s)"
                   :rules="[rules.required, rules.min]"
                   data-test="refresh-interval"
                 />
               </v-row>
               <v-row>
-                <v-text-field
+                <v-number-input
                   v-model="optionsStaleLimit"
-                  min="1"
-                  max="10000"
-                  step="1"
-                  type="number"
+                  control-variant="stacked"
+                  :min="1"
+                  :max="10000"
+                  :step="1"
                   label="Time at which to mark data Stale (s)"
                   :rules="[rules.required, rules.min]"
                   min-width="280px"
@@ -232,7 +233,7 @@ import {
 } from '@openc3/vue-common/components'
 import { ValueWidget } from '@openc3/vue-common/widgets'
 import { useContainerHeight } from '@openc3/vue-common/composables'
-import { useTemplateRef } from 'vue'
+import { tokenizedFilter } from '@openc3/js-common/utils'
 
 // Used in the menu and openConfiguration lookup
 const valueTypeToRadioGroup = {
@@ -275,6 +276,10 @@ export default {
         },
         { title: 'Value', key: 'value' },
       ],
+      // Search the item name only, not the live telemetry value, which would
+      // make rows come and go as values change. Hoisted rather than written
+      // inline so it keeps the same identity across renders.
+      filterKeys: ['name'],
       sortBy: [{ key: 'pinned', order: 'desc' }],
       optionsDialog: false,
       optionsFormValid: true,
@@ -497,34 +502,35 @@ export default {
     // Called like /tools/packetviewer?config=temps
     if (this.$route.query && this.$route.query.config) {
       this.openConfiguration(this.$route.query.config, true) // routed
-      this.changeUpdater(true)
     } else {
       // Merge default config into the currentConfig in case default isn't yet defined
       let config = { ...this.currentConfig, ...this.loadDefaultConfig() }
       this.applyConfig(config)
-      // If we're passed in the route then manually call packetChanged to update
-      if (this.$route.params.target && this.$route.params.packet) {
-        // Initial position of chooser should be correct so call packetChanged for it
+      // Resolve target/packet from route params, falling back to saved config
+      let target = this.$route.params.target
+      let packet = this.$route.params.packet
+      if (!target || !packet) {
+        target = config.target
+        packet = config.packet
+        // Chooser probably won't be at the right packet so push the route
+        if (target && packet) {
+          this.$router.push({
+            name: 'PackerViewer',
+            params: { target, packet },
+          })
+        }
+      }
+      if (target && packet) {
         await this.packetChanged(
           {
-            targetName: this.$route.params.target.toUpperCase(),
-            packetName: this.$route.params.packet.toUpperCase(),
+            targetName: target.toUpperCase(),
+            packetName: packet.toUpperCase(),
           },
           true,
         )
       } else {
-        if (config.target && config.packet) {
-          // Chooser probably won't be at the right packet so need to refresh
-          this.$router.push({
-            name: 'PackerViewer',
-            params: {
-              target: config.target,
-              packet: config.packet,
-            },
-          })
-        }
+        this.changeUpdater(true)
       }
-      this.changeUpdater(true)
     }
   },
   beforeUnmount() {
@@ -566,14 +572,10 @@ export default {
           item.item === name,
       )
     },
-    filter(value, search, _item) {
-      if (this.isPinned(value)) {
-        return true
-      } else if (value) {
-        return value.toString().indexOf(search.toUpperCase()) >= 0
-      } else {
-        return false
-      }
+    filter(value, search, item) {
+      // Pinned items stay visible no matter what's typed
+      if (item?.raw?.pinned) return true
+      return tokenizedFilter(value, search)
     },
     async packetChanged(event, force = false) {
       if (
@@ -582,6 +584,11 @@ export default {
         !force
       ) {
         return // No change
+      }
+      // The chooser clears its selection when the target has no packets or the
+      // request failed (e.g. no permission). Nothing to look up in that case.
+      if (!event.targetName || !event.packetName) {
+        return
       }
       try {
         this.loadingPacket = true
@@ -616,6 +623,7 @@ export default {
                 target: this.targetName,
                 packet: this.packetName,
               },
+              query: this.$route.query,
             })
           }
           this.changeUpdater(true)
@@ -704,10 +712,7 @@ export default {
               .then((values) => {
                 this.latestGetTlmValues(values)
               })
-              .catch((error) => {
-                // eslint-disable-next-line no-console
-                console.log(error)
-              })
+              .catch(console.error)
           } else {
             this.api
               .get_all_tlm_item_names(this.targetName)
@@ -727,10 +732,7 @@ export default {
               .then((values) => {
                 this.latestGetTlmValues(values)
               })
-              .catch((error) => {
-                // eslint-disable-next-line no-console
-                console.log(error)
-              })
+              .catch(console.error)
           }
         } else {
           // Regular packet handling using get_tlm_packet
@@ -784,10 +786,7 @@ export default {
             // Catch errors but just log to the console
             // We don't clear the updater because errors can happen on upgrade
             // and we want to continue updating once the new plugin comes online
-            .catch((error) => {
-              // eslint-disable-next-line no-console
-              console.log(error)
-            })
+            .catch(console.error)
         }
         if (loadingFirstTlm) {
           loadingFirstTlm = false
@@ -812,24 +811,21 @@ export default {
       this.refreshInterval = config.refreshInterval || 1000
       this.staleLimit = config.staleLimit || 30
       this.showIgnored = config.showIgnored || false
-      this.menus[1].items[0].checked = this.showIgnored
       this.derivedLast = config.derivedLast || false
-      this.menus[1].items[1].checked = this.derivedLast
       this.valueType = config.valueType || 'FORMATTED'
-      this.menus[1].radioGroup = valueTypeToRadioGroup[this.valueType]
       this.itemsPerPage = config.itemsPerPage || 20
       this.pinnedItems = config.pinnedItems || []
     },
     openConfiguration: function (name, routed = false) {
-      this.openConfigBase(name, routed, async (config) => {
+      // Always pass routed=true to prevent openConfigBase's query-only push
+      // from racing with packetChanged and reverting to old params
+      this.openConfigBase(name, true, async (config) => {
         this.applyConfig(config)
-        this.saveDefaultConfig(config)
         if (
           this.$route.params.target !== config.target ||
           this.$route.params.packet !== config.packet ||
           this.$route.query.config !== name
         ) {
-          // Need full refresh since chooser won't be on the right packet
           this.$router.push({
             name: 'PackerViewer',
             params: {
@@ -840,6 +836,15 @@ export default {
               config: name,
             },
           })
+        }
+        if (config.target && config.packet) {
+          await this.packetChanged(
+            {
+              targetName: config.target.toUpperCase(),
+              packetName: config.packet.toUpperCase(),
+            },
+            true,
+          )
         }
       })
     },

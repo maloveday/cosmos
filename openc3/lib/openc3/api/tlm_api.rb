@@ -23,7 +23,7 @@
 
 require 'openc3/models/target_model'
 require 'openc3/models/cvt_model'
-require 'openc3/packets/packet'
+# require 'openc3/packets/packet' # Circular require
 require 'openc3/topics/telemetry_topic'
 require 'openc3/topics/interface_topic'
 require 'openc3/topics/decom_interface_topic'
@@ -117,13 +117,14 @@ module OpenC3
     # @param packet_name [String] Packet name of the packet
     # @param item_hash [Hash] Hash of item_name and value for each item you want to change from the current value table
     # @param type [Symbol] Telemetry type, :RAW, :CONVERTED (default), :FORMATTED
-    def inject_tlm(target_name, packet_name, item_hash = nil, type: :CONVERTED, manual: false, scope: $openc3_scope, token: $openc3_token)
+    # @param received_time [Integer, nil] Optional received time as nanoseconds since Unix epoch
+    def inject_tlm(target_name, packet_name, item_hash = nil, type: :CONVERTED, stored: false, received_time: nil, manual: false, scope: $openc3_scope, token: $openc3_token)
       authorize(permission: 'tlm_set', target_name: target_name, packet_name: packet_name, manual: manual, scope: scope, token: token)
       type = type.to_s.intern
       target_name = target_name.upcase
       packet_name = packet_name.upcase
       unless CvtModel::VALUE_TYPES.include?(type)
-        raise "Unknown type '#{type}' for #{target_name} #{packet_name}"
+        raise "Unknown type '#{type}' for #{target_name} #{packet_name} (inject_tlm)"
       end
 
       if item_hash
@@ -155,9 +156,9 @@ module OpenC3
 
       # Use an interface microservice if it exists, other use the decom microservice
       if interface_name
-        InterfaceTopic.inject_tlm(interface_name, target_name, packet_name, item_hash, type: type, scope: scope)
+        InterfaceTopic.inject_tlm(interface_name, target_name, packet_name, item_hash, type: type, stored: stored, received_time: received_time, scope: scope)
       else
-        DecomInterfaceTopic.inject_tlm(target_name, packet_name, item_hash, type: type, scope: scope)
+        DecomInterfaceTopic.inject_tlm(target_name, packet_name, item_hash, type: type, stored: stored, received_time: received_time, scope: scope)
       end
     end
 
@@ -221,7 +222,8 @@ module OpenC3
         return msg_hash
       else
         topic = "#{scope}__TELEMETRY__{#{target_name}}__#{packet_name}"
-        msg_id, msg_hash = Topic.get_newest_message(topic)
+        db_shard = Store.db_shard_for_target(target_name, scope: scope)
+        msg_id, msg_hash = Topic.get_newest_message(topic, db_shard: db_shard)
         if msg_id
           msg_hash['buffer'] = msg_hash['buffer'].b
           return msg_hash
@@ -281,7 +283,7 @@ module OpenC3
 
           case value_type
           when 'FORMATTED', 'WITH_UNITS'
-            if item['format_string']
+            if item['format_string'] or item['units']
               results << [target_name, orig_packet_name, item_name, 'FORMATTED'].join('__')
             # This logic must match the logic in Packet#decom
             elsif item['states'] or (item['read_conversion'] and item['data_type'] != 'DERIVED')
@@ -304,7 +306,7 @@ module OpenC3
           if item['limits']['DEFAULT']
             results[-1] += '__LIMITS'
           end
-        rescue RuntimeError => e
+        rescue RuntimeError
           results << nil
         end
       end
@@ -327,19 +329,23 @@ module OpenC3
       end
       packets = []
       cvt_items = []
-      items.each_with_index do |item, index|
+      items.each do |item|
+        # get_tlm_available returns nil for items which don't exist and its result is
+        # passed directly here, so nil is a placeholder which returns a nil value
         if item.nil?
-          # null items mean that it doesn't exist
-          cvt_items[index] = nil
-        else
-          item_upcase = item.to_s.upcase
-          target_name, packet_name, item_name, value_type, limits = item_upcase.split('__')
-          raise ArgumentError, "items must be formatted as TGT__PKT__ITEM__TYPE" if target_name.nil? || packet_name.nil? || item_name.nil? || value_type.nil?
-          if packet_name == 'LATEST' # Lookup packet_name in case of LATEST
-            packet_name = CvtModel.determine_latest_packet_for_item(target_name, item_name, cache_timeout: cache_timeout, scope: scope)
-          end
+          cvt_items << [nil, nil, nil, nil, nil]
+          next
         end
-        cvt_items[index] = [target_name, packet_name, item_name, value_type, limits]
+        # get_tlm_available tacks on __LIMITS to indicate a limits value is available
+        # so accept both TGT__PKT__ITEM__TYPE and TGT__PKT__ITEM__TYPE__LIMITS
+        parts = item.to_s.upcase.split('__')
+        raise ArgumentError, "items must be formatted as TGT__PKT__ITEM__TYPE" if parts.length < 4 || parts.length > 5
+        target_name, packet_name, item_name, value_type, limits = parts
+        if packet_name == 'LATEST' # Lookup packet_name in case of LATEST
+          packet_name = CvtModel.determine_latest_packet_for_item(target_name, item_name, cache_timeout: cache_timeout, scope: scope)
+        end
+        # NOTE: limits is required by the historical (start_time) QuestDB lookup
+        cvt_items << [target_name, packet_name, item_name, value_type, limits]
         packets << [target_name, packet_name]
       end
       packets.uniq!
@@ -446,7 +452,8 @@ module OpenC3
         packet_name = packet_name.upcase
         authorize(permission: 'tlm', target_name: target_name, packet_name: packet_name, manual: manual, scope: scope, token: token)
         topic = "#{scope}__DECOM__{#{target_name}}__#{packet_name}"
-        id, _ = Topic.get_newest_message(topic)
+        db_shard = Store.db_shard_for_target(target_name, scope: scope)
+        id, = Topic.get_newest_message(topic, db_shard: db_shard)
         results[topic] = id ? id : '0-0'
       end
       results.to_a.join(SUBSCRIPTION_DELIMITER)
@@ -455,6 +462,12 @@ module OpenC3
     alias subscribe_packet subscribe_packets
 
     # Get packets based on ID returned from subscribe_packet.
+    # Packets are ordered within each subscribed packet stream (target/packet pair)
+    # but are NOT interleaved by time across streams. If chronological order across
+    # streams is required, sort the returned array by the 'time' field. Sorting only
+    # orders the current batch - packets across separate get_packets calls may still
+    # arrive out of order, so subscribers needing global ordering must buffer and merge
+    # across calls.
     # @param id [String] ID returned from subscribe_packets or last call to get_packets
     # @param block [Integer] Unused - Blocking must be implemented at the client
     # @param count [Integer] Maximum number of packets to return from EACH packet stream
@@ -463,7 +476,20 @@ module OpenC3
       authorize(permission: 'tlm', manual: manual, scope: scope, token: token)
       # Split the list of topic, ID values and turn it into a hash for easy updates
       lookup = Hash[*id.split(SUBSCRIPTION_DELIMITER)]
-      xread = Topic.read_topics(lookup.keys, lookup.values, nil, count) # Always don't block
+      # Group topics by db_shard for multi-shard support
+      db_shard_groups = {}
+      lookup.each do |topic, offset|
+        target_name = topic.match(/__\{?([^}_]+)\}?__/)[1] rescue nil
+        db_shard = Store.db_shard_for_target(target_name, scope: scope)
+        db_shard_groups[db_shard] ||= { topics: [], offsets: [] }
+        db_shard_groups[db_shard][:topics] << topic
+        db_shard_groups[db_shard][:offsets] << offset
+      end
+      xread = {}
+      db_shard_groups.each do |db_shard, group|
+        result = Topic.read_topics(group[:topics], group[:offsets], nil, count, db_shard: db_shard) # Always don't block
+        xread.merge!(result) if result
+      end
       # Return the original ID and and empty array if we didn't get anything
       packets = []
       return [id, packets] if xread.empty?

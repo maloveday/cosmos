@@ -1,5 +1,5 @@
 <!--
-# Copyright 2025 OpenC3, Inc.
+# Copyright 2026 OpenC3, Inc.
 # All Rights Reserved.
 #
 # This program is distributed in the hope that it will be useful,
@@ -64,7 +64,7 @@
           density="compact"
           variant="outlined"
           hide-details
-          class="version-select"
+          class="mt-1 version-select"
         />
       </v-card-subtitle>
       <!--
@@ -191,13 +191,20 @@
           color="red"
           @click="uninstall"
         />
-        <v-btn
-          v-else
-          text="Install"
-          append-icon="mdi-puzzle-plus"
-          variant="elevated"
-          @click="install"
-        />
+        <v-tooltip v-else :open-delay="600" location="top">
+          <template #activator="{ props }">
+            <span v-bind="canInstall ? null : props">
+              <v-btn
+                text="Install"
+                append-icon="mdi-puzzle-plus"
+                variant="elevated"
+                :disabled="!canInstall"
+                @click="install"
+              />
+            </span>
+          </template>
+          <span> {{ installTooltip }} </span>
+        </v-tooltip>
         <v-btn
           v-if="versionRepository"
           text="Repository"
@@ -314,9 +321,11 @@ export default {
     },
   },
   created: function () {
-    Api.get('/openc3-api/info').then(({ data }) => {
-      this.installedCosmosVersion = data.version
-    })
+    Api.get('/openc3-api/info')
+      .then(({ data }) => {
+        this.installedCosmosVersion = data.version
+      })
+      .catch(console.error)
   },
   mounted: function () {
     this.selectedVersionId = this.current_version_id
@@ -341,7 +350,7 @@ export default {
       })
     },
     copyChecksum: function () {
-      navigator.clipboard.writeText(this.versionChecksum)
+      navigator.clipboard.writeText(this.versionChecksum).catch(console.error)
       this.showCopiedTooltip = true
       setTimeout(() => {
         this.showCopiedTooltip = false

@@ -35,8 +35,9 @@ module OpenC3
     # pull openc3-cosmos-script-runner-api url from environment variables
     def _generate_url(microservice_name:, prefix:, schema: 'http', hostname: nil, port:, scope: $openc3_scope)
       prefix = '/' + prefix unless prefix[0] == '/'
-      if ENV['OPENC3_OPERATOR_HOSTNAME']
-        hostname = ENV['OPENC3_OPERATOR_HOSTNAME'] unless hostname
+      operator_hostname = ENV.fetch('OPENC3_OPERATOR_HOSTNAME', nil)
+      if operator_hostname
+        hostname = operator_hostname unless hostname
         return "#{schema}://#{hostname}:#{port.to_i}#{prefix}"
       else
         if ENV['KUBERNETES_SERVICE_HOST']
@@ -65,7 +66,7 @@ module OpenC3
 
     def _request(*method_params, **kw_params)
       kw_params[:scope] = $openc3_scope unless kw_params[:scope]
-      kw_params[:json] = true unless kw_params[:json]
+      kw_params[:json] = true # This is JsonApi so should always be speaking json
       @json_api.request(*method_params, **kw_params)
     end
   end

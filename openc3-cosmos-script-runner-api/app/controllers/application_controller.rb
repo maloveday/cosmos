@@ -54,13 +54,31 @@ class ApplicationController < ActionController::API
         token: request.headers['HTTP_AUTHORIZATION'],
       )
     rescue OpenC3::AuthError => e
-      render json: { status: 'error', message: e.message }, status: 401
+      render json: { status: 'error', message: e.message }, status: :unauthorized
       return false
     rescue OpenC3::ForbiddenError => e
-      render json: { status: 'error', message: e.message }, status: 403
+      render json: { status: 'error', message: e.message }, status: :forbidden
       return false
     end
     return true
+  end
+
+  # Soft authorization check that returns a boolean and never renders a response.
+  # Used to decide whether to run code paths (e.g. suite analysis, which executes
+  # the file) without failing the surrounding read-only request when the user
+  # lacks the higher permission.
+  # @return [Boolean] true if authorize succeeds
+  def authorized?(permission, target_name: nil)
+    authorize(
+      permission: permission,
+      target_name: target_name,
+      manual: request.headers['HTTP_MANUAL'],
+      scope: params[:scope],
+      token: request.headers['HTTP_AUTHORIZATION'],
+    )
+    true
+  rescue OpenC3::AuthError, OpenC3::ForbiddenError
+    false
   end
 
   def sanitize_params(param_list, require_params: true, allow_forward_slash: false, allow_parent_dir: false)
@@ -88,7 +106,7 @@ class ApplicationController < ActionController::API
           value = value.gsub(/(\.|%2e){2}/i, "-")
         end
         if value != arg
-          render json: { status: 'error', message: "Invalid #{param_list[index]}: #{arg}" }, status: 400
+          render json: { status: 'error', message: "Invalid #{param_list[index]}: #{arg}" }, status: :bad_request
           return false
         end
       end

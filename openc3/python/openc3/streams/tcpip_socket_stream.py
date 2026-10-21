@@ -9,7 +9,8 @@
 # This file may also be used under the terms of a commercial license
 # if purchased from OpenC3, Inc.
 
-import multiprocessing
+import contextlib
+import errno
 import select
 import socket
 import threading
@@ -18,6 +19,10 @@ from openc3.config.config_parser import ConfigParser
 from openc3.streams.stream import Stream
 from openc3.top_level import close_socket
 from openc3.utilities.logger import Logger
+
+
+# socket.MSG_DONTWAIT is Unix-only; on Windows we rely on setblocking(False).
+_MSG_DONTWAIT = getattr(socket, "MSG_DONTWAIT", 0)
 
 
 class TcpipSocketStream(Stream):
@@ -43,7 +48,10 @@ class TcpipSocketStream(Stream):
         # Mutex on write is needed to protect from commands coming in from more
         # than one tool
         self.write_mutex = threading.Lock()
-        self.pipe_reader, self.pipe_writer = multiprocessing.Pipe()
+        # socket.socketpair (rather than multiprocessing.Pipe) so the
+        # readable end can be passed to select.select on Windows, where
+        # select only accepts sockets.
+        self.pipe_reader, self.pipe_writer = socket.socketpair()
         self._connected = False
 
     # self.return [String] Returns a binary string of data from the socket
@@ -55,26 +63,58 @@ class TcpipSocketStream(Stream):
         # No read mutex is needed because reads happen serially
         while True:  # Loop until we get some data
             try:
-                data = self.read_socket.recv(65535, socket.MSG_DONTWAIT)
+                data = self.read_socket.recv(65535, _MSG_DONTWAIT)
             # Non-blocking sockets return an errno EAGAIN or EWOULDBLOCK
             # if there is no data available
             except OSError as error:
                 if error.errno == socket.EAGAIN or error.errno == socket.EWOULDBLOCK:
+                    # Wait for the socket to be ready for reading or for the timeout
+                    try:
+                        readable, _, _ = select.select(
+                            [self.read_socket, self.pipe_reader],
+                            [],
+                            [],
+                            self.read_timeout,
+                        )
+                    # Python sets fileno() to -1 once a socket is closed and select
+                    # raises ValueError rather than OSError for a negative fd. Only
+                    # that case is a disconnect. Other ValueErrors (a negative
+                    # timeout, an fd over FD_SETSIZE) are real errors so re-raise.
+                    except ValueError:
+                        if self._any_socket_closed():
+                            data = ""
+                            break
+                        raise
+                    except OSError as select_error:
+                        if select_error.errno in (errno.EBADF, errno.ENOTSOCK):
+                            data = ""
+                            break
+                        # Anything else is an unexpected system failure, not a
+                        # closed socket - don't hide it behind a clean EOF
+                        raise
                     # If select returns something it means the socket is now available for
-                    # reading so retry the read. If it returns empty list it means we timed out.
-                    # If the pipe is present that means we closed the socket
-                    readable, _, _ = select.select(
-                        [self.read_socket, self.pipe_reader],
-                        [],
-                        [],
-                        self.read_timeout,
-                    )
-                    if readable and self.pipe_reader in readable:
-                        data = ""
+                    # reading so retry the read. If it returns an empty list it means we
+                    # timed out. If the pipe is present that means we closed the socket.
+                    if readable:
+                        if self.pipe_reader in readable:
+                            data = ""
+                        else:
+                            continue
                     else:
-                        continue
+                        raise TimeoutError("Read Timeout") from error
             break
         return data
+
+    # self.return [Boolean] Whether either socket passed to select has been closed
+    def _any_socket_closed(self):
+        for sock in (self.read_socket, self.pipe_reader):
+            try:
+                if sock.fileno() < 0:
+                    return True
+            # fileno() raises on an already released socket object
+            except OSError:
+                return True
+        return False
 
     # self.param data [String] A binary string of data to write to the socket
     def write(self, data):
@@ -89,7 +129,7 @@ class TcpipSocketStream(Stream):
 
             while True:
                 try:
-                    bytes_sent = self.write_socket.send(data_to_send, socket.MSG_DONTWAIT)
+                    bytes_sent = self.write_socket.send(data_to_send, _MSG_DONTWAIT)
                 # Non-blocking sockets return an errno EAGAIN or EWOULDBLOCK
                 # if the write would block
                 except OSError as error:
@@ -126,5 +166,8 @@ class TcpipSocketStream(Stream):
             return
         close_socket(self.write_socket)
         close_socket(self.read_socket)
-        self.pipe_writer.send(".")
+        with contextlib.suppress(OSError):
+            self.pipe_writer.send(b".")
+        close_socket(self.pipe_writer)
+        close_socket(self.pipe_reader)
         self._connected = False

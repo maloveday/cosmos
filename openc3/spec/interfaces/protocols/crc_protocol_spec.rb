@@ -17,7 +17,9 @@
 
 require 'spec_helper'
 require 'openc3/interfaces/protocols/crc_protocol'
+require 'openc3/interfaces/protocols/burst_protocol'
 require 'openc3/interfaces/interface'
+require 'openc3/interfaces/stream_interface'
 require 'openc3/streams/stream'
 
 module OpenC3
@@ -813,7 +815,7 @@ module OpenC3
         packet.append_item("CRC", 32, :UINT)
         packet.append_item("TRAILER", 32, :UINT)
         packet.buffer = "\x00\x01\x02\x03\x00\x00\x00\x00\x04\x05\x06\x07"
-        expect { @interface.write(packet) }.to raise_error(/Packet item 'TGT PKT MYCRC' does not exist/)
+        expect { @interface.write(packet) }.to raise_error(/Item 'TGT PKT MYCRC' does not exist/)
       end
 
       it "calculates and writes the 8 bit CRC item" do

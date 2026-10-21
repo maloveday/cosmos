@@ -183,7 +183,8 @@ module OpenC3
       authorize(permission: 'cmd_info', target_name: target_name, packet_name: command_name, manual: manual, scope: scope, token: token)
       TargetModel.packet(target_name, command_name, type: :CMD, scope: scope)
       topic = "#{scope}__COMMAND__{#{target_name}}__#{command_name}"
-      msg_id, msg_hash = Topic.get_newest_message(topic)
+      db_shard = Store.db_shard_for_target(target_name, scope: scope)
+      msg_id, msg_hash = Topic.get_newest_message(topic, db_shard: db_shard)
       if msg_id
         msg_hash['buffer'] = msg_hash['buffer'].b
         return msg_hash
@@ -449,7 +450,7 @@ module OpenC3
 
     # NOTE: When adding new keywords to this method, make sure to update script/commands.rb
     def _cmd_implementation(method_name, *args, range_check:, hazardous_check:, raw:, timeout: nil, log_message: nil, manual: false, validate: true, queue: nil,
-                            scope: $openc3_scope, token: $openc3_token, **kwargs)
+                            queue_username: nil, scope: $openc3_scope, token: $openc3_token, **kwargs)
       extract_string_kwargs_to_args(args, kwargs)
       unless [nil, true, false].include?(log_message)
         raise "Invalid log_message parameter: #{log_message}. Must be true or false."
@@ -483,7 +484,7 @@ module OpenC3
       user = authorize(permission: 'cmd', target_name: target_name, packet_name: cmd_name, manual: manual, scope: scope, token: token)
       if user.nil?
         user = {}
-        user['username'] = ENV['OPENC3_MICROSERVICE_NAME']
+        user['username'] = ENV.fetch('OPENC3_MICROSERVICE_NAME', nil)
 
         # Get the caller stack trace to determine the point in the code where the command was called
         # This code works but ultimately we didn't want to overload 'username' and take a performance hit
@@ -534,6 +535,10 @@ module OpenC3
         'log_message' => log_message.to_s,
         'obfuscated_items' => packet['obfuscated_items'].to_s
       }
+      # Record the original queuing user (author) separately from 'username' (the
+      # user or process that actually executed the command). Command History shows
+      # 'username' as "Executed By" and queue_username as "Queued By".
+      command['queue_username'] = queue_username if queue_username
       # Users have to explicitly opt into a default queue by setting the OPENC3_DEFAULT_QUEUE
       # At which point ALL commands will go to that queue unless they specifically opt out with queue: false
       if ENV['OPENC3_DEFAULT_QUEUE'] && queue.nil?

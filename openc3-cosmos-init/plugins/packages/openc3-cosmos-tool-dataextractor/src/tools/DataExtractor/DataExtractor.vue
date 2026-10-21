@@ -74,6 +74,7 @@
               :hidden="true"
               choose-item
               allow-all
+              :allow-glob="allowWildcards"
               show-latest
               @add-item="addItem($event)"
             />
@@ -305,7 +306,12 @@
 // Putting large data into Vue data section causes lots of overhead
 let dataExtractorRawData = []
 
-import { Api, Cable, OpenC3Api } from '@openc3/js-common/services'
+import {
+  Api,
+  Cable,
+  OpenC3Api,
+  logUnlessAuthRequired,
+} from '@openc3/js-common/services'
 import {
   Config,
   OpenC3TimePicker,
@@ -372,6 +378,7 @@ export default {
       fillDown: false,
       matlabHeader: false,
       uniqueOnly: false,
+      allowWildcards: false,
       keyMap: {},
       modes: ['DECOM', 'REDUCED_MINUTE', 'REDUCED_HOUR', 'REDUCED_DAY'],
       valueTypes: ['CONVERTED', 'RAW', 'FORMATTED'],
@@ -480,6 +487,14 @@ export default {
               },
             },
             {
+              label: 'Allow Wildcards',
+              checkbox: true,
+              checked: this.allowWildcards,
+              command: () => {
+                this.allowWildcards = !this.allowWildcards
+              },
+            },
+            {
               divider: true,
             },
             {
@@ -509,6 +524,7 @@ export default {
         fillDown: this.fillDown,
         matlabHeader: this.matlabHeader,
         uniqueOnly: this.uniqueOnly,
+        allowWildcards: this.allowWildcards,
         columnMode: this.columnMode,
         cmdOrTlm: this.cmdOrTlm,
         items: this.items,
@@ -527,6 +543,9 @@ export default {
       this.saveDefaultConfig(this.currentConfig)
     },
     uniqueOnly: function () {
+      this.saveDefaultConfig(this.currentConfig)
+    },
+    allowWildcards: function () {
       this.saveDefaultConfig(this.currentConfig)
     },
     columnNode: function () {
@@ -598,6 +617,7 @@ export default {
       this.fillDown = false
       this.matlabHeader = false
       this.uniqueOnly = false
+      this.allowWildcards = false
       this.columnMode = 'normal'
       let now = new Date()
       this.startDate = this.formatDate(now - 3600000, this.timeZone) // last hr data
@@ -619,6 +639,8 @@ export default {
       this.menus[1].items[1].checked = this.matlabHeader || false
       this.uniqueOnly = config.uniqueOnly
       this.menus[1].items[2].checked = this.uniqueOnly || false
+      this.allowWildcards = config.allowWildcards
+      this.menus[1].items[3].checked = this.allowWildcards || false
       this.columnMode = config.columnMode
       this.menus[1].radioGroup =
         this.columnMode === 'normal' ? 'Normal Columns' : 'Full Column Names'
@@ -718,8 +740,8 @@ export default {
       } catch (e) {
         return
       }
-      this.startDateTime = startTemp.getTime() * 1000000 // TODO: eslint parser doesn't like 1_000_000
-      this.endDateTime = endTemp.getTime() * 1000000
+      this.startDateTime = startTemp.getTime() * 1_000_000
+      this.endDateTime = endTemp.getTime() * 1_000_000
     },
     processItems: function () {
       // Check for a process in progress
@@ -748,12 +770,12 @@ export default {
         return
       }
       // Check for a future End Time
-      if (new Date(this.endDateTime / 1000000) > Date.now()) {
+      if (new Date(this.endDateTime / 1_000_000) > Date.now()) {
         this.$notify.caution({
           title: 'Note',
           body: `End date/time is greater than current date/time. Data will
             continue to stream in real-time until
-            ${new Date(this.endDateTime / 1000000).toISOString()} is reached.`,
+            ${new Date(this.endDateTime / 1_000_000).toISOString()} is reached.`,
         })
       }
 
@@ -815,8 +837,8 @@ export default {
         this.keyMap[indexString] = key
         items.push([key, indexString])
       })
-      OpenC3Auth.updateToken(OpenC3Auth.defaultMinValidity).then(
-        (refreshed) => {
+      OpenC3Auth.updateToken(OpenC3Auth.defaultMinValidity)
+        .then((refreshed) => {
           if (refreshed) {
             OpenC3Auth.setTokens()
           }
@@ -827,8 +849,11 @@ export default {
             start_time: this.startDateTime,
             end_time: this.endDateTime,
           })
-        },
-      )
+        })
+        // An AuthRequiredError means we have no token and are being redirected
+        // to login, so don't try to subscribe. Anything else is unexpected and
+        // still gets logged.
+        .catch(logUnlessAuthRequired)
     },
     received: function (data) {
       this.cable.recordPing()
@@ -893,7 +918,7 @@ export default {
         if (item.slice(0, 2) === '__') return
         if (this.columnMap[item]) return
         this.columnMap[item] = this.columnHeaders.length // Uses short name
-        item = this.keyMap[item] // Decode to full name
+        item = this.keyMap[item] || item // Decode to full name (glob-expanded keys are already full)
         const [
           mode,
           cmdTlm,
@@ -1002,7 +1027,7 @@ export default {
         if (!this.uniqueOnly || changed) {
           // Normal column mode means each row has time / target name / packet name
           if (this.columnMode === 'normal') {
-            regularKey = this.keyMap[regularKey] // Decode to full name
+            regularKey = this.keyMap[regularKey] || regularKey // Decode to full name (glob-expanded keys are already full)
             const [
               mode,
               cmdTlm,

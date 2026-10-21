@@ -8,7 +8,7 @@
 # See LICENSE.md for more details.
 
 # Modified by OpenC3, Inc.
-# All changes Copyright 2025, OpenC3, Inc.
+# All changes Copyright 2026, OpenC3, Inc.
 # All Rights Reserved
 #
 # This file may also be used under the terms of a commercial license
@@ -19,7 +19,7 @@
   <v-footer v-if="!chromeless" id="footer" app height="33">
     <img :src="icon" alt="OpenC3" />
     <span :class="footerClass" @click="upgrade">
-      OpenC3 {{ edition }} {{ version }} &copy; 2025 - License:
+      OpenC3 {{ edition }} {{ version }} &copy; {{ currentYear }} - License:
       {{ license }}
     </span>
     <v-spacer />
@@ -36,8 +36,9 @@
 </template>
 
 <script>
-import { Api, OpenC3Api } from '@openc3/js-common/services'
+import { Api, logUnlessAuthRequired } from '@openc3/js-common/services'
 import { UpgradeToEnterpriseDialog } from '@/components'
+import { getCachedSetting } from '@/util'
 import ClockFooter from './ClockFooter.vue'
 
 export default {
@@ -55,6 +56,7 @@ export default {
       version: '',
       showUpgradeToEnterpriseDialog: false,
       chromeless: null,
+      currentYear: new Date().getFullYear(),
     }
   },
   computed: {
@@ -71,21 +73,25 @@ export default {
     this.chromeless = urlParams.get('chromeless')
 
     this.getSourceUrl()
-    Api.get('/openc3-api/info').then((response) => {
-      if (response.data.enterprise) {
-        this.edition = 'COSMOS Enterprise'
-      } else {
-        this.edition = 'COSMOS Core'
-      }
-      this.enterprise = response.data.enterprise
-      this.license = response.data.license
-      this.version = response.data.version
-    })
+    Api.get('/openc3-api/info')
+      .then((response) => {
+        if (response.data.enterprise) {
+          this.edition = 'COSMOS Enterprise'
+        } else {
+          this.edition = 'COSMOS Core'
+        }
+        this.enterprise = response.data.enterprise
+        this.license = response.data.license
+        this.version = response.data.version
+      })
+      .catch(logUnlessAuthRequired)
   },
   methods: {
     getSourceUrl: function () {
-      new OpenC3Api().get_settings(['source_url']).then((response) => {
-        this.sourceUrl = response[0]
+      // Fall back to '' rather than undefined so the anchor keeps rendering an
+      // (empty) href instead of dropping the attribute entirely
+      getCachedSetting('source_url', '').then((response) => {
+        this.sourceUrl = response
       })
     },
     upgrade: function () {

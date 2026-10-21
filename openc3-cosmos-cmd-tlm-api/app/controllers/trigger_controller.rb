@@ -41,7 +41,7 @@ class TriggerController < ApplicationController
       render json: ret
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -56,16 +56,16 @@ class TriggerController < ApplicationController
     begin
       model = @model_class.get(name: params[:name], group: params[:group], scope: params[:scope])
       if model.nil?
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
       render json: model.as_json()
     rescue OpenC3::TriggerInputError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 400
+      render json: { status: 'error', message: e.message, type: e.class }, status: :bad_request
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -104,20 +104,24 @@ class TriggerController < ApplicationController
     return unless authorization('script_run')
     hash = nil
     begin
-      hash = params.to_unsafe_h.slice(:group, :left, :operator, :right).to_h
-      name = @model_class.create_unique_name(group: hash['group'], scope: params[:scope])
+      hash = params.permit(:group, :operator, :label, :name, left: {}, right: {}).to_h
+      name = hash.delete('name')
+      if name.nil? || name.strip.empty?
+        name = @model_class.create_unique_name(group: hash['group'], scope: params[:scope])
+      end
       model = @model_class.from_json(hash.symbolize_keys, name: name, scope: params[:scope])
+      model.validate_trigger_items()
       model.create() # Create sends a notification
-      render json: model.as_json(), status: 201
+      render json: model.as_json(), status: :created
     rescue OpenC3::TriggerInputError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 400
+      render json: { status: 'error', message: e.message, type: e.class }, status: :bad_request
     rescue OpenC3::TriggerError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 418
+      render json: { status: 'error', message: e.message, type: e.class }, status: :unprocessable_entity
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -133,13 +137,18 @@ class TriggerController < ApplicationController
     begin
       model = @model_class.get(name: params[:name], group: params[:group], scope: params[:scope])
       if model.nil?
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
-      hash = params.to_unsafe_h.slice(:left, :operator, :right).to_h
+      hash = params.permit(:operator, :label, left: {}, right: {}).to_h
       model.left = hash['left'] if hash['left']
       model.operator = hash['operator'] if hash['operator']
       model.right = hash['right'] if hash['right']
+      model.label = hash['label'] if hash.key?('label')
+      # Validate items here rather than in TriggerModel#update because we notify
+      # instead of updating directly. Without this the microservice would reject the
+      # update asynchronously, long after this request returned success.
+      model.validate_trigger_items()
       # Update the timestamp before notifying so the event has the current time
       model.updated_at = Time.now.to_nsec_from_epoch
       # Notify the TriggerGroupMicroservice to update the TriggerModel
@@ -149,13 +158,13 @@ class TriggerController < ApplicationController
       render json: model.as_json()
     rescue OpenC3::TriggerInputError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 400
+      render json: { status: 'error', message: e.message, type: e.class }, status: :bad_request
     rescue OpenC3::TriggerError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 418
+      render json: { status: 'error', message: e.message, type: e.class }, status: :unprocessable_entity
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -181,7 +190,7 @@ class TriggerController < ApplicationController
     begin
       model = @model_class.get(name: params[:name], group: params[:group], scope: params[:scope])
       if model.nil?
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
       # Notify the TriggerGroupMicroservice to enable the TriggerModel
@@ -191,7 +200,7 @@ class TriggerController < ApplicationController
       render json: model.as_json()
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -217,7 +226,7 @@ class TriggerController < ApplicationController
     begin
       model = @model_class.get(name: params[:name], group: params[:group], scope: params[:scope])
       if model.nil?
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
       # Notify the TriggerGroupMicroservice to disable the TriggerModel
@@ -227,7 +236,7 @@ class TriggerController < ApplicationController
       render json: model.as_json()
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -247,11 +256,11 @@ class TriggerController < ApplicationController
     begin
       model = @model_class.get(name: params[:name], group: params[:group], scope: params[:scope])
       if model.nil?
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
       unless model.dependents.empty?
-        render json: { status: 'error', message: "#{model.group}:#{model.name} has dependents: #{model.dependents}", type: 'TriggerError' }, status: 404
+        render json: { status: 'error', message: "#{model.group}:#{model.name} has dependents: #{model.dependents}", type: 'TriggerError' }, status: :not_found
         return
       end
       # Notify the TriggerGroupMicroservice to delete the TriggerModel
@@ -261,7 +270,7 @@ class TriggerController < ApplicationController
       render json: model.as_json()
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 end

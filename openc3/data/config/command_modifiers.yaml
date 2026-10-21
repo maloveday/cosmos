@@ -199,6 +199,7 @@ HIDDEN:
   summary: Hides this command from all OpenC3 tools such as Command Sender and Handbook Creator
   description: Hidden commands do not appear in the Script Runner popup helper when writing scripts.
     The command still exists in the system and can be sent by scripts.
+  since: 6.10.1
 DISABLED:
   summary: Disables this command from being sent
   description: Hides the command and also disables it from being sent by scripts.
@@ -283,6 +284,8 @@ TEMPLATE_FILE:
     - name: Template File Path
       required: true
       description: The relative path to the template file. Filename should generally start with an underscore.
+        Absolute paths and paths containing '..' are not allowed. The file must be inside the directory
+        containing the definition file.
       values: .+
   since: 5.0.10
 RESPONSE:
@@ -416,12 +419,12 @@ VALIDATOR:
                 return [False, "TGT PKT ITEM is 0"]
             self.cmd_acpt_cnt = tlm("INST HEALTH_STATUS CMD_ACPT_CNT")
             # Return true to indicate Success, false to indicate Failure,
-            # and nil to indicate Unknown. The second value is the optional message.
+            # and None to indicate Unknown. The second value is the optional message.
             return [True, None]
 
         def post_check(self, command):
             wait_check(f"INST HEALTH_STATUS CMD_ACPT_CNT > {self.cmd_acpt_cnt}", 10)
             # Return true to indicate Success, false to indicate Failure,
-            # and nil to indicate Unknown. The second value is the optional message.
+            # and None to indicate Unknown. The second value is the optional message.
             return [True, None]
   since: 5.19.0

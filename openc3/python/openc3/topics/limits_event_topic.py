@@ -26,13 +26,27 @@ from openc3.utilities.store import Store
 # it helps maintain consistency as the topic and model are linked.
 class LimitsEventTopic(Topic):
     @classmethod
+    def _active_db_shards(cls, scope):
+        """Collect all unique target db_shards from TargetModel"""
+        db_shards = {0}
+        for _name, json_data in Store.hgetall(f"{scope}__openc3_targets").items():
+            parsed = json.loads(json_data)
+            db_shards.add(int(parsed.get("db_shard", 0) or 0))
+        return db_shards
+
+    @classmethod
     def write(cls, event, scope):
         match event["type"]:
             case "LIMITS_CHANGE":
                 # The current_limits hash keeps only the current limits state of items
-                # It is used by the API to determine the overall limits state
-                field = f"{event['target_name']}__{event['packet_name']}__{event['item_name']}"
-                Store.hset(f"{scope}__current_limits", field, event["new_limits_state"])
+                # It is used by the API to determine the overall limits state.
+                # When the event originates from a stored packet in a non-PROCESS mode
+                # (LOG or DISABLE), skip updating current_limits so that historical
+                # data does not affect the real-time overall limits state or the
+                # out_of_limits API response.
+                if not event.get("suppress_stored"):
+                    field = f"{event['target_name']}__{event['packet_name']}__{event['item_name']}"
+                    Store.hset(f"{scope}__current_limits", field, event["new_limits_state"])
 
             case "LIMITS_SETTINGS":
                 # Limits updated in limits_api.rb to avoid circular reference to TargetModel
@@ -50,7 +64,7 @@ class LimitsEventTopic(Topic):
                 limits["yellow_low"] = event["yellow_low"]
                 limits["yellow_high"] = event["yellow_high"]
                 limits["red_high"] = event["red_high"]
-                if event.get("green_low") and event.get("green_high"):
+                if event.get("green_low") is not None and event.get("green_high") is not None:
                     limits["green_low"] = event["green_low"]
                     limits["green_high"] = event["green_high"]
                 limits_settings[event["limits_set"]] = limits
@@ -78,10 +92,27 @@ class LimitsEventTopic(Topic):
                     json.dumps(limits_settings),
                 )
 
+            case "LIMITS_STATE_COLOR":
+                # Persist the state color so it survives a decom microservice restart (applied by sync_system)
+                field = f"{event['target_name']}__{event['packet_name']}__{event['item_name']}"
+                limits_settings = Store.hget(f"{scope}__current_limits_settings", field)
+                if limits_settings:
+                    limits_settings = json.loads(limits_settings)
+                else:
+                    limits_settings = {}
+                if limits_settings.get("state_colors") is None:
+                    limits_settings["state_colors"] = {}
+                limits_settings["state_colors"][event["state_name"]] = event["color"]
+                Store.hset(
+                    f"{scope}__current_limits_settings",
+                    field,
+                    json.dumps(limits_settings),
+                )
+
             case "LIMITS_SET":
                 sets = cls.sets(scope=scope)
                 if sets.get(event["set"]) is None:
-                    raise RuntimeError(f"Set '{event['set']}' does not exist!")
+                    raise RuntimeError(f"Limits set '{event['set']}' does not exist")
 
                 # Set all existing sets to "false"
                 sets = dict.fromkeys(sets, "false")
@@ -90,12 +121,15 @@ class LimitsEventTopic(Topic):
             case _:
                 raise RuntimeError(f"Invalid limits event type '{event['type']}'")
 
-        Topic.write_topic(
-            f"{scope}__openc3_limits_events",
-            {"event": json.dumps(event, cls=JsonEncoder)},
-            "*",
-            1000,
-        )
+        # Write to all active db_shards so each decom microservice can read limits events inline
+        for db_shard in cls._active_db_shards(scope):
+            Topic.write_topic(
+                f"{scope}__openc3_limits_events",
+                {"event": json.dumps(event, cls=JsonEncoder)},
+                "*",
+                1000,
+                db_shard=db_shard,
+            )
 
     # Remove the JSON encoding to return hashes directly
     @classmethod
@@ -182,6 +216,29 @@ class LimitsEventTopic(Topic):
                 if re.match(rf"^{target_name}__", item):
                     Store.hdel(f"{scope}__current_limits_settings", item)
 
+    # Removes a limits set from the limits_sets hash and from the
+    # current_limits_settings of every item. Note that the set is not removed
+    # from the TargetModel packet definitions; that is cleaned up on the next
+    # plugin install. Running microservices will continue to hold the set in
+    # memory until they restart and resync from current_limits_settings.
+    @classmethod
+    def delete_set(cls, set_name, scope):
+        set_name = str(set_name)
+        limits_settings = Store.hgetall(f"{scope}__current_limits_settings")
+        # decode the binary string keys to strings
+        limits_settings = {k.decode(): v for (k, v) in limits_settings.items()}
+        # Collect all changed items and write them back in a single hset to
+        # avoid a Redis round trip per item (this hash can be large)
+        updates = {}
+        for item, settings in limits_settings.items():
+            settings = json.loads(settings)
+            if set_name in settings:
+                del settings[set_name]
+                updates[item] = json.dumps(settings)
+        if updates:
+            Store.hset(f"{scope}__current_limits_settings", mapping=updates)
+        Store.hdel(f"{scope}__limits_sets", set_name)
+
     # Update the local System based on overall state
     @classmethod
     def sync_system(cls, scope):
@@ -200,6 +257,10 @@ class LimitsEventTopic(Topic):
                     persistence = limits_settings.get("persistence_setting", 1)
                     for limits_set, settings in limits_settings.items():
                         if not isinstance(settings, dict):
+                            continue
+                        if limits_set == "state_colors":
+                            for state_name, color in settings.items():
+                                System.limits.set_state_color(target_name, packet_name, item_name, state_name, color)
                             continue
                         System.limits.set(
                             target_name,
@@ -221,54 +282,75 @@ class LimitsEventTopic(Topic):
                         else:
                             System.limits.disable(target_name, packet_name, item_name)
 
-    # Update the local system based on limits events
+    # Process a single limits event dict and update the local System accordingly.
+    # Called inline by DecomMicroservice when reading from the limits events topic.
+    @classmethod
+    def process_event(cls, event, telemetry=None):
+        if telemetry is None:
+            telemetry = System.telemetry.all()
+        match event["type"]:
+            case "LIMITS_CHANGE":
+                pass  # Ignore
+            case "LIMITS_SETTINGS":
+                target_name = event["target_name"]
+                packet_name = event["packet_name"]
+                item_name = event["item_name"]
+                target = telemetry.get(target_name)
+                if target:
+                    packet = target.get(packet_name)
+                    if packet:
+                        enabled = event.get("enabled", None)
+                        persistence = event.get("persistence", 1)
+                        System.limits.set(
+                            target_name,
+                            packet_name,
+                            item_name,
+                            event["red_low"],
+                            event["yellow_low"],
+                            event["yellow_high"],
+                            event["red_high"],
+                            event.get("green_low", None),
+                            event.get("green_high", None),
+                            event["limits_set"],
+                            persistence,
+                            enabled,
+                        )
+
+            case "LIMITS_ENABLE_STATE":
+                target_name = event["target_name"]
+                packet_name = event["packet_name"]
+                item_name = event["item_name"]
+                target = telemetry.get(target_name)
+                if target:
+                    packet = target.get(packet_name)
+                    if packet:
+                        enabled = event.get("enabled", False)
+                        if enabled:
+                            System.limits.enable(target_name, packet_name, item_name)
+                        else:
+                            System.limits.disable(target_name, packet_name, item_name)
+
+            case "LIMITS_STATE_COLOR":
+                target_name = event["target_name"]
+                packet_name = event["packet_name"]
+                item_name = event["item_name"]
+                target = telemetry.get(target_name)
+                if target:
+                    packet = target.get(packet_name)
+                    if packet:
+                        System.limits.set_state_color(
+                            target_name, packet_name, item_name, event["state_name"], event["color"]
+                        )
+
+            case "LIMITS_SET":
+                pass  # Ignore, System.limits_set() always queries Redis
+
+    # Update the local system based on limits events (standalone read loop).
+    # Still available for non-decom consumers that need to sync limits.
     @classmethod
     def sync_system_thread_body(cls, scope):
         telemetry = System.telemetry.all()
         topics = [f"{scope}__openc3_limits_events"]
         for _, _, event, _ in Topic.read_topics(topics, timeout_ms=None):
             event = json.loads(event[b"event"], cls=JsonDecoder)
-            match event["type"]:
-                case "LIMITS_CHANGE":
-                    pass  # Ignore
-                case "LIMITS_SETTINGS":
-                    target_name = event["target_name"]
-                    packet_name = event["packet_name"]
-                    item_name = event["item_name"]
-                    target = telemetry.get(target_name)
-                    if target:
-                        packet = target.get(packet_name)
-                        if packet:
-                            enabled = event.get("enabled", None)
-                            persistence = event.get("persistence", 1)
-                            System.limits.set(
-                                target_name,
-                                packet_name,
-                                item_name,
-                                event["red_low"],
-                                event["yellow_low"],
-                                event["yellow_high"],
-                                event["red_high"],
-                                event.get("green_low", None),
-                                event.get("green_high", None),
-                                event["limits_set"],
-                                persistence,
-                                enabled,
-                            )
-
-                case "LIMITS_ENABLE_STATE":
-                    target_name = event["target_name"]
-                    packet_name = event["packet_name"]
-                    item_name = event["item_name"]
-                    target = telemetry.get(target_name)
-                    if target:
-                        packet = target.get(packet_name)
-                        if packet:
-                            enabled = event.get("enabled", False)
-                            if enabled:
-                                System.limits.enable(target_name, packet_name, item_name)
-                            else:
-                                System.limits.disable(target_name, packet_name, item_name)
-
-                case "LIMITS_SET":
-                    pass  # Ignore, System.limits_set() always queries Redis
+            cls.process_event(event, telemetry=telemetry)

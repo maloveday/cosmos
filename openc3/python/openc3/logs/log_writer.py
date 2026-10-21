@@ -132,7 +132,8 @@ class LogWriter:
     def shutdown(self):
         threads = self.stop()
         with LogWriter.mutex:
-            LogWriter.instances.remove(self)
+            if self in LogWriter.instances:
+                LogWriter.instances.remove(self)
             if len(LogWriter.instances) <= 0:
                 if LogWriter.cycle_sleeper:
                     LogWriter.cycle_sleeper.cancel()
@@ -282,9 +283,9 @@ class LogWriter:
                 and (self.previous_time_nsec_since_epoch > time_nsec_since_epoch)
             ):
                 # Warning= Creating new files here can cause lots of files to be created if packets make it through out of order:
-                # Changed to just a error to prevent file thrashing
+                # Changed to just a warning to prevent file thrashing
                 if not self.out_of_order:
-                    Logger.error(
+                    Logger.warn(
                         f"Log writer out of order time detected (increase buffer depth?): {from_nsec_from_epoch(self.previous_time_nsec_since_epoch)} {from_nsec_from_epoch(time_nsec_since_epoch)}"
                     )
                     self.out_of_order = True

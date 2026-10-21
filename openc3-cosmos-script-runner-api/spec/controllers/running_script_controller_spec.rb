@@ -54,6 +54,25 @@ RSpec.describe RunningScriptController, type: :controller do
       expect(json["items"].size).to eq(0)
     end
 
+    it "filters the list by the search parameter" do
+      OpenC3::ScriptStatusModel.new(
+        name: "2",
+        state: "running",
+        scope: "DEFAULT",
+        filename: "INST/procedures/collect.rb",
+        start_time: Time.now.utc.iso8601,
+        username: "other_user",
+        user_full_name: "Other User"
+      ).create
+
+      get :index, params: {"scope" => "DEFAULT", "search" => "collect"}
+      expect(response.status).to eq(200)
+      json = JSON.parse(response.body)
+      expect(json["items"].size).to eq(1)
+      expect(json["items"][0]["filename"]).to eq("INST/procedures/collect.rb")
+      expect(json["total"]).to eq(1)
+    end
+
     it "handles forbidden errors when authorization is enabled" do
       get :index
       expect(response.status).to eq(401)
@@ -250,6 +269,29 @@ RSpec.describe RunningScriptController, type: :controller do
         expect(Process).to receive(:kill).with("SIGINT", 12345)
         expect(Process).to receive(:kill).with("SIGKILL", 12345)
         expect_any_instance_of(RunningScriptController).to receive(:running_script_publish).at_least(:once).with("cmd-running-script-channel:1", "stop")
+
+        delete :delete, params: {id: "1", scope: "DEFAULT"}
+
+        expect(response.status).to eq(200)
+      end
+    end
+
+    context "when script has no pid (spawn failed)" do
+      it "skips process signaling and cleans up the status model" do
+        script_model = double("ScriptModel")
+        allow(script_model).to receive(:filename).and_return("INST/procedures/test.rb")
+        allow(script_model).to receive(:pid).and_return(nil)
+        allow(script_model).to receive(:end_time=)
+        allow(script_model).to receive(:state=)
+        allow(script_model).to receive(:update)
+        allow(OpenC3::ScriptStatusModel).to receive(:get_model).and_return(script_model)
+        expect_any_instance_of(RunningScriptController).to receive(:running_script_publish).at_least(:once).with("cmd-running-script-channel:1", "stop")
+
+        expect(Process).not_to receive(:kill)
+        expect(Process).not_to receive(:getpgid)
+
+        expect(script_model).to receive(:state=).with("killed")
+        expect(script_model).to receive(:update)
 
         delete :delete, params: {id: "1", scope: "DEFAULT"}
 

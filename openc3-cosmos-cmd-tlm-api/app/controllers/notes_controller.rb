@@ -36,7 +36,7 @@ class NotesController < ApplicationController
   def index
     return unless authorization('system')
     action do
-      hash = params.to_unsafe_h.slice(:start, :stop, :limit)
+      hash = params.permit(:start, :stop, :limit).to_h
       if (hash['start'] && hash['stop'])
         hash['start'] = Time.parse(hash['start']).to_i
         hash['stop'] = Time.parse(hash['stop']).to_i
@@ -72,7 +72,7 @@ class NotesController < ApplicationController
   def create
     return unless authorization('script_run')
     action do
-      hash = params.to_unsafe_h.slice(:start, :stop, :color, :description).to_h
+      hash = params.permit(:start, :stop, :color, :description).to_h
       if hash['start'].nil? || hash['stop'].nil?
         raise ArgumentError.new "Param '#{hash['start'].nil? ? 'start' : 'stop'}' is required"
       end
@@ -86,7 +86,7 @@ class NotesController < ApplicationController
         scope: params[:scope],
         user: username(),
       )
-      render json: model.as_json(), status: 201
+      render json: model.as_json(), status: :created
     end
   end
 
@@ -109,7 +109,7 @@ class NotesController < ApplicationController
       if model_hash
         render json: model_hash
       else
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
       end
     end
   end
@@ -141,12 +141,12 @@ class NotesController < ApplicationController
     action do
       hash = @model_class.get(start: params[:id].to_i, scope: params[:scope])
       if hash.nil?
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
       model = @model_class.from_json(hash.symbolize_keys, scope: params[:scope])
 
-      hash = params.to_unsafe_h.slice(:start, :stop, :color, :description).to_h
+      hash = params.permit(:start, :stop, :color, :description).to_h
       hash['start'] = Time.parse(hash['start']).to_i
       hash['stop'] = Time.parse(hash['stop']).to_i
       model.update(
@@ -181,7 +181,7 @@ class NotesController < ApplicationController
     action do
       count = @model_class.destroy(start: params[:id].to_i, scope: params[:scope])
       if count == 0
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
       OpenC3::Logger.info(
@@ -225,7 +225,7 @@ class NotesController < ApplicationController
                message: "Invalid input: #{e.message}",
                type: e.class,
              },
-             status: 400
+             status: :bad_request
     rescue OpenC3::SortedError => e
       log_error(e)
       render json: {
@@ -233,7 +233,7 @@ class NotesController < ApplicationController
                message: e.message,
                type: e.class,
              },
-             status: 400
+             status: :bad_request
     rescue StandardError => e
       log_error(e)
       render json: {
@@ -242,7 +242,7 @@ class NotesController < ApplicationController
                type: e.class,
                backtrace: e.backtrace,
              },
-             status: 400
+             status: :bad_request
     end
   end
 end

@@ -15,7 +15,7 @@ If you check the project directory you should see a `plugins/DEFAULT/openc3-cosm
 
 ### Editing scripts
 
-:::info Visual Studio Code
+:::info[Visual Studio Code]
 This tutorial will use [VS Code](https://code.visualstudio.com) which is the editor used by the COSMOS developers. NOTE: There is a VS Code plugin maintained by a member of the COSMOS community at [openc3-vscode](https://github.com/JakeHillHub/openc3-vscode) (search in the Marketplace for 'OpenC3').
 :::
 
@@ -34,6 +34,29 @@ Clicking this reloads the file which has been synced into COSMOS and now we see 
 ### Disabling Local Mode
 
 If you want to disable Local Mode you can edit the .env file and delete the setting `OPENC3_LOCAL_MODE=1`.
+
+## Local Only Targets
+
+Local Mode keeps two copies of each edited file in sync: one in the `plugins` directory on the host and one in the COSMOS config bucket. For some targets you may want the files to live only on the host, for example when the host's project directory should be the single source of those files and they should never be copied into the bucket. List those targets in `OPENC3_LOCAL_ONLY_TARGETS`, separated by commas:
+
+```bash
+# .env or .env.local
+OPENC3_LOCAL_ONLY_TARGETS=INST,INST2
+```
+
+Restart COSMOS (`openc3.sh stop` then `openc3.sh run`) to apply the change. Target names are not case sensitive.
+
+For each listed target, its target files (procedures, screens, tables and anything else under the target) are read from and written to `plugins/<SCOPE>/targets_modified/<TARGET>` only:
+
+- Saving a file in Script Runner, Table Manager, Telemetry Viewer and the other tools writes it to the host directory and never to the bucket. Local Mode's sync never copies these files to or from the bucket either.
+- Files are only read from the host directory. There is no fallback to the bucket, so **files shipped in the plugin are not visible for these targets**. Copy any plugin files you need into `plugins/<SCOPE>/targets_modified/<TARGET>`.
+- Scripts reach these files the same way through `get_target_file` and `put_target_file`. A script running outside COSMOS (for example from your own machine using the COSMOS Python or Ruby client) reads and writes them through the COSMOS API, which serves them from the host directory.
+- Asking for a bucket download or upload URL for one of these files returns an error, since the file is not in the bucket.
+- Files that were already in the bucket before you added a target to the list, for example from earlier Local Mode syncs, are hidden but not deleted. Remove them from the bucket yourself if you no longer want them there.
+
+Local only targets work whether or not `OPENC3_LOCAL_MODE` is enabled. When a plugin with a local only target is upgraded, COSMOS still finds the modified files in the host directory and offers to delete them, just as it does for Local Mode.
+
+The target's plugin still supplies everything else: command and telemetry definitions, interfaces and microservices are installed from the plugin as usual.
 
 ## Configuration Management
 

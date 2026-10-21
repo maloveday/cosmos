@@ -7,7 +7,7 @@
 # See LICENSE.md for more details.
 #
 # Modified by OpenC3, Inc.
-# All changes Copyright 2025, OpenC3, Inc.
+# All changes Copyright 2026, OpenC3, Inc.
 # All Rights Reserved
 #
 # This file may also be used under the terms of a commercial license
@@ -17,11 +17,42 @@ import ast
 import re
 
 
+# Tokenizer for command parameters: matches double-quoted strings, single-quoted strings,
+# bracket-delimited arrays (one level of nesting), a bare comma delimiter, or bare words.
+# Commas are tokenized separately so whitespace around them is optional.
 SCANNING_REGULAR_EXPRESSION = re.compile(
-    r"(?:\"(?:[^\\\"]|\\.)*\") | (?:'(?:[^\\']|\\.)*') | (?:\[.*\]) | \S+", re.VERBOSE
+    r""" "(?:[^\\"]|\\.)*"            # double-quoted string (with escaped chars)
+       | '(?:[^\\']|\\.)*'            # single-quoted string (with escaped chars)
+       | \[(?:[^\\\[\]]|\\.|\[(?:[^\\\[\]]|\\.)*\])*\]   # array, one level of nesting
+       | ,                            # comma delimiter
+       | [^\s,]+                      # bare word
+    """,
+    re.VERBOSE,
 )
 
-SPLIT_WITH_REGEX = re.compile(r"\s+with\s+", re.IGNORECASE)
+# Operators supported by check(), wait() and wait_check() comparisons
+COMPARISON_OPERATORS = ["==", "!=", ">=", "<=", ">", "<", "in"]
+# Collections the in operator accepts. Ruby only has an Array.
+IN_OPERAND_TYPES = (list, tuple, set)
+
+# Matches Infinity and NaN which literal_eval rejects but float() accepts
+INFINITY_NAN_REGEX = re.compile(r"^[+-]?(inf(inity)?|nan)$", re.IGNORECASE)
+
+# Matches an f-string prefix. Interpolation would be code execution so it is rejected.
+INTERPOLATION_REGEX = re.compile(r"^(?:[fF][rRbB]?|[rRbB][fF])['\"]")
+
+# Matches repr() of a bytearray, e.g. bytearray(b'\\x00'). tlm() returns BLOCK items as a
+# bytearray so this is the natural way to write the operand, but it is a constructor call
+# rather than a literal so literal_eval rejects it.
+BYTEARRAY_REGEX = re.compile(r"^bytearray\((.*)\)$", re.DOTALL)
+
+# Matches the 'with' that separates the command from its parameters. Only a
+# single whitespace character is matched on each side (the rest of each run is
+# stripped by the caller) so the pattern stays free of quantifiers, which a
+# leading \s+ would make super-linear to search for.
+SPLIT_WITH_REGEX = re.compile(r"\swith\s", re.IGNORECASE)  # codespell:ignore
+# 'with' surrounded by optional whitespace is simply 'with' appearing anywhere
+SPLIT_WITH_OPTIONAL_WHITESPACE_REGEX = re.compile(r"with", re.IGNORECASE)
 
 # Regular expression to identify a String as a floating point number
 FLOAT_CHECK_REGEX = re.compile(r"\A\s*[-+]?\d*\.\d+\s*\Z")
@@ -135,8 +166,16 @@ def add_cmd_parameter(keyword, value, cmd_params):
 
 
 def extract_fields_from_cmd_text(text):
-    split_string = re.split(SPLIT_WITH_REGEX, text, maxsplit=2)
-    if len(split_string) == 1 and SPLIT_WITH_REGEX.match(text):
+    split_string = re.split(SPLIT_WITH_REGEX, text, maxsplit=1)  # 1 split, therefore 2 elements
+    if len(split_string) == 2:
+        # SPLIT_WITH_REGEX matches a single whitespace character on each side of
+        # 'with', so drop the rest of each run to match a r"\s+with\s+" split
+        split_string = [split_string[0].rstrip(), split_string[1].lstrip()]
+    if len(split_string) == 0 or split_string[0] == "":
+        raise RuntimeError("ERROR: text must not be empty")
+    if (len(split_string) == 1 and re.search(SPLIT_WITH_OPTIONAL_WHITESPACE_REGEX, text)) or (
+        len(split_string) == 2 and split_string[1] == ""
+    ):
         raise RuntimeError(f"ERROR: 'with' must be followed by parameters : {text:s}")
 
     # Extract target_name and cmd_name
@@ -154,35 +193,33 @@ def extract_fields_from_cmd_text(text):
         second_half = SCANNING_REGULAR_EXPRESSION.findall(split_string[1])
         keyword = None
         value = None
-        comma = None
         for item in second_half:
-            if not keyword:
-                keyword = item
-                continue
-            if not value:
-                if item.endswith(","):
-                    value = item[0:-1]
-                    comma = True
-                else:
-                    value = item
-                    continue
-            if not comma and item != ",":
-                raise RuntimeError(f"Missing comma in command parameters: {text:s}")
-            add_cmd_parameter(keyword, value, cmd_params)
-            keyword = None
-            value = None
-            comma = None
-        if keyword:
-            if value:
+            if item == ",":
+                # A comma completes the current keyword / value pair.
+                # A comma with nothing pending is a leading or duplicated comma.
+                if keyword is None:
+                    raise RuntimeError(f"Missing command parameter before comma: {text:s}")
+                if value is None:
+                    raise RuntimeError(f"Missing value for last command parameter: {text:s}")
                 add_cmd_parameter(keyword, value, cmd_params)
+                keyword = None
+                value = None
+            elif keyword is None:
+                keyword = item
+            elif value is None:
+                value = item
             else:
+                raise RuntimeError(f"Missing comma in command parameters: {text:s}")
+        if keyword is not None:
+            if value is None:
                 raise RuntimeError(f"Missing value for last command parameter: {text:s}")
+            add_cmd_parameter(keyword, value, cmd_params)
 
     return target_name, cmd_name, cmd_params
 
 
 def extract_fields_from_tlm_text(text):
-    split_string = text.split(" ")
+    split_string = text.split()
     if len(split_string) != 3:
         raise RuntimeError(f"ERROR: Telemetry Item must be specified as 'TargetName PacketName ItemName' : {text}")
     target_name = split_string[0]
@@ -215,21 +252,110 @@ def extract_fields_from_set_tlm_text(text):
 
 
 def extract_fields_from_check_text(text):
-    split_string = text.split(" ")
-    if len(split_string) < 3:
+    fields_split = text.split(None, 3)  # Python: second split arg is max number of splits
+    if len(fields_split) < 3:
         raise RuntimeError(f"ERROR: Check improperly specified: {text}")
-    target_name = split_string[0]
-    packet_name = split_string[1]
-    item_name = split_string[2]
-    comparison_to_eval = None
-    if len(split_string) == 3:
-        return [target_name, packet_name, item_name, comparison_to_eval]
-    if len(split_string) < 4:
-        raise RuntimeError(f"ERROR: Check improperly specified: {text}")
+    target_name, packet_name, item_name, *comparison = fields_split
 
-    # TODO: Ruby version has additional code to split on regex spaces
-    comparison_to_eval = " ".join(split_string[3:])
-    if split_string[3] == "=":
-        raise RuntimeError(f"ERROR: Use '==' instead of '=': {text}")
+    # comparison is a list, guaranteed to be of length 0 or 1 because of the split 3 with the splat operator above.
+    # We need it to be either None or the comparison string.
+    if len(comparison):
+        comparison = comparison[0]
+    else:
+        comparison = None
 
-    return target_name, packet_name, item_name, comparison_to_eval
+    if comparison and len(comparison):
+        operator, *_ = comparison.split(None, 1)
+        if operator == "=":
+            raise RuntimeError(f"ERROR: Use '==' instead of '=' in {text}")
+
+    return target_name, packet_name, item_name, comparison
+
+
+# Splits `check()` comparison expressions, e.g. "== 'foo bar'" becomes ["==", "foo bar"]
+def extract_operator_and_operand_from_comparison(comparison):
+    parts = comparison.split(None, 1)  # Python: second split arg is max number of splits
+    operator = parts[0] if len(parts) >= 1 else None
+    operand = parts[1] if len(parts) >= 2 else None
+
+    if operand is None:
+        if operator is not None:
+            raise RuntimeError(f"ERROR: Invalid comparison, must specify an operand: {comparison}")
+        return [None, None]
+
+    if operator not in COMPARISON_OPERATORS:
+        raise RuntimeError(f"ERROR: Invalid operator: '{operator}'")
+
+    # split leaves any trailing whitespace on the operand which the anchored matches reject
+    operand = extract_operand(operand.strip())
+    # 'in' is containment against a list of values in both Ruby and Python. A tuple or set is
+    # also accepted since that is how Python scripts commonly spell a collection of values.
+    # Enforced here so check(), wait() and wait_check() all reject the same thing.
+    if operator == "in" and not isinstance(operand, IN_OPERAND_TYPES):
+        raise RuntimeError(f"ERROR: The 'in' operator requires a list operand: {operand!r}")
+
+    return operator, operand
+
+
+# Converts the operand of a `check()` comparison expression into a Python value.
+# Note this deliberately does not eval the operand so only literal values are supported.
+def extract_operand(operand):
+    # A bytearray is spelled as a constructor call around a literal. Only this one wrapper is
+    # recognized and its contents still go through extract_operand, so nothing is executed.
+    bytearray_match = BYTEARRAY_REGEX.match(operand)
+    if bytearray_match:
+        contents = bytearray_match.group(1).strip()
+        if not contents:
+            return bytearray()
+        value = extract_operand(contents)
+        if not isinstance(value, bytes | bytearray | list):
+            raise RuntimeError(f"ERROR: Unable to parse operand: {operand}")
+        return bytearray(value)
+
+    # literal_eval only parses Python literals, e.g. numbers, strings, bytes, lists and dicts,
+    # so unlike eval it can not execute arbitrary code. It processes string escape sequences
+    # and requires a single complete literal, so "== 'a' garbage 'b'" is a syntax error.
+    try:
+        return ast.literal_eval(operand)
+    except (ValueError, SyntaxError, MemoryError, RecursionError):
+        pass  # Fall through to the formats literal_eval does not support
+    if INFINITY_NAN_REGEX.match(operand):
+        return float(operand)
+
+    # An f-string is interpolation which would be code execution. literal_eval already rejects
+    # it but the generic error does not say why.
+    if INTERPOLATION_REGEX.match(operand):
+        raise RuntimeError(
+            f"ERROR: String interpolation is not supported in an operand: {operand}. Interpolate in the script itself"
+        )
+    # A bare word is almost always a string the user forgot to quote. re.ASCII keeps \w to
+    # [A-Za-z0-9_] so this matches the same words as the Ruby implementation.
+    if re.match(r"^[A-Za-z_]\w*$", operand, re.ASCII):
+        raise NameError(f"Uninitialized constant {operand}. Did you mean '{operand}' as a string?")
+    raise RuntimeError(f"ERROR: Unable to parse operand: {operand}")
+
+
+# Compares a telemetry value against an operand using the given operator.
+# Returns False rather than raising if the two values can not be compared.
+def compare_values(value, operator, operand):
+    try:
+        if operator == "==":
+            return value == operand
+        elif operator == "!=":
+            return value != operand
+        elif operator == ">":
+            return value > operand
+        elif operator == ">=":
+            return value >= operand
+        elif operator == "<":
+            return value < operand
+        elif operator == "<=":
+            return value <= operand
+        elif operator == "in":
+            # 'in' is containment against a collection of values, matching Ruby
+            return isinstance(operand, IN_OPERAND_TYPES) and value in operand
+        else:
+            raise RuntimeError(f"ERROR: Invalid operator: '{operator}'")
+    except TypeError:
+        # Comparing incompatible types, e.g. None > 1, is simply not a match
+        return False

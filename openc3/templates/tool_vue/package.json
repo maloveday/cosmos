@@ -1,6 +1,6 @@
 {
   "name": "<%= tool_name %>",
-  "version": "7.0.0-rc4",
+  "version": "7.5.0-beta0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,8 +11,8 @@
   },
   "dependencies": {
     "@astrouxds/astro-web-components": "^7.24.0",
-    "@openc3/js-common": "6.10.4",
-    "@openc3/vue-common": "6.10.4",
+    "@openc3/js-common": "7.4.1",
+    "@openc3/vue-common": "7.4.1",
     "axios": "^1.7.7",
     "date-fns": "^4.1.0",
     "lodash": "^4.17.21",
@@ -22,7 +22,6 @@
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.1",
     "@vue/eslint-config-prettier": "^9.0.0",
-    "@vue/test-utils": "^2.4.6",
     "eslint": "^9.16.0",
     "eslint-config-prettier": "^9.1.0",
     "eslint-plugin-prettier": "^5.2.1",

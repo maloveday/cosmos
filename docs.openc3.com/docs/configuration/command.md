@@ -6,7 +6,7 @@ sidebar_custom_props:
   myEmoji: 📡
 ---
 
-<!-- Be sure to edit _command.md because command.md is a generated file -->
+{/* Be sure to edit _command.md because command.md is a generated file */}
 
 ## Command Concepts
 
@@ -22,21 +22,21 @@ When defining command parameters you can choose from the following data types: I
 
 ### Naming Convention
 
-Command Packets and Parameters can be named however you want with very few exceptions. The following is not allowed in Command or Parameter names: `__` (double underscore), `[[` or `]]` (double brackets), whitespace, and ending a name with underscore. While not much else is _explicitly_ restricted we've found the following guidelines to be helpful.
+Command Packets and Parameters can be named however you want with very few exceptions. The following is not allowed in Command or Parameter names: `__` (double underscore), `[[` or `]]` (double brackets), whitespace, and ending a name with underscore. Parameter names are also limited to a maximum of 127 characters because they are used as column headers when command data is stored in the time series database (QuestDB). Note that all target, packet, parameter, and state names are automatically converted to uppercase (COSMOS is not case sensitive), so mixed case cannot be used to visually separate words. Use underscores or dashes instead, e.g. `LOW_POWER_MODE` rather than `LowPowerMode` which becomes the harder to read `LOWPOWERMODE`. While not much else is _explicitly_ restricted we've found the following guidelines to be helpful. Note that renaming or changing the type of an existing parameter affects the historical data already stored for it, see [Packet Structure Changes](/docs/guides/packet-structure-changes).
 
-* Use underscores
+- Use underscores
 
-    Command names like `FIRE_THRUSTER` or `SET_MODE` are easy to read and understand. Most parameter names can be a single word like `TYPE`, `DURATION`, or `MODE` because they are unique within each Command.
+  Command names like `FIRE_THRUSTER` or `SET_MODE` are easy to read and understand. Most parameter names can be a single word like `TYPE`, `DURATION`, or `MODE` because they are unique within each Command.
 
-* Be descriptive but succinct
+- Be descriptive but succinct
 
-    A command name like `BUS_FLIGHT_SOFTWARE_ADCS_FIRE_THRUSTER_2` is a valid command name but makes all the drop downs extra long and is a lot to type. A better choice might be `FIRE_THRUSTER with POD 2`. Parameters are a great way to break up complex commands.
+  A command name like `BUS_FLIGHT_SOFTWARE_ADCS_FIRE_THRUSTER_2` is a valid command name but makes all the drop downs extra long and is a lot to type. A better choice might be `FIRE_THRUSTER with POD 2`. Parameters are a great way to break up complex commands.
 
-* Avoid brackets in commands and parameters
+- Avoid brackets in commands and parameters
 
-    Array items use brackets to allow indexing into an individual item. Thus if you use brackets in parameter names it gets confusing as to whether this is a COSMOS [ARRAY_PARAMETER](command#array_parameter) or simply a name with brackets. We support brackets for legacy reasons but avoid them when possible. For example from the Demo: `INST ARYCMD with ARRAY [1, 2, 3, 4]`.
+  Array items use brackets to allow indexing into an individual item. Thus if you use brackets in parameter names it gets confusing as to whether this is a COSMOS [ARRAY_PARAMETER](command#array_parameter) or simply a name with brackets. We support brackets for legacy reasons but avoid them when possible. For example from the Demo: `INST ARYCMD with ARRAY [1, 2, 3, 4]`.
 
-<div style={{"clear": 'both'}}></div>
+<div style={{ clear: "both" }}></div>
 
 ## Command Authority (Enterprise)
 
@@ -67,7 +67,7 @@ Here is an example of sending a HAZARDOUS command in Command Sender when Critica
 | Description | Description of this command which must be enclosed with quotes | False |
 
 Example Usage:
-```ruby
+```cosmos
 COMMAND INST COLLECT BIG_ENDIAN "Start collect"
 ```
 
@@ -103,7 +103,7 @@ When Data Type is STRING, BLOCK the remaining parameters are:
 | Endianness | Indicates if the data in this command is to be sent in Big Endian or Little Endian format<br/><br/>Valid Values: <span class="values">BIG_ENDIAN, LITTLE_ENDIAN</span> | False |
 
 Example Usage:
-```ruby
+```cosmos
 PARAMETER SYNC 0 32 UINT 0xDEADBEEF 0xDEADBEEF 0xDEADBEEF "Sync pattern"
 PARAMETER DATA 32 32 INT MIN MAX 0 "Data value"
 PARAMETER VALUE 64 32 FLOAT 0 10.5 2.5
@@ -122,7 +122,7 @@ The following keywords must follow a PARAMETER keyword.
 | Format | How to format using printf syntax. For example, '0x%0X' will display the value in hex. | True |
 
 Example Usage:
-```ruby
+```cosmos
 FORMAT_STRING "0x%0X"
 ```
 
@@ -135,7 +135,7 @@ FORMAT_STRING "0x%0X"
 | Abbreviated | Abbreviation for the units, e.g. C | True |
 
 Example Usage:
-```ruby
+```cosmos
 UNITS Celsius C
 UNITS Kilometers KM
 ```
@@ -158,7 +158,7 @@ Meta data is user specific data that can be used by custom tools for various pur
 | Meta Values | One or more values to be stored for this Meta Name | False |
 
 Example Usage:
-```ruby
+```cosmos
 META TEST "This parameter is for test purposes only"
 ```
 
@@ -178,7 +178,7 @@ Keys are often [JSONPath](https://en.wikipedia.org/wiki/JSONPath) or [XPath](htt
 | Key string | The key to access this item | True |
 
 Example Usage:
-```ruby
+```cosmos
 KEY $.book.title
 ```
 
@@ -235,7 +235,7 @@ Key value pairs allow for user friendly strings. For example, you might define s
 | Hazardous Description | String describing why this state is hazardous | False |
 
 Example Usage:
-```ruby
+```cosmos
 APPEND_PARAMETER ENABLE 32 UINT 0 1 0 "Enable setting"
   STATE FALSE 0
   STATE TRUE 1
@@ -266,12 +266,12 @@ in the TIME_OFFSET command definition of the COSMOS Demo
 [INST inst_cmds.txt](https://github.com/OpenC3/cosmos/blob/main/openc3-cosmos-init/plugins/packages/openc3-cosmos-demo/targets/INST/cmd_tlm/inst_cmds.txt)
 or [INST2 inst_cmds.txt](https://github.com/OpenC3/cosmos/blob/main/openc3-cosmos-init/plugins/packages/openc3-cosmos-demo/targets/INST2/cmd_tlm/inst_cmds.txt).
 
-:::info Multiple write conversions on command parameters
+:::info[Multiple write conversions on command parameters]
 When a command is built, each item gets written (and write conversions are run)
 to set the default value. Then items are written (again write conversions are run)
 with user provided values. Thus write conversions can be run twice. Also there are
 no guarantees which parameters have already been written. The packet itself has a
-given_values() method which can be used to retrieve a hash of the user provided
+`given_values` attribute which can be used to retrieve a hash of the user provided
 values to the command. That can be used to check parameter values passed in.
 :::
 
@@ -283,13 +283,51 @@ values to the command. That can be used to check parameter values passed in.
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
-WRITE_CONVERSION openc3/conversions/ip_write_conversion.py
+```cosmos
+# Example command with a WRITE_CONVERSION that sets a command parameter
+# based on the given values of other parameters
+COMMAND INST BLOCK BIG_ENDIAN "Send variable block of data"
+  APPEND_PARAMETER BYTE 8 UINT MIN MAX 0x55 "Byte to duplicate"
+    FORMAT_STRING "0x%0X"
+  APPEND_PARAMETER LENGTH 32 UINT MIN MAX 0 "Length of data"
+  APPEND_PARAMETER DATA 0 BLOCK "" "Variable block of data"
+    WRITE_CONVERSION block_conversion.py
+    HIDDEN # Because we're filling it in with a conversion
+
+# Implemented in INST/lib/block_conversion.py:
+from openc3.conversions.conversion import Conversion
+class BlockConversion(Conversion):
+    def call(self, value, packet, buffer):
+        # Use the packet.given_values hash to access user provided values to the command
+        byte = packet.given_values.get('BYTE', 0x55)
+        length = packet.given_values.get('LENGTH', 0)
+        return bytes([byte]) * length
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
-WRITE_CONVERSION ip_write_conversion.rb
+```cosmos
+# Example command with a WRITE_CONVERSION that sets a command parameter
+# based on the given values of other parameters
+COMMAND INST BLOCK BIG_ENDIAN "Send variable block of data"
+  APPEND_PARAMETER BYTE 8 UINT MIN MAX 0x55 "Byte to duplicate"
+    FORMAT_STRING "0x%0X"
+  APPEND_PARAMETER LENGTH 32 UINT MIN MAX 0 "Length of data"
+  APPEND_PARAMETER DATA 0 BLOCK "" "Variable block of data"
+    WRITE_CONVERSION block_conversion.rb
+    HIDDEN # Because we're filling it in with a conversion
+
+# Implemented in INST/lib/block_conversion.rb:
+require 'openc3/conversions/conversion'
+module OpenC3
+  class BlockConversion < Conversion
+    def call(value, packet, buffer)
+      # Use the packet.given_values hash to access user provided values to the command
+      byte = packet.given_values['BYTE'] || 0x55
+      length = packet.given_values['LENGTH'] || 0
+      [byte].pack('C') * length
+    end
+  end
+end
 ```
 </TabItem>
 </Tabs>
@@ -319,12 +357,12 @@ compatibility). The last line of code should return the converted
 value. The GENERIC_WRITE_CONVERSION_END keyword specifies that all lines of
 code for the conversion have been given.
 
-:::info Multiple write conversions on command parameters
+:::info[Multiple write conversions on command parameters]
 When a command is built, each item gets written (and write conversions are run)
 to set the default value. Then items are written (again write conversions are run)
 with user provided values. Thus write conversions can be run twice. Also there are
 no guarantees which parameters have already been written. The packet itself has a
-given_values() method which can be used to retrieve a hash of the user provided
+`given_values` attribute which can be used to retrieve a hash of the user provided
 values to the command. That can be used to check parameter values passed in.
 :::
 
@@ -336,7 +374,7 @@ Generic conversions are not a good long term solution. Consider creating a conve
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 APPEND_PARAMETER ITEM1 32 UINT 0 0xFFFFFFFF 0
   GENERIC_WRITE_CONVERSION_START
     int(value * 1.5) # Convert the value by a scale factor
@@ -344,7 +382,7 @@ APPEND_PARAMETER ITEM1 32 UINT 0 0xFFFFFFFF 0
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 APPEND_PARAMETER ITEM1 32 UINT 0 0xFFFFFFFF 0
   GENERIC_WRITE_CONVERSION_START
     (value * 1.5).to_i # Convert the value by a scale factor
@@ -367,12 +405,12 @@ By default OpenC3 throws an error if you try to write a value which overflows it
 | Behavior | How OpenC3 treats an overflow value. Only applies to signed and unsigned integer data types.<br/><br/>Valid Values: <span class="values">ERROR, ERROR_ALLOW_HEX, TRUNCATE, SATURATE</span> | True |
 
 Example Usage:
-```ruby
+```cosmos
 OVERFLOW TRUNCATE
 ```
 
 #### HIDDEN
-**Hides this parameter from all the OpenC3 tools**
+<span class="badge badge--secondary since-right">Since 6.10.0</span>**Hides this parameter from all the OpenC3 tools**
 
 This item will not appear in CmdSender. It also hides this item from appearing in the Script Runner popup helper when writing scripts. The parameter should not be provided to commands.
 
@@ -405,7 +443,7 @@ When Data Type is STRING, BLOCK the remaining parameters are:
 | Endianness | Indicates if the data in this command is to be sent in Big Endian or Little Endian format<br/><br/>Valid Values: <span class="values">BIG_ENDIAN, LITTLE_ENDIAN</span> | False |
 
 Example Usage:
-```ruby
+```cosmos
 APPEND_PARAMETER SYNC 32 UINT 0xDEADBEEF 0xDEADBEEF 0xDEADBEEF "Sync pattern"
 APPEND_PARAMETER VALUE 32 FLOAT 0 10.5 2.5
 APPEND_PARAMETER LABEL 0 STRING "OPENC3" "The label to apply"
@@ -442,7 +480,7 @@ When Data Type is STRING, BLOCK the remaining parameters are:
 | Endianness | Indicates if the data in this command is to be sent in Big Endian or Little Endian format<br/><br/>Valid Values: <span class="values">BIG_ENDIAN, LITTLE_ENDIAN</span> | False |
 
 Example Usage:
-```ruby
+```cosmos
 ID_PARAMETER OPCODE 32 32 UINT 2 2 2 "Opcode identifier"
 ```
 
@@ -476,7 +514,7 @@ When Data Type is STRING, BLOCK the remaining parameters are:
 | Endianness | Indicates if the data in this command is to be sent in Big Endian or Little Endian format<br/><br/>Valid Values: <span class="values">BIG_ENDIAN, LITTLE_ENDIAN</span> | False |
 
 Example Usage:
-```ruby
+```cosmos
 APPEND_ID_PARAMETER OPCODE 32 UINT 2 2 2 "Opcode identifier"
 ```
 
@@ -494,7 +532,7 @@ APPEND_ID_PARAMETER OPCODE 32 UINT 2 2 2 "Opcode identifier"
 | Endianness | Indicates if the data is to be sent in Big Endian or Little Endian format<br/><br/>Valid Values: <span class="values">BIG_ENDIAN, LITTLE_ENDIAN</span> | False |
 
 Example Usage:
-```ruby
+```cosmos
 ARRAY_PARAMETER ARRAY 64 64 FLOAT 640 "Array of 10 64bit floats"
 ```
 
@@ -511,7 +549,7 @@ ARRAY_PARAMETER ARRAY 64 64 FLOAT 640 "Array of 10 64bit floats"
 | Endianness | Indicates if the data is to be sent in Big Endian or Little Endian format<br/><br/>Valid Values: <span class="values">BIG_ENDIAN, LITTLE_ENDIAN</span> | False |
 
 Example Usage:
-```ruby
+```cosmos
 APPEND_ARRAY_PARAMETER ARRAY 64 FLOAT 640 "Array of 10 64bit floats"
 ```
 
@@ -548,7 +586,7 @@ Must be used in conjunction with SELECT_COMMAND to first select the packet. Typi
 | Parameter | Name of the parameter to select for modification | True |
 
 Example Usage:
-```ruby
+```cosmos
 SELECT_COMMAND INST COLLECT
   SELECT_PARAMETER DURATION
     # Add units
@@ -565,13 +603,13 @@ Deleting a parameter from the command definition does not remove the defined spa
 | Parameter | Name of the parameter to delete | True |
 
 Example Usage:
-```ruby
+```cosmos
 SELECT_COMMAND INST COLLECT
   DELETE_PARAMETER DURATION
 ```
 
 ### HIDDEN
-**Hides this command from all OpenC3 tools such as Command Sender and Handbook Creator**
+<span class="badge badge--secondary since-right">Since 6.10.1</span>**Hides this command from all OpenC3 tools such as Command Sender and Handbook Creator**
 
 Hidden commands do not appear in the Script Runner popup helper when writing scripts. The command still exists in the system and can be sent by scripts.
 
@@ -597,7 +635,7 @@ Meta data is user specific data that can be used by custom tools for various pur
 | Meta Values | One or more values to be stored for this Meta Name | False |
 
 Example Usage:
-```ruby
+```cosmos
 META FSW_TYPE "struct command"
 ```
 
@@ -655,7 +693,7 @@ Generally the template file is formatted in JSON or HTML and then values are fil
 
 | Parameter | Description | Required |
 |-----------|-------------|----------|
-| Template File Path | The relative path to the template file. Filename should generally start with an underscore. | True |
+| Template File Path | The relative path to the template file. Filename should generally start with an underscore. Absolute paths and paths containing '..' are not allowed. The file must be inside the directory containing the definition file. | True |
 
 ### RESPONSE
 <span class="badge badge--secondary since-right">Since 5.14.0</span>**Indicates the expected telemetry packet response to this command**
@@ -726,7 +764,7 @@ Validator class is used to validate the command success or failure with both a p
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 VALIDATOR custom_validator.py
 
 Defined in custom_validator.py:
@@ -743,18 +781,18 @@ class CustomValidator(CommandValidator):
             return [False, "TGT PKT ITEM is 0"]
         self.cmd_acpt_cnt = tlm("INST HEALTH_STATUS CMD_ACPT_CNT")
         # Return true to indicate Success, false to indicate Failure,
-        # and nil to indicate Unknown. The second value is the optional message.
+        # and None to indicate Unknown. The second value is the optional message.
         return [True, None]
 
     def post_check(self, command):
         wait_check(f"INST HEALTH_STATUS CMD_ACPT_CNT > {self.cmd_acpt_cnt}", 10)
         # Return true to indicate Success, false to indicate Failure,
-        # and nil to indicate Unknown. The second value is the optional message.
+        # and None to indicate Unknown. The second value is the optional message.
         return [True, None]
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 VALIDATOR custom_validator.rb
 
 Defined in custom_validator.rb:
@@ -798,7 +836,7 @@ Typically used in a separate configuration file from where the original command 
 | Command Name | Name of the command to select | True |
 
 Example Usage:
-```ruby
+```cosmos
 SELECT_COMMAND INST COLLECT
   SELECT_PARAMETER DURATION
     # Add units
@@ -810,8 +848,7 @@ SELECT_COMMAND INST COLLECT
 
 **Example File: TARGET/cmd_tlm/cmd.txt**
 
-<!-- prettier-ignore -->
-```ruby
+```cosmos
 COMMAND TARGET COLLECT_DATA BIG_ENDIAN "Commands my target to collect data"
   PARAMETER CCSDSVER 0 3 UINT 0 0 0 "CCSDS PRIMARY HEADER VERSION NUMBER"
   PARAMETER CCSDSTYPE 3 1 UINT 1 1 1 "CCSDS PRIMARY HEADER PACKET TYPE"

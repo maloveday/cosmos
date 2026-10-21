@@ -1,4 +1,4 @@
-# Copyright 2025 OpenC3, Inc.
+# Copyright 2026 OpenC3, Inc.
 # All Rights Reserved.
 #
 # This program is distributed in the hope that it will be useful,
@@ -22,7 +22,7 @@ from openc3.config.config_parser import ConfigParser
 from openc3.microservices.interface_decom_common import (
     handle_build_cmd,
     handle_get_tlm_buffer,
-    handle_inject_tlm,
+    handle_inject_tlm_with_ack,
 )
 from openc3.microservices.interface_microservice import InterfaceMicroservice
 from openc3.microservices.microservice import Microservice
@@ -101,20 +101,30 @@ class DecomMicroservice(Microservice):
         "GREEN_HIGH": 5,
     }
 
+    # Decom never uses descriptions so don't keep them in memory
+    def load_descriptions(self):
+        return False
+
     def __init__(self, *args):
         super().__init__(*args)
         # Should only be one target, but there might be multiple decom microservices for a given target
         # First Decom microservice has no number in the name
         if "__DECOM__" in self.name:
             self.topics.append(f"{self.scope}__DECOMINTERFACE__{{{self.target_names[0]}}}")
-        Topic.update_topic_offsets(self.topics)
+        self.limits_event_topic = f"{self.scope}__openc3_limits_events"
+        self.topics.append(self.limits_event_topic)
+        Topic.update_topic_offsets(self.topics, db_shard=self.db_shard)
+        # Initialize before set_limits_change_callback - sync_system below can
+        # fire the callback synchronously for any persisted-disabled items.
+        self.limits_response_queue = queue.Queue()
+        self.limits_response_thread = None
         System.telemetry.set_limits_change_callback(self.limits_change_callback)
         LimitsEventTopic.sync_system(scope=self.scope)
+        target_model = TargetModel.get_model(name=self.target_names[0], scope=self.scope)
+        self.stored_limits_mode = target_model.stored_limits_mode if target_model else "PROCESS"
         self.error_count = 0
         self.metric.set(name="decom_total", value=self.count, type="counter")
         self.metric.set(name="decom_error_total", value=self.error_count, type="counter")
-        self.limits_response_queue = queue.Queue()
-        self.limits_response_thread = None
 
     def run(self):
         self.limits_response_thread = LimitsResponseThread(
@@ -131,16 +141,18 @@ class DecomMicroservice(Microservice):
             if self.cancel_thread:
                 break
             try:
-                # OpenC3.in_span("read_topics") do
-                for topic, msg_id, msg_hash, redis in Topic.read_topics(self.topics):
+                for topic, msg_id, msg_hash, redis in Topic.read_topics(self.topics, db_shard=self.db_shard):
                     if self.cancel_thread:
                         break
 
                     if topic == self.microservice_topic:
                         self.microservice_cmd(topic, msg_id, msg_hash, redis)
+                    elif topic == self.limits_event_topic:
+                        event = json.loads(msg_hash[b"event"])
+                        LimitsEventTopic.process_event(event)
                     elif "__DECOMINTERFACE__" in topic:
                         if msg_hash.get(b"inject_tlm"):
-                            handle_inject_tlm(msg_hash[b"inject_tlm"], self.scope)
+                            handle_inject_tlm_with_ack(msg_hash[b"inject_tlm"], msg_id, self.scope, self.logger)
                             continue
                         if msg_hash.get(b"build_cmd"):
                             handle_build_cmd(msg_hash[b"build_cmd"], msg_id, self.scope)
@@ -152,7 +164,6 @@ class DecomMicroservice(Microservice):
                         self.decom_packet(topic, msg_id, msg_hash, redis)
                         self.metric.set(name="decom_total", value=self.count, type="counter")
                     self.count += 1
-                LimitsEventTopic.sync_system_thread_body(scope=self.scope)
             except Exception as error:
                 self.error_count += 1
                 self.metric.set(name="decom_error_total", value=self.error_count, type="counter")
@@ -217,10 +228,16 @@ class DecomMicroservice(Microservice):
             # Process all the limits and call the limits_change_callback (as necessary)
             # This must be before the full decom so that limits states are available
             #############################################################################
-            packet_or_subpacket.check_limits(System.limits_set())
+            disable_stored_limits = packet_or_subpacket.stored and self.stored_limits_mode == "DISABLE"
+            if not disable_stored_limits:
+                packet_or_subpacket.check_limits(System.limits_set())
 
             # This is what actually decommutates the packet and updates the CVT
-            TelemetryDecomTopic.write_packet(packet_or_subpacket, scope=self.scope)
+            TelemetryDecomTopic.write_packet(
+                packet_or_subpacket,
+                include_limits_states=not disable_stored_limits,
+                scope=self.scope,
+            )
         diff = time.time() - start  # seconds as a float
         self.metric.set(name="decom_duration_seconds", value=diff, type="gauge", unit="seconds")
 
@@ -297,10 +314,11 @@ class DecomMicroservice(Microservice):
             packet_time = packet.packet_time
         else:
             packet_time = datetime.now(timezone.utc)
-        if value:
+        if value is not None:
             message = f"{packet.target_name} {packet.packet_name} {item.name} = {value} is {item.limits.state}"
             if item.limits.values:
-                values = item.limits.values[System.limits_set()]
+                selected_limits_set = System.limits_set() if System.limits_set() in item.limits.values else "DEFAULT"
+                values = item.limits.values[selected_limits_set]
                 # Check if the state is RED_LOW, YELLOW_LOW, YELLOW_HIGH, RED_HIGH, GREEN_LOW, GREEN_HIGH
                 if DecomMicroservice.LIMITS_STATE_INDEX.get(item.limits.state, None) is not None:
                     # Directly index into the values and return the value
@@ -339,9 +357,12 @@ class DecomMicroservice(Microservice):
             "time_nsec": to_nsec_from_epoch(packet_time),
             "message": str(message),
         }
+        suppress_stored = packet.stored and self.stored_limits_mode != "PROCESS"
+        if suppress_stored:
+            event["suppress_stored"] = True
         LimitsEventTopic.write(event, scope=self.scope)
 
-        if item.limits.response is not None:
+        if item.limits.response is not None and not suppress_stored:
             copied_packet = packet.deep_copy()
             copied_item = packet.items[item.name]
             self.limits_response_queue.put([copied_packet, copied_item, old_limits_state])

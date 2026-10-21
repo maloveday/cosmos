@@ -15,13 +15,15 @@
 # This file may also be used under the terms of a commercial license
 # if purchased from OpenC3, Inc.
 
+require 'openc3/utilities/script'
+
 class RunningScriptController < ApplicationController
   def index
     return unless authorization('script_view')
     limit = params[:limit] || 10
     offset = params[:offset] || 0
-    items = OpenC3::ScriptStatusModel.all(scope: params[:scope], offset: offset, limit: limit, type: 'running')
-    total = OpenC3::ScriptStatusModel.count(scope: params[:scope], type: 'running')
+    search = params[:search]
+    items, total = OpenC3::ScriptStatusModel.page(scope: params[:scope], offset: offset, limit: limit, type: 'running', search: search)
     render json: { items: items, total: total }
   end
 
@@ -29,13 +31,17 @@ class RunningScriptController < ApplicationController
     return unless authorization('script_view')
     running_script = OpenC3::ScriptStatusModel.get(name: params[:id], scope: params[:scope])
     if running_script
-      # If this is a suite being run, pull the file and process the suites for the frontend
+      # If this is a suite being run, pull the file and process the suites for the
+      # frontend. Suite analysis executes the file, so it is gated at the script_run
+      # tier rather than this read-only script_view endpoint.
       if running_script['suite_runner']
         name = running_script['filename']
-        file = Script.body(params[:scope], name)
-        # Since this is a running script the suite should process successfully
-        results_suites, _results_error, _success = Script.process_suite(name, file, username: username(), scope: params[:scope])
-        running_script['suites'] = results_suites
+        if authorized?('script_run', target_name: name.split('/')[0])
+          file = Script.body(params[:scope], name)
+          # Since this is a running script the suite should process successfully
+          results_suites, _results_error, _success = Script.process_suite(name, file, username: username(), scope: params[:scope])
+          running_script['suites'] = results_suites
+        end
       end
       render json: running_script
     else
@@ -60,43 +66,55 @@ class RunningScriptController < ApplicationController
     running_script = OpenC3::ScriptStatusModel.get_model(name: params[:id], scope: params[:scope])
     if running_script
       target_name = running_script.filename.split('/')[0]
-      pid = running_script.pid.to_i
+      pid = running_script.pid&.to_i
       return unless authorization('script_run', target_name: target_name)
       running_script_publish("cmd-running-script-channel:#{params[:id]}", "stop")
 
-      # Give the process 1 second to stop from stop message
       stopped = false
-      start_time = Time.now
-      while Time.now - start_time < 1.0
-        begin
-          Process.getpgid(pid.to_i)
-          sleep 0.1
-        rescue Errno::ESRCH
-          stopped = true
-          break
-        end
-      end
-
-      # If the process is still running
-      # Send a SIGINT and give it one more second
-      if not stopped
-        Process.kill("SIGINT", pid)
+      if pid and pid > 0
+        # Give the process 1 second to stop from stop message
         start_time = Time.now
         while Time.now - start_time < 1.0
           begin
-            Process.getpgid(pid.to_i)
+            Process.getpgid(pid)
             sleep 0.1
           rescue Errno::ESRCH
             stopped = true
             break
           end
         end
+
+        # If the process is still running
+        # Send a SIGINT and give it one more second
+        if not stopped
+          begin
+            Process.kill("SIGINT", pid)
+          rescue Errno::ESRCH
+            stopped = true
+          end
+          start_time = Time.now
+          while Time.now - start_time < 1.0
+            begin
+              Process.getpgid(pid)
+              sleep 0.1
+            rescue Errno::ESRCH
+              stopped = true
+              break
+            end
+          end
+        end
+
+        # If the process is still running send a hard kill signal
+        if not stopped
+          begin
+            Process.kill("SIGKILL", pid)
+          rescue Errno::ESRCH
+            stopped = true
+          end
+        end
       end
 
-      # If the process is still running send a hard kill signal
-      if not stopped
-        Process.kill("SIGKILL", pid)
-
+      if pid.nil? or not stopped
         # Also need to cleanup the status model in this case because the process will not die and cleanup
         running_script.end_time = Time.now.utc.iso8601
         running_script.state = "killed"
@@ -173,7 +191,9 @@ class RunningScriptController < ApplicationController
       elsif params[:multiple]
         running_script_publish("cmd-running-script-channel:#{params[:id]}", { method: params[:method], multiple: JSON.generate(params[:answer], allow_nan: true), prompt_id: params[:prompt_id] })
       else
-        running_script_publish("cmd-running-script-channel:#{params[:id]}", { method: params[:method], answer: params[:answer], prompt_id: params[:prompt_id] })
+        # Convert ActionController::Parameters to a plain hash for nested objects (e.g. open_bucket_dialog)
+        answer = params[:answer].respond_to?(:to_unsafe_h) ? params[:answer].to_unsafe_h : params[:answer]
+        running_script_publish("cmd-running-script-channel:#{params[:id]}", { method: params[:method], answer: answer, prompt_id: params[:prompt_id] })
       end
       OpenC3::Logger.info("Script prompt action #{params[:method]}: #{running_script['filename']}", scope: params[:scope], user: username())
       head :ok

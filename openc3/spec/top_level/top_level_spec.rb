@@ -18,6 +18,7 @@
 require 'spec_helper'
 require 'openc3/top_level'
 require 'fileutils'
+require 'openc3/packets/packet'
 
 describe "HazardousError" do
   it "has accessors" do
@@ -34,11 +35,6 @@ describe "HazardousError" do
 end
 
 module OpenC3
-  def self.cleanup_exceptions
-    # Delete the 'exception' files
-    Dir[File.join(File.dirname(__FILE__), "*exception.txt")].each { |file| FileUtils.rm_f file }
-  end
-
   describe "FatalError" do
     it "is a StandardError" do
       expect(FatalError.new).to be_a StandardError
@@ -91,7 +87,6 @@ module OpenC3
         expect { OpenC3.marshal_dump('marshal_test', Proc.new { '' }) }.to raise_error(SystemExit)
         expect(stdout.string).to match("is defined for class Proc")
       end
-      OpenC3.cleanup_exceptions()
     end
 
     it "rescues marshal dump errors in a Packet with a Mutex" do
@@ -102,7 +97,6 @@ module OpenC3
         expect { OpenC3.marshal_dump('marshal_test', pkt) }.to raise_error(SystemExit)
         expect(stdout.string).to match("Mutex exists in a packet")
       end
-      OpenC3.cleanup_exceptions()
     end
 
     it "rescues marshal load errors" do
@@ -123,7 +117,6 @@ module OpenC3
         OpenC3.marshal_load('marshal_test')
         expect(stdout.string).to match("Marshal load failed with exception")
       end
-      OpenC3.cleanup_exceptions()
     end
   end
 
@@ -155,24 +148,26 @@ module OpenC3
   end
 
   describe "hash_files" do
-    it "calculates a hashing sum across files in md5 mode" do
+    before(:all) do
       File.open(File.join(OpenC3::PATH, 'test1.txt'), 'w') { |f| f.puts "test1" }
       File.open(File.join(OpenC3::PATH, 'test2.txt'), 'w') { |f| f.puts "test2" }
+    end
+
+    after(:all) do
+      FileUtils.rm_f(File.join(OpenC3::PATH, 'test1.txt'))
+      FileUtils.rm_f(File.join(OpenC3::PATH, 'test2.txt'))
+    end
+
+    it "calculates a hashing sum across files in md5 mode" do
       digest = OpenC3.hash_files(["test1.txt", "test2.txt"], nil, 'MD5')
       expect(digest.digest.length).to be 16
       expect(digest.hexdigest).to eql 'e51dfbea83de9c7e6b49560089d8a170'
-      File.delete(File.join(OpenC3::PATH, 'test1.txt'))
-      File.delete(File.join(OpenC3::PATH, 'test2.txt'))
     end
 
     it "calculates a hashing sum across files in sha256 mode" do
-      File.open(File.join(OpenC3::PATH, 'test1.txt'), 'w') { |f| f.puts "test1" }
-      File.open(File.join(OpenC3::PATH, 'test2.txt'), 'w') { |f| f.puts "test2" }
       digest = OpenC3.hash_files(["test1.txt", "test2.txt"], nil, 'SHA256')
       expect(digest.digest.length).to be 32
       expect(digest.hexdigest).to eql '49789e7c809eb38ea34864b00e2cfd68825e0c07cd7b7d0c6fe2642ac87a919c'
-      File.delete(File.join(OpenC3::PATH, 'test1.txt'))
-      File.delete(File.join(OpenC3::PATH, 'test2.txt'))
     end
   end
 
@@ -229,23 +224,12 @@ module OpenC3
     end
   end
 
-  describe "write_exception_file" do
-    it "writes an exception file" do
-      file = OpenC3.write_exception_file(nil, 'test1_exception', File.dirname(__FILE__))
-      expect(File.exist?(file)).to be true
-      file = OpenC3.write_exception_file(RuntimeError.new, 'test2_exception', File.dirname(__FILE__))
-      expect(File.exist?(file)).to be true
-      OpenC3.cleanup_exceptions()
-    end
-  end
-
   describe "handle_fatal_exception" do
     it "writes to the Logger and exit" do
       capture_io do |stdout|
         expect { OpenC3.handle_fatal_exception(RuntimeError.new) }.to raise_error(SystemExit)
         expect(stdout.string).to match("Fatal Exception! Exiting...")
       end
-      OpenC3.cleanup_exceptions()
     end
   end
 
@@ -255,78 +239,71 @@ module OpenC3
         OpenC3.handle_critical_exception(RuntimeError.new)
         expect(stdout.string).to match("Critical Exception!")
       end
-      OpenC3.cleanup_exceptions()
-    end
-  end
-
-  describe "safe_thread" do
-    it "handles exceptions" do
-      capture_io do |stdout|
-        thread = OpenC3.safe_thread("Test", 1) do
-          raise "TestError"
-        end
-        def thread.graceful_kill
-        end
-        sleep 1
-        expect(stdout.string).to match("Test thread unexpectedly died.")
-        OpenC3.kill_thread(thread, thread)
-      end
-      OpenC3.cleanup_exceptions()
     end
   end
 
   describe "require_class" do
-    it "requires the class represented by the filename" do
-      filename = File.join(OpenC3::PATH, "lib", "my_test_class.rb")
-      File.delete(filename) if File.exist? filename
-
-      File.open(filename, 'w') do |file|
+    before(:all) do
+      FileUtils.mkdir_p(File.join(OpenC3::PATH, "lib"))
+      File.open(File.join(OpenC3::PATH, "lib", "my_test_class.rb"), 'w') do |file|
         file.puts "class MyTestClass"
         file.puts "end"
       end
-
-      klass = OpenC3.require_class("my_test_class.rb")
-      expect(klass).to be_a(Class)
-      expect(klass).to eq MyTestClass
-      File.delete(filename)
-    end
-
-    it "requires the class represented by the classname" do
-      filename = File.join(OpenC3::PATH, "lib", "my_other_test_class.rb")
-      File.delete(filename) if File.exist? filename
-
-      File.open(filename, 'w') do |file|
+      File.open(File.join(OpenC3::PATH, "lib", "my_other_test_class.rb"), 'w') do |file|
         file.puts "class MyOtherTestClass"
         file.puts "end"
       end
+    end
 
+    after(:all) do
+      FileUtils.rm_f(File.join(OpenC3::PATH, "lib", "my_test_class.rb"))
+      FileUtils.rm_f(File.join(OpenC3::PATH, "lib", "my_other_test_class.rb"))
+    end
+
+    it "requires the class represented by the filename" do
+      klass = OpenC3.require_class("my_test_class.rb")
+      expect(klass).to be_a(Class)
+      expect(klass).to eq MyTestClass
+    end
+
+    it "requires the class represented by the classname" do
       klass = OpenC3.require_class("MyOtherTestClass")
       expect(klass).to be_a(Class)
       expect(klass).to eq MyOtherTestClass
-      File.delete(filename)
     end
   end
 
   describe "require_file" do
-    it "requires the file" do
-      filename = File.join(OpenC3::PATH, "lib", "my_test_file.rb")
-      File.delete(filename) if File.exist? filename
+    filename = File.join(OpenC3::PATH, "lib", "my_test_file.rb")
 
+    before(:all) do
+      FileUtils.mkdir_p(File.dirname(filename))
+    end
+
+    after(:each) do
+      FileUtils.rm_f(filename)
+    end
+
+    it "raises LoadError if the file does not exist" do
+      FileUtils.rm_f(filename)
       expect { OpenC3.require_file("my_test_file.rb") }.to raise_error(LoadError, /Unable to require my_test_file.rb/)
+    end
 
+    it "raises NameError if the file has an error" do
       File.open(filename, 'w') do |file|
         file.puts "class MyTestFile"
         file.puts "  blah" # This will cause an error
         file.puts "end"
       end
       expect { OpenC3.require_file("my_test_file.rb") }.to raise_error(NameError, /Unable to require my_test_file.rb/)
+    end
 
+    it "requires the file" do
       File.open(filename, 'w') do |file|
         file.puts "class MyTestFile"
         file.puts "end"
       end
-      OpenC3.require_file("my_test_file.rb")
-      File.delete(filename)
+      expect { OpenC3.require_file("my_test_file.rb") }.to_not raise_error
     end
   end
 

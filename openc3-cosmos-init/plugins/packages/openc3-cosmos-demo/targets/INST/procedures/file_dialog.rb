@@ -13,3 +13,22 @@ files.each do |file|
   puts file.read
   file.delete
 end
+
+# Specify the title and message and filter to txt files
+file = open_bucket_dialog("Open a file from the buckets", "Choose something interesting")
+puts file # Ruby File object
+puts file.path # Path of the tempfile (generally not used)
+puts file.filename # Filename that was selected in the dialog
+puts file.read
+file.delete
+
+# Preselect the procedures folder and restrict to .rb files.
+# default_path uses the form bucket/path - trailing slash means folder.
+file = open_bucket_dialog(
+  "Pick a procedure",
+  "Defaults to INST procedures, .rb only",
+  default_path: "config/DEFAULT/targets/INST/procedures/",
+  filter: ".rb"
+)
+puts file.filename
+file.delete

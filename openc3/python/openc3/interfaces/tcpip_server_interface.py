@@ -9,7 +9,7 @@
 # This file may also be used under the terms of a commercial license
 # if purchased from OpenC3, Inc.
 
-import multiprocessing
+import contextlib
 import queue
 import select
 import socket
@@ -21,6 +21,10 @@ from openc3.interfaces.stream_interface import StreamInterface
 from openc3.streams.tcpip_socket_stream import TcpipSocketStream
 from openc3.top_level import close_socket, kill_thread
 from openc3.utilities.logger import Logger
+
+
+# socket.MSG_DONTWAIT is Unix-only; on Windows we rely on setblocking(False).
+_MSG_DONTWAIT = getattr(socket, "MSG_DONTWAIT", 0)
 
 
 # Data class which stores the interface and associated information
@@ -175,7 +179,9 @@ class TcpipServerInterface(StreamInterface):
         if self.read_queue:
             self.read_queue.put(None)
         for pipe in self.listen_pipes:
-            pipe.send(".")
+            with contextlib.suppress(OSError):
+                pipe.send(b".")
+            close_socket(pipe)
         self.listen_pipes = []
 
         # Shutdown listen thread(s)
@@ -342,11 +348,14 @@ class TcpipServerInterface(StreamInterface):
                 + "wait 1 minute and try again."
             ) from e
 
-        listen_socket.setblocking(0)
+        listen_socket.setblocking(False)
         listen_socket.listen(5)
         self.listen_sockets.append(listen_socket)
 
-        thread_reader, thread_writer = multiprocessing.Pipe()
+        # socket.socketpair (rather than multiprocessing.Pipe) so the
+        # readable end can be passed to select.select on Windows, where
+        # select only accepts sockets.
+        thread_reader, thread_writer = socket.socketpair()
         self.listen_pipes.append(thread_writer)
         thread = threading.Thread(
             target=self._listen_thread_body,
@@ -378,6 +387,7 @@ class TcpipServerInterface(StreamInterface):
 
             # Configure TCP_NODELAY option
             client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            client_socket.setblocking(False)
 
             # Accept Connection
             write_socket = None
@@ -441,7 +451,7 @@ class TcpipServerInterface(StreamInterface):
                         if read_interface_info.interface.stream_log_pair:
                             read_interface_info.interface.stream_log_pair.stop()
                         break
-            if index_to_delete:
+            if index_to_delete is not None:
                 del self.read_interface_infos[index_to_delete]
         except Exception:
             Logger.error(f"{self.name}: Tcpip server read thread unexpectedly died")
@@ -544,7 +554,7 @@ class TcpipServerInterface(StreamInterface):
                 for interface_info in self.write_interface_infos:
                     if self.write_port != self.read_port:
                         # Socket should return EWOULDBLOCK if it is still cleanly connected
-                        interface_info.interface.stream.write_socket.recv(10, socket.MSG_DONTWAIT)
+                        interface_info.interface.stream.write_socket.recv(10, _MSG_DONTWAIT)
                     elif interface_info.interface.stream.write_socket.fileno() != -1:
                         # Let read thread detect disconnect
                         continue

@@ -1,5 +1,5 @@
 /*
-# Copyright 2025 OpenC3, Inc.
+# Copyright 2026 OpenC3, Inc.
 # All Rights Reserved.
 #
 # This program is distributed in the hope that it will be useful,
@@ -20,16 +20,22 @@ export default {
     return {
       id: Math.floor(Math.random() * 100000000000), // Unique-ish
       state: 'start',
-      items: [
-        {
-          targetName: this.parameters[0],
-          packetName: this.parameters[1],
-          itemName: this.parameters[2],
-          valueType: this.parameters[3] || 'CONVERTED',
-          reduced: this.parameters[4] || 'DECOM',
-          reducedType: this.parameters[5] || null,
-        },
-      ],
+      // LINEGRAPH names its item as parameters, ARRAYPLOT takes none and adds
+      // them all with SETTING ITEM. Only seed an item if we were given one,
+      // otherwise we subscribe to undefined/undefined/undefined and plot an
+      // empty series for it.
+      items: this.parameters[0]
+        ? [
+            {
+              targetName: this.parameters[0],
+              packetName: this.parameters[1],
+              itemName: this.parameters[2],
+              valueType: this.parameters[3] || 'CONVERTED',
+              reduced: this.parameters[4] || 'DECOM',
+              reducedType: this.parameters[5] || null,
+            },
+          ]
+        : [],
       startTime: null,
       // 1hr of data by default
       secondsGraphed: 3600,
@@ -110,27 +116,31 @@ export default {
           break
       }
     })
+    const validationIds = []
     this.items = this.items.map((item) => {
-      let itemName = item.itemName
-      // Remove double bracket escaping. This means they actually have an item
-      // with a bracket in the name, not an array index.
-      if (item.itemName.includes('[[')) {
-        // Change the actual item and the the name we're passing to the screen
-        item.itemName = item.itemName.replace('[[', '[').replace(']]', ']')
-        itemName = item.itemName
-      } else if (item.itemName.includes('[')) {
-        // Brackets mean array indexes (normally, but see above)
-        let match = item.itemName.match(/\[(\d+)\]/)
-        this.arrayIndex = parseInt(match[1])
-        // Here we keep the original item name with the brackets but change
-        // the item we're passing to the screen to the non-bracket item
-        itemName = item.itemName.replace(match[0], '')
+      const parsed = this.parseItemName(item.itemName)
+      if (parsed.arrayIndex !== null) {
+        // Keep the original bracketed name on the item; record the index so
+        // downstream consumers can pick the element.
+        this.arrayIndex = parsed.arrayIndex
+      } else {
+        // Un-escape [[...]] for real items whose names contain brackets;
+        // a no-op for plain names.
+        item.itemName = parsed.name
       }
+      // Validate the base name, not the streaming name: ARY[0] is a valid
+      // thing to stream but the packet only has an item called ARY, so
+      // get_tlm_available would report every array element as nonexistent.
+      validationIds.push(
+        `${item.targetName}__${item.packetName}__${parsed.name}__${item.valueType}`,
+      )
       // We don't emit 'addItem' because graphWidgets use streams in realtime
       // and manage their own playback requests
-
-      // Return the mapped values since we may have removed bracket escaping
       return item
     })
+    // We still want to know if any of them don't exist. Streaming just never
+    // sends data for a bad item, so without this the screen looks fine and the
+    // series stays empty.
+    this.checkScreenItems(validationIds)
   },
 }

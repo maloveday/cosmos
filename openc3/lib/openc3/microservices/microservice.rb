@@ -43,7 +43,7 @@ module OpenC3
     attr_accessor :secrets
 
     def self.run(name = nil)
-      name = ENV['OPENC3_MICROSERVICE_NAME'] unless name
+      name = ENV.fetch('OPENC3_MICROSERVICE_NAME', nil) unless name
       microservice = self.new(name)
       thread = Thread.new do
         begin
@@ -88,6 +88,7 @@ module OpenC3
       @name = name
       split_name = name.split("__")
       raise "Name #{name} doesn't match convention of SCOPE__TYPE__NAME" if split_name.length != 3
+      microservice_type = split_name[1].to_s.upcase
 
       @scope = split_name[0]
       $openc3_scope = @scope
@@ -102,8 +103,14 @@ module OpenC3
 
       OpenC3.setup_open_telemetry(@name, false)
 
+      @temp_dir = OpenC3.sanitize_path(File.join(Dir.tmpdir, @name))
+
       # Create temp folder for this microservice
-      @temp_dir = Dir.mktmpdir
+      # This will already have been setup by plugin_microservice.rb if USER
+      if is_plugin or microservice_type != 'USER'
+        FileUtils.remove_entry_secure(@temp_dir, true)
+        Dir.mkdir(@temp_dir)
+      end
 
       # Get microservice configuration from Redis
       @config = MicroserviceModel.get(name: @name, scope: @scope)
@@ -120,12 +127,13 @@ module OpenC3
       @logger.info("Microservice initialized with config:\n#{@config}")
       @topics ||= []
       @microservice_topic = "MICROSERVICE__#{@name}"
+      @db_shard = (@config['db_shard'] || 0).to_i
 
       # Get configuration for any targets
       @target_names = @config["target_names"]
       @target_names ||= []
       # NOTE: setup_targets doesn't do anything if @target_names is empty
-      System.setup_targets(@target_names, @temp_dir, scope: @scope) unless is_plugin
+      System.setup_targets(@target_names, @temp_dir, scope: @scope, descriptions: load_descriptions?) unless is_plugin
 
       # Use at_exit to shutdown cleanly no matter how we die
       at_exit do
@@ -142,22 +150,36 @@ module OpenC3
         cmd_array = @config["cmd"]
 
         # Get Microservice files from bucket storage
-        temp_dir = Dir.mktmpdir
-        bucket = ENV['OPENC3_CONFIG_BUCKET']
+        bucket = ENV.fetch('OPENC3_CONFIG_BUCKET') { raise 'OPENC3_CONFIG_BUCKET environment variable is required' }
         client = Bucket.getClient()
 
         prefix = "#{@scope}/microservices/#{@name}/"
         file_count = 0
-        client.list_objects(bucket: bucket, prefix: prefix).each do |object|
-          response_target = File.join(temp_dir, object.key.split(prefix)[-1])
-          FileUtils.mkdir_p(File.dirname(response_target))
-          client.get_object(bucket: bucket, key: object.key, path: response_target)
-          file_count += 1
+        # Tolerate transient object store failures during startup. On a busy or
+        # underpowered cluster the bucket store (e.g. MinIO) can be briefly
+        # unreachable while many microservices start at once. Rather than crash
+        # and CrashLoopBackOff (which can outlast deploy timeouts), retry for a
+        # bounded time before giving up.
+        startup_timeout = (ENV.fetch('OPENC3_MICROSERVICE_STARTUP_BUCKET_TIMEOUT', 60)).to_f
+        startup_deadline = Time.now + startup_timeout
+        begin
+          file_count = 0
+          client.list_objects(bucket: bucket, prefix: prefix).each do |object|
+            response_target = OpenC3.sanitize_path(File.join(@temp_dir, object.key.split(prefix)[-1]))
+            FileUtils.mkdir_p(File.dirname(response_target))
+            client.get_object(bucket: bucket, key: object.key, path: response_target)
+            file_count += 1
+          end
+        rescue => error
+          raise if Time.now >= startup_deadline
+          @logger.warn("Microservice #{@name} startup: bucket access failed (#{error.class}: #{error.message}); retrying for up to #{startup_timeout.to_i}s")
+          sleep(5)
+          retry
         end
 
         # Adjust @work_dir to microservice files downloaded if files and a relative path
         if file_count > 0 and @work_dir[0] != '/'
-          @work_dir = File.join(temp_dir, @work_dir)
+          @work_dir = OpenC3.sanitize_path(File.join(@temp_dir, @work_dir))
         end
 
         # Check Syntax on any ruby files
@@ -209,6 +231,12 @@ module OpenC3
       shutdown()
     end
 
+    # Whether System keeps packet and item descriptions. Subclasses that never
+    # use them override this to return false to reduce memory.
+    def load_descriptions?
+      true
+    end
+
     def shutdown(state = 'STOPPED')
       return if @shutdown_complete
       begin
@@ -253,10 +281,10 @@ module OpenC3
         else
           raise "Invalid topics given to microservice_cmd: #{topics}"
         end
-        Topic.trim_topic(topic, msg_id)
+        Topic.trim_topic(topic, msg_id, db_shard: @db_shard)
         return true
       end
-      Topic.trim_topic(topic, msg_id)
+      Topic.trim_topic(topic, msg_id, db_shard: @db_shard)
       return false
     end
   end

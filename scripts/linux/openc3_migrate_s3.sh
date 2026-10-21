@@ -55,7 +55,10 @@ MINIO_MIGRATION_CONTAINER="openc3-minio-migration"
 VERSITY_MIGRATION_CONTAINER="openc3-versity-migration"
 MINIO_IMAGE="ghcr.io/openc3/openc3-minio:latest"
 VERSITY_IMAGE="${OPENC3_REGISTRY:-docker.io}/${OPENC3_NAMESPACE:-openc3inc}/openc3-buckets:${OPENC3_TAG:-latest}"
-MC_IMAGE="ghcr.io/openc3/openc3-cosmos-init:6.10.4"  # Contains patched mc client
+# COSMOS 6 init image containing the patched mc client used for the migration.
+# Defaults to the Core init image. Set MC_IMAGE to use a different init image,
+# e.g. one already available locally on an offline / air-gapped system.
+MC_IMAGE="${MC_IMAGE:-ghcr.io/openc3/openc3-cosmos-init:6.10.4}"
 
 # Network - will be auto-detected or created
 MIGRATION_NETWORK="openc3-migration-net"
@@ -70,8 +73,6 @@ NC='\033[0m' # No Color
 # State variables
 MINIO_SOURCE=""        # Where to read MINIO data from (live or temp container)
 VERSITY_DEST=""        # Where to write versitygw data to (live or temp container)
-USING_TEMP_MINIO=false
-USING_TEMP_VERSITY=false
 DOCKER_NETWORK=""
 
 usage() {
@@ -112,6 +113,9 @@ Configuration (via environment variables):
   NEW_VOLUME    New versitygw volume name (default: openc3-object-v)
   OPENC3_BUCKET_USERNAME  S3 credentials (default: openc3minio)
   OPENC3_BUCKET_PASSWORD  S3 credentials (default: openc3miniopassword)
+  MC_IMAGE      COSMOS 6 init image used to run mc
+                (default: ghcr.io/openc3/openc3-cosmos-init:6.10.4)
+                If offline, set this to an init image available locally.
 
 EOF
     exit 0
@@ -151,6 +155,26 @@ volume_exists() {
 # Check if a Docker network exists
 network_exists() {
     docker network ls --format '{{.Name}}' 2>/dev/null | grep -q "^$1$"
+}
+
+# Check if a Docker image exists locally
+image_exists() {
+    docker image inspect "$1" >/dev/null 2>&1
+}
+
+# Ensure the image used to run mc is available locally
+ensure_mc_image() {
+    log_info "Using mc image: $MC_IMAGE"
+    if ! image_exists "$MC_IMAGE"; then
+        log_info "Pulling mc image: $MC_IMAGE"
+        if ! docker pull "$MC_IMAGE"; then
+            log_error "Failed to pull mc image: $MC_IMAGE"
+            echo "If you are offline, set MC_IMAGE to a COSMOS 6 init image available locally, e.g.:"
+            echo "  MC_IMAGE=<registry>/<namespace>/openc3-cosmos-init:<tag> $0 ${COMMAND}"
+            return 1
+        fi
+    fi
+    return 0
 }
 
 # Find a running container by partial name match
@@ -235,16 +259,13 @@ detect_environment() {
     live_minio=$(find_container "openc3-minio")
     if [[ -n "$live_minio" ]] && [[ "$live_minio" != "$MINIO_MIGRATION_CONTAINER" ]]; then
         MINIO_SOURCE="$live_minio"
-        USING_TEMP_MINIO=false
         log_info "Found live MINIO (COSMOS 6): $MINIO_SOURCE"
         DOCKER_NETWORK=$(get_container_network "$MINIO_SOURCE")
     elif container_running "$MINIO_MIGRATION_CONTAINER"; then
         MINIO_SOURCE="$MINIO_MIGRATION_CONTAINER"
-        USING_TEMP_MINIO=true
         log_info "Using temp MINIO container: $MINIO_SOURCE"
     else
         MINIO_SOURCE=""
-        USING_TEMP_MINIO=true
         log_info "No MINIO running - will start temp container"
     fi
 
@@ -253,18 +274,15 @@ detect_environment() {
     live_versity=$(find_container "openc3-buckets")
     if [[ -n "$live_versity" ]] && [[ "$live_versity" != "$VERSITY_MIGRATION_CONTAINER" ]]; then
         VERSITY_DEST="$live_versity"
-        USING_TEMP_VERSITY=false
         log_info "Found live versitygw (COSMOS 7): $VERSITY_DEST"
         if [[ -z "$DOCKER_NETWORK" ]]; then
             DOCKER_NETWORK=$(get_container_network "$VERSITY_DEST")
         fi
     elif container_running "$VERSITY_MIGRATION_CONTAINER"; then
         VERSITY_DEST="$VERSITY_MIGRATION_CONTAINER"
-        USING_TEMP_VERSITY=true
         log_info "Using temp versitygw container: $VERSITY_DEST"
     else
         VERSITY_DEST=""
-        USING_TEMP_VERSITY=true
         log_info "No versitygw running - will start temp container"
     fi
 
@@ -305,7 +323,7 @@ start_temp_minio() {
     # Wait for MINIO to be ready
     log_info "Waiting for MINIO to be ready..."
     local retries=0
-    while [ $retries -lt 30 ]; do
+    while [[ $retries -lt 30 ]]; do
         # Check if container is running and MINIO is responding
         # Use mc admin info which works reliably across MINIO versions
         if docker run --rm --network "$DOCKER_NETWORK" --entrypoint "" \
@@ -566,16 +584,20 @@ cmd_cleanup() {
 }
 
 # Main
-case "${1:-help}" in
+COMMAND="${1:-help}"
+case "$COMMAND" in
     start)
+        ensure_mc_image || exit 1
         cmd_start
         exit $?
         ;;
     migrate)
+        ensure_mc_image || exit 1
         cmd_migrate
         exit $?
         ;;
     status)
+        ensure_mc_image || exit 1
         cmd_status
         exit $?
         ;;

@@ -18,6 +18,7 @@ _openc3_api_schema = "OPENC3_API_SCHEMA"
 _openc3_api_hostname = "OPENC3_API_HOSTNAME"
 _openc3_api_port = "OPENC3_API_PORT"
 _openc3_api_timeout = "OPENC3_API_TIMEOUT"
+_openc3_api_read_timeout = "OPENC3_API_READ_TIMEOUT"
 _openc3_script_api_schema = "OPENC3_SCRIPT_API_SCHEMA"
 _openc3_script_api_hostname = "OPENC3_SCRIPT_API_HOSTNAME"
 _openc3_script_api_port = "OPENC3_SCRIPT_API_PORT"
@@ -56,7 +57,6 @@ _openc3_api_client = "OPENC3_API_CLIENT"
 _openc3_api_token = "OPENC3_API_TOKEN"
 _openc3_keycloak_realm = "OPENC3_KEYCLOAK_REALM"
 _openc3_keycloak_url = "OPENC3_KEYCLOAK_URL"
-_openc3_redis_cluster = "OPENC3_REDIS_CLUSTER"
 
 
 def get_env_bool(key: str, default: bool = False) -> bool:
@@ -108,6 +108,12 @@ try:
     OPENC3_API_TIMEOUT = float(os.environ.get(_openc3_api_timeout))
 except TypeError:
     OPENC3_API_TIMEOUT = 1.0
+# None means unset. JsonApiObject.DEFAULT_READ_TIMEOUT_S owns the default so the
+# fallback lives in one place, matching the Ruby ENV.fetch(..., DEFAULT_READ_TIMEOUT_S).
+try:
+    OPENC3_API_READ_TIMEOUT = float(os.environ.get(_openc3_api_read_timeout))
+except TypeError:
+    OPENC3_API_READ_TIMEOUT = None
 
 OPENC3_SCRIPT_API_SCHEMA = os.environ.get(_openc3_script_api_schema, "http")
 OPENC3_SCRIPT_API_HOSTNAME = os.environ.get(_openc3_script_api_hostname, "openc3-cosmos-script-runner-api")
@@ -158,7 +164,6 @@ OPENC3_API_CLIENT = os.environ.get(_openc3_api_client, "api")
 OPENC3_API_TOKEN = os.environ.get(_openc3_api_token)
 OPENC3_KEYCLOAK_REALM = os.environ.get(_openc3_keycloak_realm, "openc3")
 OPENC3_KEYCLOAK_URL = os.environ.get(_openc3_keycloak_url, "http://openc3-keycloak/auth")
-OPENC3_REDIS_CLUSTER = os.environ.get(_openc3_redis_cluster)
 
 # User agent used by all
 _openc3_default_user_agent = [

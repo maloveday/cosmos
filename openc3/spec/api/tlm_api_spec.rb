@@ -249,11 +249,11 @@ module OpenC3
       end
 
       it "complains about non-existent targets" do
-        expect { @api.inject_tlm("BLAH", "HEALTH_STATUS") }.to raise_error("Packet 'BLAH HEALTH_STATUS' does not exist")
+        expect { @api.inject_tlm("BLAH", "HEALTH_STATUS") }.to raise_error("Packet definition 'BLAH HEALTH_STATUS' does not exist")
       end
 
       it "complains about non-existent packets" do
-        expect { @api.inject_tlm("INST", "BLAH") }.to raise_error("Packet 'INST BLAH' does not exist")
+        expect { @api.inject_tlm("INST", "BLAH") }.to raise_error("Packet definition 'INST BLAH' does not exist")
       end
 
       it "complains about non-existent items" do
@@ -283,6 +283,25 @@ module OpenC3
         @api.inject_tlm("INST", "HEALTH_STATUS")
         sleep 0.1
         expect(@api.tlm("INST HEALTH_STATUS RECEIVED_COUNT")).to eql 3
+      end
+
+      it "raises an error when writing to a DERIVED item without a write conversion" do
+        expect { @api.inject_tlm("INST", "HEALTH_STATUS", { "RECEIVED_TIMESECONDS" => 123.0 }) }.to raise_error(/Cannot write DERIVED item/)
+      end
+
+      it "does not update the CVT when stored is true" do
+        @api.inject_tlm("INST", "HEALTH_STATUS", { TEMP1: 50 }, type: :CONVERTED)
+        sleep 0.1
+        expect(@api.tlm("INST HEALTH_STATUS TEMP1")).to be_within(0.1).of(50.0)
+
+        @api.inject_tlm("INST", "HEALTH_STATUS", { TEMP1: 99 }, type: :CONVERTED, stored: true)
+        sleep 0.1
+        # CVT should still have the old value since stored packets don't update CVT
+        expect(@api.tlm("INST HEALTH_STATUS TEMP1")).to be_within(0.1).of(50.0)
+
+        @api.inject_tlm("INST", "HEALTH_STATUS", { TEMP1: 99 }, type: :CONVERTED, stored: false)
+        sleep 0.1
+        expect(@api.tlm("INST HEALTH_STATUS TEMP1")).to be_within(0.1).of(99.0)
       end
     end
 
@@ -436,7 +455,7 @@ module OpenC3
 
     describe "get_all_tlm" do
       it "raises if the target does not exist" do
-        expect { @api.get_all_tlm("BLAH", scope: "DEFAULT") }.to raise_error("Target 'BLAH' does not exist for scope: DEFAULT")
+        expect { @api.get_all_tlm("BLAH", scope: "DEFAULT") }.to raise_error("Target 'BLAH' does not exist for scope: DEFAULT (TargetModel)")
       end
 
       it "returns an array of all packet hashes" do
@@ -482,8 +501,8 @@ module OpenC3
 
     describe "get_tlm" do
       it "raises if the target or packet do not exist" do
-        expect { @api.get_tlm("BLAH", "HEALTH_STATUS", scope: "DEFAULT") }.to raise_error("Packet 'BLAH HEALTH_STATUS' does not exist")
-        expect { @api.get_tlm("INST BLAH", scope: "DEFAULT") }.to raise_error("Packet 'INST BLAH' does not exist")
+        expect { @api.get_tlm("BLAH", "HEALTH_STATUS", scope: "DEFAULT") }.to raise_error("Packet definition 'BLAH HEALTH_STATUS' does not exist")
+        expect { @api.get_tlm("INST BLAH", scope: "DEFAULT") }.to raise_error("Packet definition 'INST BLAH' does not exist")
       end
 
       it "returns a packet hash" do
@@ -498,9 +517,9 @@ module OpenC3
 
     describe "get_item" do
       it "raises if the target or packet or item do not exist" do
-        expect { @api.get_item("BLAH", "HEALTH_STATUS", "CCSDSVER", scope: "DEFAULT") }.to raise_error("Packet 'BLAH HEALTH_STATUS' does not exist")
-        expect { @api.get_item("INST BLAH CCSDSVER", scope: "DEFAULT") }.to raise_error("Packet 'INST BLAH' does not exist")
-        expect { @api.get_item("INST", "HEALTH_STATUS", "BLAH", scope: "DEFAULT") }.to raise_error("Item 'INST HEALTH_STATUS BLAH' does not exist")
+        expect { @api.get_item("BLAH", "HEALTH_STATUS", "CCSDSVER", scope: "DEFAULT") }.to raise_error("Packet definition 'BLAH HEALTH_STATUS' does not exist")
+        expect { @api.get_item("INST BLAH CCSDSVER", scope: "DEFAULT") }.to raise_error("Packet definition 'INST BLAH' does not exist")
+        expect { @api.get_item("INST", "HEALTH_STATUS", "BLAH", scope: "DEFAULT") }.to raise_error("Item 'INST HEALTH_STATUS BLAH' does not exist (TargetModel)")
         expect { @api.get_item("INST HEALTH_STATUS", scope: "DEFAULT") }.to raise_error(/Target name, packet name and item name are required./)
       end
 
@@ -528,15 +547,15 @@ module OpenC3
 
     describe "get_tlm_packet" do
       it "complains about non-existent targets" do
-        expect { @api.get_tlm_packet("BLAH", "HEALTH_STATUS") }.to raise_error(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist")
+        expect { @api.get_tlm_packet("BLAH", "HEALTH_STATUS") }.to raise_error(RuntimeError, "Packet definition 'BLAH HEALTH_STATUS' does not exist")
       end
 
       it "complains about non-existent packets" do
-        expect { @api.get_tlm_packet("INST BLAH") }.to raise_error(RuntimeError, "Packet 'INST BLAH' does not exist")
+        expect { @api.get_tlm_packet("INST BLAH") }.to raise_error(RuntimeError, "Packet definition 'INST BLAH' does not exist")
       end
 
       it "complains using LATEST" do
-        expect { @api.get_tlm_packet("INST", "LATEST") }.to raise_error(RuntimeError, "Packet 'INST LATEST' does not exist")
+        expect { @api.get_tlm_packet("INST", "LATEST") }.to raise_error(RuntimeError, "Packet definition 'INST LATEST' does not exist")
       end
 
       it "complains about non-existent value_types" do
@@ -673,10 +692,12 @@ module OpenC3
         items << 'INST__ADCS__Q1__WITH_UNITS'
         items << 'INST__LATEST__CCSDSTYPE__WITH_UNITS'
         items << 'INST__LATEST__CCSDSVER__WITH_UNITS'
+        items << 'INST__ADCS__POSX__WITH_UNITS' # No conversion or states but has units
         # Ask for FORMATTED for an item which has various formats
         items << 'INST__ADCS__Q2__FORMATTED'
         items << 'INST__ADCS__CCSDSTYPE__FORMATTED'
         items << 'INST__ADCS__CCSDSVER__FORMATTED'
+        items << 'INST__ADCS__POSX__FORMATTED' # No conversion or states but has units
         # Ask for CONVERTED for an item which has various formats
         items << 'INST__HEALTH_STATUS__COLLECT_TYPE__CONVERTED' # states but no conversion
         items << 'INST__ADCS__STAR1ID__CONVERTED' # conversion but no states
@@ -701,9 +722,11 @@ module OpenC3
           'INST__ADCS__Q1__FORMATTED',
           'INST__LATEST__CCSDSTYPE__CONVERTED',
           'INST__LATEST__CCSDSVER__RAW',
+          'INST__ADCS__POSX__FORMATTED',
           'INST__ADCS__Q2__FORMATTED',
           'INST__ADCS__CCSDSTYPE__CONVERTED',
           'INST__ADCS__CCSDSVER__RAW',
+          'INST__ADCS__POSX__FORMATTED',
           'INST__HEALTH_STATUS__COLLECT_TYPE__CONVERTED',
           'INST__ADCS__STAR1ID__CONVERTED',
           'INST__ADCS__CCSDSVER__RAW',
@@ -723,11 +746,11 @@ module OpenC3
 
     describe "get_tlm_values" do
       it "complains about non-existent targets" do
-        expect { @api.get_tlm_values(["BLAH__HEALTH_STATUS__TEMP1__CONVERTED"]) }.to raise_error(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist")
+        expect { @api.get_tlm_values(["BLAH__HEALTH_STATUS__TEMP1__CONVERTED"]) }.to raise_error(RuntimeError, "Packet 'BLAH HEALTH_STATUS' has no current values in CVT")
       end
 
       it "complains about non-existent packets" do
-        expect { @api.get_tlm_values(["INST__BLAH__TEMP1__CONVERTED"]) }.to raise_error(RuntimeError, "Packet 'INST BLAH' does not exist")
+        expect { @api.get_tlm_values(["INST__BLAH__TEMP1__CONVERTED"]) }.to raise_error(RuntimeError, "Packet 'INST BLAH' has no current values in CVT")
       end
 
       it "complains about non-existent value_types" do
@@ -738,6 +761,48 @@ module OpenC3
         expect { @api.get_tlm_values() }.to raise_error(ArgumentError)
         expect { @api.get_tlm_values({}) }.to raise_error(ArgumentError, /items must be array of strings/)
         expect { @api.get_tlm_values(["INST", "HEALTH_STATUS", "TEMP1"]) }.to raise_error(ArgumentError, /items must be formatted/)
+        expect { @api.get_tlm_values(["INST__HEALTH_STATUS__TEMP1__CONVERTED__LIMITS__EXTRA"]) }.to raise_error(ArgumentError, /items must be formatted/)
+      end
+
+      it "only authorizes the packets of items which exist" do
+        expect(@api).to receive(:authorize).once.with(hash_including(target_name: "INST", packet_name: "HEALTH_STATUS"))
+        @api.get_tlm_values([nil, "INST__HEALTH_STATUS__TEMP1__CONVERTED", nil])
+      end
+
+      it "passes the limits flag and placeholders to the historical lookup" do
+        # get_tlm_available tacks on __LIMITS and returns nil for items which don't exist
+        expect(CvtModel).to receive(:tsdb_lookup).with(
+          [
+            ["INST", "HEALTH_STATUS", "TEMP1", "CONVERTED", nil],
+            ["INST", "HEALTH_STATUS", "TEMP2", "CONVERTED", "LIMITS"],
+            [nil, nil, nil, nil, nil],
+          ],
+          start_time: "2026-09-13T00:00:00Z", end_time: nil, scope: "DEFAULT"
+        ).and_return([[0.0, nil], [-100.0, "RED_LOW"], [nil, nil]])
+        vals = @api.get_tlm_values(["INST__HEALTH_STATUS__TEMP1__CONVERTED", "INST__HEALTH_STATUS__TEMP2__CONVERTED__LIMITS", nil], start_time: "2026-09-13T00:00:00Z")
+        expect(vals).to eql([[0.0, nil], [-100.0, "RED_LOW"], [nil, nil]])
+      end
+
+      it "accepts the limits suffix from get_tlm_available" do
+        vals = @api.get_tlm_values(["INST__HEALTH_STATUS__TEMP1__CONVERTED__LIMITS"])
+        expect(vals[0][0]).to eql(-100.0)
+        expect(vals[0][1]).to eql(:RED_LOW)
+      end
+
+      it "returns nil values for items which do not exist" do
+        # get_tlm_available returns nil for items which don't exist and its result
+        # is passed directly to get_tlm_values
+        vals = @api.get_tlm_values([nil, "INST__HEALTH_STATUS__TEMP1__CONVERTED", nil])
+        expect(vals[0]).to eql([nil, nil])
+        expect(vals[1][0]).to eql(-100.0)
+        expect(vals[1][1]).to eql(:RED_LOW)
+        expect(vals[2]).to eql([nil, nil])
+      end
+
+      it "returns a row of nils when no item exists in a historical query" do
+        # Nothing to query, so this doesn't need (or touch) the time series database
+        vals = @api.get_tlm_values([nil, nil], start_time: "2026-09-13T00:00:00Z", end_time: "2026-09-13T01:00:00Z")
+        expect(vals).to eql([[nil, nil], [nil, nil]])
       end
 
       it "reads all the specified items" do
@@ -907,11 +972,11 @@ module OpenC3
 
     describe "get_tlm_cnt" do
       it "complains about non-existent targets" do
-        expect { @api.get_tlm_cnt("BLAH", "ABORT") }.to raise_error("Packet 'BLAH ABORT' does not exist")
+        expect { @api.get_tlm_cnt("BLAH", "ABORT") }.to raise_error("Packet definition 'BLAH ABORT' does not exist")
       end
 
       it "complains about non-existent packets" do
-        expect { @api.get_tlm_cnt("INST BLAH") }.to raise_error("Packet 'INST BLAH' does not exist")
+        expect { @api.get_tlm_cnt("INST BLAH") }.to raise_error("Packet definition 'INST BLAH' does not exist")
       end
 
       it "returns the receive count" do
@@ -936,11 +1001,11 @@ module OpenC3
 
     describe "get_packet_derived_items" do
       it "complains about non-existent targets" do
-        expect { @api.get_packet_derived_items("BLAH", "ABORT") }.to raise_error("Packet 'BLAH ABORT' does not exist")
+        expect { @api.get_packet_derived_items("BLAH", "ABORT") }.to raise_error("Packet definition 'BLAH ABORT' does not exist")
       end
 
       it "complains about non-existent packets" do
-        expect { @api.get_packet_derived_items("INST BLAH") }.to raise_error("Packet 'INST BLAH' does not exist")
+        expect { @api.get_packet_derived_items("INST BLAH") }.to raise_error("Packet definition 'INST BLAH' does not exist")
       end
 
       it "returns the packet derived items" do

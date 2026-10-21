@@ -6,7 +6,7 @@ sidebar_custom_props:
   myEmoji: 🔄
 ---
 
-<!-- Be sure to edit _conversions.md because conversions.md is a generated file -->
+{/* Be sure to edit _conversions.md because conversions.md is a generated file */}
 
 # Overview
 
@@ -29,20 +29,12 @@ The above command creates a conversion called `double_conversion.py` at `targets
 
 ```python
 from openc3.conversions.conversion import Conversion
-# Using tlm() requires the following:
-# from openc3.api.tlm_api import tlm
+# Using System.telemetry.packet() requires the following:
+# from openc3.system.system import System
 
 # Custom conversion class
 # See https://docs.openc3.com/docs/configuration/telemetry#read_conversion
 class DoubleConversion(Conversion):
-    def __init__(self):
-        super().__init__()
-        # Should be one of 'INT', 'UINT', 'FLOAT', 'STRING', 'BLOCK', 'BOOL', 'ARRAY', 'OBJECT', 'ANY', 'TIME'
-        self.converted_type = 'STRING'
-        # Size of the converted type in bits
-        # Use 0 for 'STRING' or 'BLOCK' where the size can be variable
-        self.converted_bit_size = 0
-
     # @param value [Object] Value based on the item definition. This could be
     #   a string, integer, float, or array of values.
     # @param packet [Packet] The packet object where the conversion is defined
@@ -58,26 +50,22 @@ class DoubleConversion(Conversion):
         # Used when conversion is applied to a regular (not DERIVED) item
         # NOTE: You can also use packet.read("ITEM") to get additional values
         # return value / 2 * packet.read("OTHER_ITEM")
+        #
+        # In a READ_CONVERSION, read the latest value from a different packet in the same target
+        # other = System.telemetry.packet(packet.target_name, "OTHER_PACKET")
+        # return value * other.read("OTHER_ITEM")
         return value
 ```
 
-There are a lot of comments to help you know what to do. The primary things to modify are the `converted_type`, `converted_bit_size`, and `call` method.
+There are a lot of comments to help you implement the `call` method.
 
-### converted_type
+:::info[Conversions Across Packets]
+The `call` method passes in the current packet. To use values from a different packet in the same target, get that packet with `System.telemetry.packet(packet.target_name, "OTHER_PACKET")` and call `read` on it. This returns the most recently received value without a round trip to the database. For Python you need to add `from openc3.system.system import System`.
 
-The `converted_type` is the resulting type of the converted value. It lets consumers of the converted value know the resulting type. In our case we're doubling the input value and since this could be applied to an unsigned integer as well as a floating point value we'll choose `FLOAT`.
+Only packets from targets processed by the same decom microservice are available, normally just the conversion's own target. Each packet holds the values from its most recent arrival (all zeros until it is first received).
 
-```python
-self.converted_type = 'FLOAT'
-```
-
-### converted_bit_size
-
-The `converted_bit_size` is the resulting size of the converted value. It lets consumers of the converted value know the resulting size. Since we chose `FLOAT` as the type we'll choose `32` as the bit size. We could have also chosen `64` bits. Sometimes you know the type and size of the resulting conversion and can simply hard code them. Other times you need to pass them in as parameters and let the user decide.
-
-```python
-self.converted_bit_size = 32
-```
+This applies to a `READ_CONVERSION`, which runs in the decom microservice. A `WRITE_CONVERSION` runs wherever the command is built, typically the interface microservice, which only has current values for telemetry received on that same interface. To read telemetry from other targets in a `WRITE_CONVERSION`, use the `tlm()` API instead (for Python add `from openc3.api.tlm_api import tlm`).
+:::
 
 ### call
 
@@ -86,24 +74,20 @@ The call method is where the actual conversion logic is implemented. In our case
 ```python
 from openc3.conversions.conversion import Conversion
 class DoubleConversion(Conversion):
-    def __init__(self):
-        super().__init__()
-        self.converted_type = 'FLOAT'
-        self.converted_bit_size = 32
-
     def call(self, value, packet, buffer):
         return value * 2
 ```
 
 ### Apply Conversion
 
-Now that we have implemented the conversion logic we need to apply it to a telemetry item by adding the line `READ_CONVERSION double_conversion.py` in the [telemetry](/docs/configuration/telemetry) definition file. This could look something like this:
+Now that we have implemented the conversion logic we need to apply it to a telemetry item by adding the line `READ_CONVERSION double_conversion.py` in the [telemetry](/docs/configuration/telemetry) definition file. We also apply a `CONVERTED_DATA` keyword to indicate we're changing the data type.
 
 ```bash
 TELEMETRY GSE DATA BIG_ENDIAN "Data packet"
   ... # Header items
   APPEND_ITEM VALUE 16 UINT "Value I want to double"
     READ_CONVERSION double_conversion.py
+    CONVERTED_DATA 32 FLOAT
 ```
 
 # Built-in Conversions
@@ -112,7 +96,7 @@ TELEMETRY GSE DATA BIG_ENDIAN "Data packet"
 
 **Applies a simple conversion to a single telemetry item.**
 
-The generic conversion is meant to be a quick and easy way to apply a conversion to a single telemetry item. It must be parsed and evaluated and thus is not as performant as a dedicated conversion class.
+The generic conversion is meant to be a quick and easy way to apply a conversion to a single telemetry item. It must be parsed and evaluated and thus is not as performant as a dedicated conversion class. To specify the bit size, type, and array size of the converted data, use the CONVERTED_DATA keyword.
 
 | Parameter | Description                                                                                                                                                  | Required                          |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------- |
@@ -122,19 +106,21 @@ The generic conversion is meant to be a quick and easy way to apply a conversion
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
 
-```python
-GENERIC_READ_CONVERSION_START FLOAT 32
+```cosmos
+GENERIC_READ_CONVERSION_START
     packet.read('TEMP1') / 1_000_000
 GENERIC_READ_CONVERSION_END
+CONVERTED_DATA 32 FLOAT
 ```
 
 </TabItem>
 <TabItem value="ruby" label="Ruby">
 
-```ruby
-GENERIC_READ_CONVERSION_START FLOAT 32
+```cosmos
+GENERIC_READ_CONVERSION_START
   packet.read('TEMP1') / 1_000_000
 GENERIC_READ_CONVERSION_END
+CONVERTED_DATA 32 FLOAT
 ```
 
 </TabItem>
@@ -147,13 +133,13 @@ GENERIC_READ_CONVERSION_END
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/bit_reverse_conversion.py
 WRITE_CONVERSION openc3/conversions/bit_reverse_conversion.py
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION bit_reverse_conversion.rb
 WRITE_CONVERSION bit_reverse_conversion.rb
 ```
@@ -170,12 +156,12 @@ For example, 0xFFFF8000 would be converted to '255.255.128.0'.
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/ip_read_conversion.py
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION ip_read_conversion.rb
 ```
 </TabItem>
@@ -192,12 +178,12 @@ For example, '255.255.128.0' would be converted to 0xFFFF8000.
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 WRITE_CONVERSION openc3/conversions/ip_write_conversion.py
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 WRITE_CONVERSION ip_write_conversion.rb
 ```
 </TabItem>
@@ -218,12 +204,12 @@ returned as a Ruby hash or Python dict. The packet object must be defined in the
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/object_read_conversion.py CMD INST COLLECT
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION object_read_conversion.rb CMD INST COLLECT
 ```
 </TabItem>
@@ -245,12 +231,12 @@ are the values to write. The packet object must be defined in the target's confi
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 WRITE_CONVERSION openc3/conversions/object_write_conversion.py CMD INST COLLECT
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 WRITE_CONVERSION object_write_conversion.rb CMD INST COLLECT
 ```
 </TabItem>
@@ -267,12 +253,12 @@ For more information see the [Received Time and Packet Time](/docs/configuration
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/packet_time_formatted_conversion.py
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION packet_time_formatted_conversion.rb
 ```
 </TabItem>
@@ -289,12 +275,12 @@ For more information see the [Received Time and Packet Time](/docs/configuration
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/packet_time_seconds_conversion.py
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION packet_time_seconds_conversion.rb
 ```
 </TabItem>
@@ -312,7 +298,7 @@ For commands, the conversion factor is applied to raw value set by the user (via
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/polynomial_conversion.py 10 0.5 0.25
 # Since this is a common conversion it has an alias:
 POLY_READ_CONVERSION 10 0.5 0.25
@@ -323,7 +309,7 @@ POLY_WRITE_CONVERSION 10 0.5 0.25
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION polynomial_conversion.rb 10 0.5 0.25
 # Since this is a common conversion it has an alias:
 POLY_READ_CONVERSION 10 0.5 0.25
@@ -350,14 +336,14 @@ See the [Processor](/docs/configuration/processors) documentation for more infor
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 PROCESSOR TEMP1WATER openc3/conversions/watermark_processor.py TEMP1
 ITEM TEMP1HIGH 0 0 DERIVED "High-water mark for TEMP1"
   READ_CONVERSION openc3/conversions/processor_conversion.py TEMP1WATER HIGH_WATER
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 PROCESSOR TEMP1WATER watermark_processor.rb TEMP1
 ITEM TEMP1HIGH 0 0 DERIVED "High-water mark for TEMP1"
   READ_CONVERSION processor_conversion.rb TEMP1WATER HIGH_WATER
@@ -375,12 +361,12 @@ This in an internal conversion which is automatically applied to the
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/received_count_conversion.py
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION received_count_conversion.rb
 ```
 </TabItem>
@@ -397,12 +383,12 @@ For more information see the [Received Time and Packet Time](/docs/configuration
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/received_time_formatted_conversion.py
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION received_time_formatted_conversion.rb
 ```
 </TabItem>
@@ -419,12 +405,12 @@ For more information see the [Received Time and Packet Time](/docs/configuration
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/received_time_formatted_conversion.py
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION received_time_formatted_conversion.rb
 ```
 </TabItem>
@@ -443,7 +429,7 @@ For commands, this conversion factor is applied to the raw value set by the user
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/segmented_polynomial_conversion.py 0 10 0.5 0.25 # Apply the conversion to all values < 50
 # Since this is a common conversion it has an alias:
 SEG_POLY_READ_CONVERSION 10 0.5 0.25 0 10 0.5 0.25 # Apply the conversion to all values < 50
@@ -458,7 +444,7 @@ SEG_POLY_WRITE_CONVERSION 100 12 0.5 0.3 # Apply the conversion to all values >=
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION segmented_polynomial_conversion.rb 0 10 0.5 0.25 # Apply the conversion to all values < 50
 # Since this is a common conversion it has an alias:
 SEG_POLY_READ_CONVERSION 10 0.5 0.25 0 10 0.5 0.25 # Apply the conversion to all values < 50
@@ -486,12 +472,12 @@ SEG_POLY_WRITE_CONVERSION 100 12 0.5 0.3 # Apply the conversion to all values >=
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/unix_time_conversion.py TIMESEC TIMEUS
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION unix_time_conversion.rb TIMESEC TIMEUS
 ```
 </TabItem>
@@ -509,12 +495,12 @@ READ_CONVERSION unix_time_conversion.rb TIMESEC TIMEUS
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/unix_time_formatted_conversion.py TIMESEC TIMEUS
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION unix_time_formatted_conversion.rb TIMESEC TIMEUS
 ```
 </TabItem>
@@ -532,12 +518,12 @@ READ_CONVERSION unix_time_formatted_conversion.rb TIMESEC TIMEUS
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
-```python
+```cosmos
 READ_CONVERSION openc3/conversions/unix_time_seconds_conversion.py TIMESEC TIMEUS
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 READ_CONVERSION unix_time_seconds_conversion.rb TIMESEC TIMEUS
 ```
 </TabItem>

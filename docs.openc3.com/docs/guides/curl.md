@@ -7,18 +7,29 @@ sidebar_custom_props:
 
 The COSMOS APIs are all served over HTTP, which means you can use curl to experiment with them. Curl is a great tool for seeing exactly how the API responds to any given request.
 
-:::info OpenC3 CLI is Available
+:::info[OpenC3 CLI is Available]
 Before diving too deeping into `curl` make sure what you're trying to accomplish can't be achieved using the [OpenC3 CLI](/docs/getting-started/cli). There are options to load plugins, spawn scripts, check script status, etc. This curl information is for developers or executing APIs calls outside the CLI.
 :::
 
 ## Curl Example with OpenC3 COSMOS Core
 
-OpenC3 COSMOS Core just has a single user account, so all you need to do is pass the single password as the token with your requests like this.
+OpenC3 COSMOS Core just has a single user account, but since COSMOS 7.0.0 you must first obtain a token:
 
 Request:
 
 ```bash
-curl -i -H "Content-Type: application/json-rpc" -H "Authorization: eyJhbGciOiJSUzI1NiIsInR5cCI...<access_token>" \
+TOKEN=$(curl -s -X POST "http://localhost:2900/openc3-api/auth/verify" \
+    -H "Content-Type: application/json" \
+    -d '{"password": "password"}')
+curl -i -H "Content-Type: application/json-rpc" -H "Authorization: $TOKEN" \
+-d '{"jsonrpc": "2.0", "method": "tlm", "params": ["INST HEALTH_STATUS TEMP1"], "keyword_params": {"scope": "DEFAULT"}, "id": 8}' \
+-X POST http://127.0.0.1:2900/openc3-api/api
+```
+
+In COSMOS 6 you can directly pass the password:
+
+```bash
+curl -i -H "Content-Type: application/json-rpc" -H "Authorization: password" \
 -d '{"jsonrpc": "2.0", "method": "tlm", "params": ["INST HEALTH_STATUS TEMP1"], "keyword_params": {"scope": "DEFAULT"}, "id": 8}' \
 -X POST http://127.0.0.1:2900/openc3-api/api
 ```

@@ -16,7 +16,12 @@
 -->
 
 <template>
-  <v-dialog v-model="show" persistent width="80vw" @keydown.esc="close">
+  <v-dialog
+    v-model="show"
+    persistent
+    width="80vw"
+    @keydown.esc.stop="handleEsc"
+  >
     <v-card>
       <v-card-title>{{ pluginName }}</v-card-title>
       <v-card-text class="pt-0">
@@ -263,9 +268,11 @@ export default {
     },
   },
   created() {
-    Api.get('/openc3-api/info').then(({ data }) => {
-      this.installedCosmosVersion = data.version
-    })
+    Api.get('/openc3-api/info')
+      .then(({ data }) => {
+        this.installedCosmosVersion = data.version
+      })
+      .catch(console.error)
   },
   mounted() {
     const pluginMode = this.buildPluginMode()
@@ -280,6 +287,7 @@ export default {
       this.editor.setValue(this.localPluginTxt)
       this.editor.clearSelection()
       AceEditorUtils.applyVimModeIfEnabled(this.editor)
+      this.editor.session.$undoManager.markClean() // because setting the initial content made it "dirty"
       this.editor.focus()
     } else {
       this.tab = 1 // Show the diff right off the bat
@@ -450,6 +458,27 @@ export default {
     },
     close: function () {
       this.show = !this.show
+    },
+    handleEsc: function () {
+      const isClean = this.editor.session.$undoManager.isClean()
+      if (isClean) {
+        this.close()
+      } else {
+        this.$dialog
+          .confirm(
+            'You have unsaved changes. Are you sure you want to close?',
+            {
+              okText: 'Close without saving',
+              cancelText: 'Cancel',
+            },
+          )
+          .then(() => {
+            this.close()
+          })
+          .catch(() => {
+            this.editor?.focus()
+          })
+      }
     },
     showContextMenu: function (event) {
       this.menuX = event.pageX

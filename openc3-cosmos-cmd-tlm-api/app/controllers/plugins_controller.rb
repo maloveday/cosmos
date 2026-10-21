@@ -15,6 +15,7 @@
 # This file may also be used under the terms of a commercial license
 # if purchased from OpenC3, Inc.
 
+require 'openc3/utilities/default_plugins'
 require 'openc3/utilities/process_manager'
 require 'openc3/models/plugin_store_model'
 require 'openc3/models/plugin_model'
@@ -38,7 +39,7 @@ class PluginsController < ModelController
     api_key_setting = OpenC3::SettingModel.get(name: 'store_api_key', scope: 'DEFAULT')
     api_key = api_key_setting['data'] if api_key_setting
 
-    test_url = "http://#{uri.host}:#{uri.port}/api/v1.1/cosmos_plugins/#{store_plugin_id}"
+    test_url = "http://#{uri.host}:#{uri.port}/api/v1.2/cosmos_plugins/#{store_plugin_id}"
     begin
       uri_obj = URI(test_url)
       req = Net::HTTP::Get.new(uri_obj)
@@ -70,10 +71,33 @@ class PluginsController < ModelController
     nil # indicates unreachable download location
   end
 
+  # Returns the plugin names. Pass exclude_default=true to leave out the plugins
+  # that ship with COSMOS.
+  def index
+    return unless authorization('system')
+    exclude_default = params[:exclude_default]
+    unless exclude_default.nil? || ['true', 'false'].include?(exclude_default)
+      render json: { status: 'error', message: "Invalid exclude_default: #{exclude_default}" }, status: :bad_request
+      return
+    end
+    names = @model_class.names(scope: params[:scope])
+    names = names.reject { |name| OpenC3::DefaultPlugins.default?(name) } if exclude_default == 'true'
+    render json: names
+  rescue StandardError => error
+    render json: { status: 'error', message: error.message }, status: :internal_server_error
+    logger.error(error.formatted)
+  end
+
   def show
     return unless authorization('system')
     if params[:id].downcase == 'all'
       plugins = @model_class.all(scope: params[:scope])
+      # Enrich with per-plugin UV migration status (derived from filesystem, not stored in Redis).
+      # Must run before the store data merge below, which adds keys that PluginModel.new doesn't accept.
+      plugins.each do |_plugin_name, plugin|
+        model = @model_class.new(**(plugin.transform_keys(&:to_sym)), scope: params[:scope])
+        plugin['needs_uv_migration'] = model.needs_uv_migration?
+      end
       OpenC3::PluginStoreModel.ensure_exists()
       store_plugins = OpenC3::PluginStoreModel.all()
       store_plugins = JSON.parse(store_plugins)
@@ -86,6 +110,11 @@ class PluginsController < ModelController
             plugin.merge!(store_version) if store_version
           end
         end
+      end
+
+      # Flag the plugins that ship with COSMOS so clients can hide them by default
+      plugins.each do |plugin_name, plugin|
+        plugin['default'] = OpenC3::DefaultPlugins.default?(plugin_name)
       end
 
       render json: plugins
@@ -101,7 +130,7 @@ class PluginsController < ModelController
       render json: plugin
     end
   rescue StandardError => error
-    render json: { status: 'error', message: error.message }, status: 500
+    render json: { status: 'error', message: error.message }, status: :internal_server_error
     logger.error(error.formatted)
   end
 
@@ -116,14 +145,14 @@ class PluginsController < ModelController
         store_version = store_data['versions'].find { |version| version['id'] == store_version_id }
       end
       if store_version.nil? || store_version['gem_url'].nil?
-        render json: { status: 'error', message: 'Unable to fetch requested plugin version.' }, status: 500
+        render json: { status: 'error', message: 'Unable to fetch requested plugin version.' }, status: :internal_server_error
         return
       end
 
       # Try to find the correct hostname (in case it's localhost and needs to be host.docker.internal)
       adjusted_gem_url = check_localhost_reachability(store_version['gem_url'], params[:store_plugin_id])
       if adjusted_gem_url.nil?
-        render json: { status: 'error', message: 'Gem could not be downloaded. Host is not reachable.' }, status: 500
+        render json: { status: 'error', message: 'Gem could not be downloaded. Host is not reachable.' }, status: :internal_server_error
         return
       end
 
@@ -138,7 +167,7 @@ class PluginsController < ModelController
       checksum = Digest::SHA256.file(tempfile.path).hexdigest.downcase
       expected = store_version['checksum'].downcase
       unless checksum == expected
-        render json: { status: 'error', message: "Checksum verification failed. Expected #{expected} but got #{checksum}" }, status: 500
+        render json: { status: 'error', message: "Checksum verification failed. Expected #{expected} but got #{checksum}" }, status: :internal_server_error
         return
       end
 
@@ -164,17 +193,17 @@ class PluginsController < ModelController
         end
         render json: result
       rescue OpenC3::EmptyGemFileError => error
-        render json: { status: 'error', message: error.message }, status: 400
+        render json: { status: 'error', message: error.message }, status: :bad_request
         logger.error(error.formatted)
       rescue Exception => error
-        render json: { status: 'error', message: error.message }, status: 500
+        render json: { status: 'error', message: error.message }, status: :internal_server_error
         logger.error(error.formatted)
       ensure
         FileUtils.remove_entry_secure(temp_dir, true)
       end
     else
       logger.error("No file received")
-      render json: { status: 'error', message: "No file received" }, status: 500
+      render json: { status: 'error', message: "No file received" }, status: :internal_server_error
     end
   end
 
@@ -183,6 +212,26 @@ class PluginsController < ModelController
     # Grab the existing plugin we're updating so we can display existing variables
     @existing_model = @model_class.get(name: params[:id], scope: params[:scope])
     create(true)
+  end
+
+  # Dry run before an upgrade: returns which modified files differ from the
+  # incoming plugin's rendered content so the UI can warn the user that those
+  # modifications will be superseded (a new Version History entry is created).
+  def modified_diff
+    return unless authorization('admin')
+    begin
+      scope = sanitize_params([:scope])
+      return unless scope
+      scope = scope[0]
+      plugin_hash = JSON.parse(params[:plugin_hash])
+      files = OpenC3::PluginModel.modified_diff(plugin_hash, scope: scope)
+      render json: { files: files }
+    rescue JSON::ParserError => error
+      render json: { status: 'error', message: error.message }, status: :bad_request
+    rescue Exception => error
+      logger.error(error.formatted)
+      render json: { status: 'error', message: error.message }, status: :internal_server_error
+    end
   end
 
   def install
@@ -194,8 +243,22 @@ class PluginsController < ModelController
       temp_dir = Dir.mktmpdir
       plugin_hash_filename = Dir::Tmpname.create(['plugin-instance-', '.json']) {}
       plugin_hash_file_path = File.join(temp_dir, File.basename(plugin_hash_filename))
+      # Stamp the installing user server-side (never trust a client-supplied
+      # username) so Version History can attribute plugin-upgrade versions of
+      # modified files. Falls back to writing the body verbatim if it isn't
+      # the expected JSON object.
+      plugin_hash_body = params[:plugin_hash]
+      begin
+        parsed = JSON.parse(params[:plugin_hash])
+        if parsed.is_a?(Hash)
+          parsed['username'] = username()
+          plugin_hash_body = JSON.generate(parsed)
+        end
+      rescue JSON::ParserError
+        # leave plugin_hash_body as the original string
+      end
       File.open(plugin_hash_file_path, 'wb') do |file|
-        file.write(params[:plugin_hash])
+        file.write(plugin_hash_body)
       end
 
       gem_name = sanitize_params([:id])
@@ -208,7 +271,7 @@ class PluginsController < ModelController
       render json: result.name
     rescue Exception => error
       logger.error(error.formatted)
-      render json: { status: 'error', message: error.message }, status: 500
+      render json: { status: 'error', message: error.message }, status: :internal_server_error
     end
   end
 
@@ -221,7 +284,25 @@ class PluginsController < ModelController
       render json: result.name
     rescue Exception => error
       logger.error(error.formatted)
-      render json: { status: 'error', message: error.message }, status: 500
+      render json: { status: 'error', message: error.message }, status: :internal_server_error
+    end
+  end
+
+  # Migrate a legacy plugin from the shared Python venv to a per-plugin UV
+  # virtual environment. Spawns `openc3cli migratetouv` as a background process.
+  def migrate_to_uv
+    return unless authorization('admin')
+    begin
+      id, scope = sanitize_params([:id, :scope])
+      return unless id and scope
+      result = OpenC3::ProcessManager.instance.spawn(
+        ["ruby", "/openc3/bin/openc3cli", "migratetouv", id, scope],
+        "plugin_migrate_to_uv", id, Time.now + 1.hour, scope: scope
+      )
+      render json: result.name
+    rescue Exception => error
+      logger.error(error.formatted)
+      render json: { status: 'error', message: error.message }, status: :internal_server_error
     end
   end
 end

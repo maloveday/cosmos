@@ -36,19 +36,19 @@ class PackagesController < ApplicationController
         if File.extname(package_file_path) == '.gem'
           process_name = OpenC3::GemModel.put(package_file_path, gem_install: true, scope: params[:scope])
         else
-          process_name = OpenC3::PythonPackageModel.put(package_file_path, package_install: true, scope: params[:scope])
+          process_name = OpenC3::PythonPackageModel.put(package_file_path, package_install: true, scope: params[:scope], plugin: params[:plugin])
         end
         OpenC3::Logger.info("Package created: #{params[:package]}", scope: params[:scope], user: username())
         render json: process_name
       rescue => e
         OpenC3::Logger.error("Error installing package: #{file.original_filename}:#{e.formatted}", scope: params[:scope], user: username())
-        render json: { status: 'error', message: e.message, type: e.class }, status: 400
+        render json: { status: 'error', message: e.message, type: e.class }, status: :bad_request
       ensure
         FileUtils.remove_entry_secure(temp_dir, true)
       end
     else
       OpenC3::Logger.error("Error installing package: Package file as params[:package] is required", scope: params[:scope], user: username())
-      render json: { status: 'error', message: "Package file as params[:package] is required" }, status: 400
+      render json: { status: 'error', message: "Package file as params[:package] is required" }, status: :bad_request
     end
   end
 
@@ -60,18 +60,26 @@ class PackagesController < ApplicationController
         if params[:id] =~ /\.gem/
           OpenC3::GemModel.destroy(params[:id])
         else
-          OpenC3::PythonPackageModel.destroy(params[:id], scope: params[:scope])
+          OpenC3::PythonPackageModel.destroy(params[:id], scope: params[:scope], plugin: params[:plugin])
         end
         OpenC3::Logger.info("Package destroyed: #{params[:id]}", scope: params[:scope], user: username())
         head :ok
       rescue => e
         OpenC3::Logger.error("Error destroying package: #{params[:id]}:#{e.formatted}", scope: params[:scope], user: username())
-        render json: { status: 'error', message: e.message, type: e.class }, status: 400
+        render json: { status: 'error', message: e.message, type: e.class }, status: :bad_request
       end
     else
       OpenC3::Logger.error("Error destroying package: Package name as params[:id] is required", scope: params[:scope], user: username())
-      render json: { status: 'error', message: "Package name as params[:id] is required" }, status: 400
+      render json: { status: 'error', message: "Package name as params[:id] is required" }, status: :bad_request
     end
+  end
+
+  # Return per-plugin Python dependency lists (package name + version) for each
+  # plugin venv. Used by the Admin Packages tab to show installed dependencies
+  # in a collapsible tree view per plugin.
+  def trees
+    return unless authorization('system')
+    render json: OpenC3::PythonPackageModel.trees
   end
 
   def download
@@ -87,7 +95,7 @@ class PackagesController < ApplicationController
       render json: { filename: package_name, contents: Base64.encode64(file) }
     rescue Exception => e
       OpenC3::Logger.info("Package '#{params[:id]}' download failed: #{e.message}", user: username())
-      render json: { status: 'error', message: e.message }, status: 500
+      render json: { status: 'error', message: e.message }, status: :internal_server_error
     end
   end
 end

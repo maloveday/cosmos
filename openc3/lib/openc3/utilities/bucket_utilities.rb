@@ -25,8 +25,7 @@ module OpenC3
     DIRECTORY_TIMESTAMP_FORMAT = "%Y%m%d"
 
     def self.bucket_load(*args, scope: $openc3_scope)
-      scope = ENV['OPENC3_SCOPE'] unless scope
-      scope = 'DEFAULT' unless scope
+      scope = ENV.fetch('OPENC3_SCOPE', 'DEFAULT') unless scope
       path = args[0]
 
       # Only support TARGET files
@@ -93,7 +92,7 @@ module OpenC3
           # this to work with really large files. Otherwise the entire file has
           # to be held in memory!
           File.open(filename, 'rb') do |file|
-            client.put_object(bucket: ENV['OPENC3_LOGS_BUCKET'], key: bucket_key, body: file, metadata: metadata)
+            client.put_object(bucket: ENV.fetch('OPENC3_LOGS_BUCKET', nil), key: bucket_key, body: file, metadata: metadata)
           end
         rescue => err
           # Try to upload file three times
@@ -104,7 +103,7 @@ module OpenC3
           retry
         end
 
-        Logger.debug "wrote #{ENV['OPENC3_LOGS_BUCKET']}/#{bucket_key}"
+        Logger.debug "wrote #{ENV.fetch('OPENC3_LOGS_BUCKET', nil)}/#{bucket_key}"
 
         File.delete(orig_filename) if orig_filename
         File.delete(filename)
@@ -117,7 +116,9 @@ module OpenC3
       # Allow caching for files that have a filename versioning strategy
       has_version_number = /(-|_|\.)\d+(-|_|\.)\d+(-|_|\.)\d+\./.match(filename)
       has_content_hash = /[\.-][a-f0-9]{20}\./.match(filename)
-      return nil if has_version_number or has_content_hash
+      # Font files are immutable assets deployed with plugins and safe to cache
+      is_font = /\.(woff2?|eot|ttf|otf)$/.match(filename)
+      return nil if has_version_number or has_content_hash or is_font
       return 'no-store'
     end
 

@@ -32,6 +32,8 @@ from openc3.utilities.extract import (
     extract_fields_from_set_tlm_text,
     extract_fields_from_tlm_text,
 )
+from openc3.utilities.questdb_client import TlmItem
+from openc3.utilities.store import Store
 
 
 WHITELIST.extend(
@@ -130,7 +132,16 @@ def set_tlm(*args, type="CONVERTED", cache_timeout=0.1, scope=OPENC3_SCOPE):
 # @param packet_name [String] Packet name of the packet
 # @param item_hash [Hash] Hash of item_name and value for each item you want to change from the current value table
 # @param type [Symbol] Telemetry type, :RAW, :CONVERTED (default), :FORMATTED
-def inject_tlm(target_name, packet_name, item_hash=None, type="CONVERTED", scope=OPENC3_SCOPE):
+# @param received_time [Integer|None] Optional received time as nanoseconds since Unix epoch
+def inject_tlm(
+    target_name,
+    packet_name,
+    item_hash=None,
+    type="CONVERTED",
+    stored=False,
+    scope=OPENC3_SCOPE,
+    received_time=None,
+):
     authorize(
         permission="tlm_set",
         target_name=target_name,
@@ -140,7 +151,7 @@ def inject_tlm(target_name, packet_name, item_hash=None, type="CONVERTED", scope
     target_name = target_name.upper()
     packet_name = packet_name.upper()
     if type not in CvtModel.VALUE_TYPES:
-        raise RuntimeError(f"Unknown type '{type}' for {target_name} {packet_name}")
+        raise RuntimeError(f"Unknown type '{type}' for {target_name} {packet_name} (inject_tlm)")
 
     if item_hash:
         item_hash = {k.upper(): v for k, v in item_hash.items()}
@@ -167,9 +178,26 @@ def inject_tlm(target_name, packet_name, item_hash=None, type="CONVERTED", scope
 
     # Use an interface microservice if it exists, other use the decom microservice
     if interface_name:
-        InterfaceTopic.inject_tlm(interface_name, target_name, packet_name, item_hash, type=type, scope=scope)
+        InterfaceTopic.inject_tlm(
+            interface_name,
+            target_name,
+            packet_name,
+            item_hash,
+            type=type,
+            stored=stored,
+            scope=scope,
+            received_time=received_time,
+        )
     else:
-        DecomInterfaceTopic.inject_tlm(target_name, packet_name, item_hash, type=type, scope=scope)
+        DecomInterfaceTopic.inject_tlm(
+            target_name,
+            packet_name,
+            item_hash,
+            type=type,
+            stored=stored,
+            scope=scope,
+            received_time=received_time,
+        )
 
 
 # Override the current value table such that a particular item always
@@ -241,7 +269,8 @@ def get_tlm_buffer(*args, scope=OPENC3_SCOPE, timeout=5):
         return {k.decode(): v for (k, v) in msg_hash.items()}
     else:
         topic = f"{scope}__TELEMETRY__{{{target_name}}}__{packet_name}"
-        msg_id, msg_hash = Topic.get_newest_message(topic)
+        db_shard = Store.db_shard_for_target(target_name, scope=scope)
+        msg_id, msg_hash = Topic.get_newest_message(topic, db_shard=db_shard)
         if msg_id:
             # Decode the keys for user convenience
             return {k.decode(): v for (k, v) in msg_hash.items()}
@@ -267,16 +296,16 @@ def get_tlm_packet(*args, stale_time: int = 30, type: str = "CONVERTED", scope: 
     packet = TargetModel.packet(target_name, packet_name, scope=scope)
     t = _validate_tlm_type(type)
     if t is None:
-        raise TypeError(f"Unknown type '{type}' for {target_name} {packet_name}")
+        raise TypeError(f"Unknown type '{type}' for {target_name} {packet_name} (get_tlm_packet)")
     cvt_items = []
     for item in packet["items"]:
         if not item.get("hidden", False):
             cvt_items.append(item)
-    cvt_items = [[target_name, packet_name, item["name"].upper(), type] for item in cvt_items]
+    cvt_items = [TlmItem(target_name, packet_name, item["name"].upper(), type) for item in cvt_items]
     # This returns an array of arrays containing the value and the limits state:
     # [[0, None], [0, 'RED_LOW'], ... ]
     current_values = CvtModel.get_tlm_values(cvt_items, stale_time=stale_time, scope=scope)
-    return [[cvt_items[index][2], item[0], item[1]] for index, item in enumerate(current_values)]
+    return [[cvt_items[index].item_name, item[0], item[1]] for index, item in enumerate(current_values)]
 
 
 def get_tlm_available(items, manual=False, scope=OPENC3_SCOPE):
@@ -365,19 +394,30 @@ def get_tlm_values(
     end_time=None,
     scope=OPENC3_SCOPE,
 ):
-    if not isinstance(items, list) or len(items) == 0 or not isinstance(items[0], str):
+    if not isinstance(items, list) or len(items) == 0:
         raise TypeError("items must be array of strings: ['TGT__PKT__ITEM__TYPE', ...]")
     packets = []
     cvt_items = []
     for item in items:
-        try:
-            target_name, packet_name, item_name, value_type = item.upper().split("__")
-        except ValueError:
-            raise ValueError("items must be formatted as TGT__PKT__ITEM__TYPE") from None
+        # get_tlm_available returns None for items which don't exist and its result is
+        # passed directly here, so None is a placeholder which returns a None value
+        if item is None:
+            cvt_items.append(TlmItem(None, None, None, None, None))
+            continue
+        if not isinstance(item, str):
+            raise TypeError("items must be array of strings: ['TGT__PKT__ITEM__TYPE', ...]")
+        # get_tlm_available tacks on __LIMITS to indicate a limits value is available
+        # so accept both TGT__PKT__ITEM__TYPE and TGT__PKT__ITEM__TYPE__LIMITS
+        parts = item.upper().split("__")
+        if len(parts) < 4 or len(parts) > 5:
+            raise ValueError("items must be formatted as TGT__PKT__ITEM__TYPE")
+        target_name, packet_name, item_name, value_type = parts[0:4]
+        limits = parts[4] if len(parts) == 5 else None
         if packet_name == "LATEST":
             packet_name = CvtModel.determine_latest_packet_for_item(target_name, item_name, cache_timeout, scope)
         # Change packet_name in case of LATEST and ensure upcase
-        cvt_items.append([target_name, packet_name, item_name, value_type])
+        # NOTE: limits is required by the historical (start_time) QuestDB lookup
+        cvt_items.append(TlmItem(target_name, packet_name, item_name, value_type, limits))
         packets.append([target_name, packet_name])
     # Make the array of arrays unique
     packets = [list(x) for x in {tuple(x) for x in packets}]
@@ -513,7 +553,8 @@ def subscribe_packets(packets, scope=OPENC3_SCOPE):
             scope=scope,
         )
         topic = f"{scope}__DECOM__{{{target_name}}}__{packet_name}"
-        id_, _ = Topic.get_newest_message(topic)
+        db_shard = Store.db_shard_for_target(target_name, scope=scope)
+        id_, _ = Topic.get_newest_message(topic, db_shard=db_shard)
         result[topic] = id_ if id_ else "0-0"
 
     mylist = []
@@ -524,6 +565,13 @@ def subscribe_packets(packets, scope=OPENC3_SCOPE):
 
 def get_packets(id, count=1000, scope=OPENC3_SCOPE):
     """Get packets based on ID returned from subscribe_packet.
+
+    Packets are ordered within each subscribed packet stream (target/packet pair)
+    but are NOT interleaved by time across streams. If chronological order across
+    streams is required, sort the returned list by the 'time' field. Sorting only
+    orders the current batch - packets across separate get_packets calls may still
+    arrive out of order, so subscribers needing global ordering must buffer and merge
+    across calls.
 
     Args:
         id (str) ID returned from subscribe_packets or last call to get_packets
@@ -539,16 +587,28 @@ def get_packets(id, count=1000, scope=OPENC3_SCOPE):
     # Convert it back into a dict to create a lookup
     lookup = dict(zip(items[::2], items[1::2], strict=False))
     packets = []
-    for topic, topic_id, msg_hash, _ in Topic.read_topics(lookup.keys(), list(lookup.values()), None, count):
-        # # Return the original ID and empty array if we didn't get anything
-        # for topic, data in xread:
-        # for id, msg_hash in data:
-        lookup[topic] = topic_id  # save the new ID
-        # decode the binary string keys and values to strings
-        msg_hash = {k.decode(): v.decode() for (k, v) in msg_hash.items()}
-        json_hash = json.loads(msg_hash["json_data"])
-        msg_hash.pop("json_data")
-        packets.append(msg_hash | json_hash)
+    # Group topics by db_shard for multi-db_shard support
+    import re
+
+    db_shard_groups = {}
+    for topic, offset in lookup.items():
+        match = re.search(r"__\{?([^}_]+)\}?__", topic)
+        target_name = match.group(1) if match else None
+        db_shard = Store.db_shard_for_target(target_name, scope=scope)
+        if db_shard not in db_shard_groups:
+            db_shard_groups[db_shard] = {"topics": [], "offsets": []}
+        db_shard_groups[db_shard]["topics"].append(topic)
+        db_shard_groups[db_shard]["offsets"].append(offset)
+    for db_shard, group in db_shard_groups.items():
+        for topic, topic_id, msg_hash, _ in Topic.read_topics(
+            group["topics"], group["offsets"], None, count, db_shard=db_shard
+        ):
+            lookup[topic] = topic_id  # save the new ID
+            # decode the binary string keys and values to strings
+            msg_hash = {k.decode(): v.decode() for (k, v) in msg_hash.items()}
+            json_hash = json.loads(msg_hash["json_data"])
+            msg_hash.pop("json_data")
+            packets.append(msg_hash | json_hash)
     mylist = []
     for k, v in lookup.items():
         mylist += [k, v]

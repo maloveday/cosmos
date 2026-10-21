@@ -37,14 +37,27 @@ module OpenC3
 
     attr_reader :microservice
     attr_reader :scope
+    attr_reader :db_shard
     attr_reader :data
     attr_reader :mutex
 
-    def initialize(microservice:, scope:)
+    def initialize(microservice:, scope:, db_shard: nil)
       @scope = scope
       @microservice = microservice
       @data = {}
       @mutex = Mutex.new
+
+      if db_shard
+        @db_shard = db_shard
+      else
+        # Look up db_shard from MicroserviceModel
+        begin
+          json = Store.hget('openc3_microservices', microservice)
+          @db_shard = json ? JSON.parse(json)['db_shard'].to_i : 0
+        rescue
+          @db_shard = 0
+        end
+      end
 
       # Always make sure there is a update thread
       @@mutex.synchronize do
@@ -90,6 +103,7 @@ module OpenC3
             instance.mutex.synchronize do
               json = {}
               json['name'] = instance.microservice
+              json['db_shard'] = instance.db_shard
               values = instance.data
               json['values'] = values
               MetricModel.set(json, scope: instance.scope) if values.length > 0
@@ -119,7 +133,23 @@ module OpenC3
     def graceful_kill
     end
 
+    # Environment variable the operator sets on every microservice it spawns to
+    # say "I am already reporting process metrics for you". Without it an
+    # in-process generator and the operator would both be writing cpu/memory for
+    # the same microservice.
+    SUPERVISED_ENV_VAR = 'OPENC3_OPERATOR_PROCESS_METRICS'.freeze
+
+    # Whether something outside this process is already reporting its process
+    # level metrics.
+    def self.supervised?
+      !ENV[SUPERVISED_ENV_VAR].nil?
+    end
+
     def self.add_update_generator(object)
+      # Generators produce process level metrics (cpu, memory). Skip them
+      # entirely when the operator is already reporting those for us.
+      return if supervised?
+
       @@update_generators << object
     end
   end

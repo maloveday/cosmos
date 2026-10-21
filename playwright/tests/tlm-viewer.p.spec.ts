@@ -12,7 +12,6 @@
 # All Rights Reserved
 */
 
-// @ts-check
 import { test, expect } from './fixture'
 import { format, sub } from 'date-fns'
 
@@ -21,7 +20,7 @@ test.use({
   toolName: 'Telemetry Viewer',
 })
 
-test.beforeEach(async ({ page, utils }) => {
+test.beforeEach(({ page, utils }) => {
   // Throw exceptions on any pageerror events
   page.on('pageerror', (exception) => {
     throw exception
@@ -33,6 +32,7 @@ async function showScreen(
   utils,
   target,
   screen,
+  close = true,
   callback = async () => {},
 ) {
   await page.locator('[data-test="select-target"]').click()
@@ -52,10 +52,12 @@ async function showScreen(
     ).toBeVisible()
   }
   await callback()
-  await page.locator('[data-test=close-screen-icon]').click()
-  await expect(
-    page.locator(`.v-toolbar:has-text("${target} ${screen}")`),
-  ).not.toBeVisible()
+  if (close) {
+    await page.locator('[data-test=close-screen-icon]').click()
+    await expect(
+      page.locator(`.v-toolbar:has-text("${target} ${screen}")`),
+    ).not.toBeVisible()
+  }
 }
 
 async function deleteScreen(page, utils, target, screen) {
@@ -92,12 +94,16 @@ test('displays INST BLOCK', async ({ page, utils }) => {
 })
 
 test('displays INST COMMANDING', async ({ page, utils }) => {
-  await showScreen(page, utils, 'INST', 'COMMANDING', async function () {
+  await showScreen(page, utils, 'INST', 'COMMANDING', true, async function () {
     // This is the expansion panel button
     await page.locator('#innerapp button').first().click()
 
     await page.getByRole('combobox').filter({ hasText: 'NORMAL' }).click()
     await page.getByRole('option', { name: 'NORMAL' }).click()
+    // Wait for the select menu to fully close before clicking the buttons
+    // beneath it, otherwise the closing overlay swallows the next click and the
+    // command is never sent (so the hazardous dialog below never appears).
+    await expect(page.getByRole('option', { name: 'NORMAL' })).toHaveCount(0)
     await page.getByRole('button', { name: 'Start Collect' }).click()
     // Send clear command which is hazardous
     await page.getByRole('button', { name: 'Send' }).click()
@@ -122,6 +128,86 @@ test('displays INST COMMANDING', async ({ page, utils }) => {
   })
 })
 
+// The BUTTON widget runs author-supplied JavaScript inside an opaque-origin
+// sandbox iframe (openc3-vue-common/src/util/buttonScriptSandbox.js) instead of
+// eval()ing it in the main window, so a screen author can't read
+// localStorage.openc3Token. The next two tests pin the invariants that
+// isolation rests on. Both need the sandbox to still be alive while they
+// assert, so they park it on the hazardous-command confirmation dialog, which
+// waits on the operator indefinitely.
+async function pauseButtonScriptOnHazardous(page) {
+  // Collapse the target/screen selector panel so it stops covering the screen
+  await page.locator('#innerapp button').first().click()
+  // GROUP defaults to 'Clear' (INST/screens/commanding.txt), so Send issues the
+  // hazardous INST CLEAR and the sandbox blocks awaiting confirmation.
+  await page.getByRole('button', { name: 'Send' }).click()
+  await expect(
+    page.getByText('Warning: Command is Hazardous. Send?'),
+  ).toBeVisible()
+}
+
+test('runs BUTTON scripts in an opaque-origin sandbox', async ({
+  page,
+  utils,
+}) => {
+  await showScreen(page, utils, 'INST', 'COMMANDING', true, async function () {
+    await pauseButtonScriptOnHazardous(page)
+    const sandbox = page.locator('iframe[src="/sandbox.html"]')
+    await expect(sandbox).toHaveCount(1)
+    // 'allow-scripts' WITHOUT 'allow-same-origin' is what gives the frame its
+    // unique opaque origin. Granting allow-same-origin would hand the session
+    // token back to author JavaScript, so assert the whole attribute value
+    // rather than a substring.
+    await expect(sandbox).toHaveAttribute('sandbox', 'allow-scripts')
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Cancel' })
+      .click()
+  })
+})
+
+test('ignores forged sandbox bridge messages', async ({ page, utils }) => {
+  let dialogCount = 0
+  page.on('dialog', async (dialog) => {
+    dialogCount += 1
+    await dialog.dismiss()
+  })
+  await showScreen(page, utils, 'INST', 'COMMANDING', true, async function () {
+    await pauseButtonScriptOnHazardous(page)
+    // Exactly the shape the real sandbox posts, but sent from the top window:
+    // it carries a real event.origin and event.source === window, so both of
+    // the bridge's guards must reject it. If either regressed, these would run
+    // screen.open() and alert() with the parent's privileges.
+    await page.evaluate(() => {
+      window.postMessage(
+        {
+          type: 'call',
+          id: 'forged-screen',
+          target: 'screen',
+          method: 'open',
+          args: ['INST', 'HS'],
+        },
+        '*',
+      )
+      window.postMessage(
+        { type: 'call', id: 'forged-alert', target: 'alert', args: ['forged'] },
+        '*',
+      )
+    })
+    // Cancelling resolves the paused run, so the sandbox finishes and the
+    // parent tears the iframe down. A window delivers messages
+    // FIFO, so the bridge has provably already handled (and rejected) them by
+    // the time the iframe leaves the DOM.
+    await page
+      .getByRole('dialog')
+      .getByRole('button', { name: 'Cancel' })
+      .click()
+    await expect(page.locator('iframe[src="/sandbox.html"]')).toHaveCount(0)
+    await expect(page.locator('.v-toolbar:has-text("INST HS")')).toHaveCount(0)
+    expect(dialogCount).toBe(0)
+  })
+})
+
 test('displays INST GRAPHS', async ({ page, utils }) => {
   await showScreen(page, utils, 'INST', 'GRAPHS')
 })
@@ -131,7 +217,7 @@ test('displays INST GROUND', async ({ page, utils }) => {
 })
 
 test('displays INST HS', async ({ page, utils }) => {
-  await showScreen(page, utils, 'INST', 'HS', async function () {
+  await showScreen(page, utils, 'INST', 'HS', true, async function () {
     await expect(page.locator('text=Health and Status')).toBeVisible()
     await page.locator('[data-test=minimize-screen-icon]').click()
     await expect(page.locator('text=Health and Status')).not.toBeVisible()
@@ -197,7 +283,7 @@ test('displays INST ROLLUP', async ({ page, utils }) => {
 
 test('displays INST SIMPLE', async ({ page, utils }) => {
   const text = 'TEST' + Math.floor(Math.random() * 10000)
-  await showScreen(page, utils, 'INST', 'SIMPLE', async function () {
+  await showScreen(page, utils, 'INST', 'SIMPLE', true, async function () {
     await expect(page.locator(`text=${text}`)).not.toBeVisible()
     await page.locator('[data-test=edit-screen-icon]').click()
     await page.locator('textarea').fill(`SCREEN AUTO AUTO 0.5
@@ -220,6 +306,75 @@ BIG INST HEALTH_STATUS TEMP2`)
     await page.locator('button:has-text("Cancel")').click()
     await expect(
       page.locator(`.v-toolbar:has-text("Edit Screen")`),
+    ).not.toBeVisible()
+  })
+})
+
+test('autocompletes screen keywords and their parameters', async ({
+  page,
+  utils,
+}) => {
+  // The screen editor completer splits the line being typed into tokens to work
+  // out which parameter is being completed, so it has to keep counting tokens
+  // correctly as the line grows. Uses ADCS because no other test saves it.
+  await showScreen(page, utils, 'INST', 'ADCS', true, async function () {
+    await page.locator('[data-test=edit-screen-icon]').click()
+    await expect(
+      page.locator('.v-toolbar:has-text("Edit Screen")'),
+    ).toBeVisible()
+    // Complete on a clean line at the end of the screen. fill() inserts at the
+    // cursor rather than replacing the document, and drops the newline, which
+    // would leave the keyword appended to the last line of the definition.
+    const editor = page.locator('textarea').first()
+    if (process.platform === 'darwin') {
+      await page.keyboard.press('Meta+ArrowDown') // Ace "gotoend" on mac
+    } else {
+      await page.keyboard.press('Control+End')
+    }
+    await page.keyboard.press('Enter')
+
+    const autocomplete = page.locator('.ace_autocomplete')
+    // Ctrl-space is the editor's documented trigger, and works whether or not
+    // live autocompletion fired on the keystrokes themselves
+    const showCompletions = async () => {
+      await page.keyboard.press('Control+Space')
+      await expect(autocomplete).toBeVisible()
+    }
+
+    // One token so far: the keyword itself. The completer fetches its keyword
+    // list when the editor opens, so retry until that request has landed.
+    await editor.pressSequentially('LABELVA')
+    await expect(async () => {
+      await page.keyboard.press('Control+Space')
+      await expect(autocomplete).toBeVisible({ timeout: 1000 })
+    }).toPass({ timeout: 20000 })
+    await expect(autocomplete).toContainText('LABELVALUE')
+
+    // Two tokens: the first parameter is the target name
+    await editor.pressSequentially('LUE INS')
+    await showCompletions()
+    await expect(autocomplete).toContainText('INST')
+
+    // Three tokens: the packets of the target named in the second token
+    await editor.pressSequentially('T HEALTH')
+    await showCompletions()
+    await expect(autocomplete).toContainText('HEALTH_STATUS')
+
+    // Four tokens: the items of the packet named in the third token
+    await editor.pressSequentially('_STATUS TEMP')
+    await showCompletions()
+    await expect(autocomplete).toContainText('TEMP1')
+
+    // Dismiss the completion popup, then leave without saving
+    await editor.press('Escape')
+    await expect(autocomplete).not.toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.getByText('You have unsaved changes')).toBeVisible()
+    await page
+      .locator('[data-test="confirm-dialog-close without saving"]')
+      .click()
+    await expect(
+      page.locator('.v-toolbar:has-text("Edit Screen")'),
     ).not.toBeVisible()
   })
 })
@@ -247,6 +402,12 @@ test('creates new blank screen', async ({ page, utils }) => {
   await expect(page.locator('.v-dialog')).toContainText(
     'Screen ADCS already exists!',
   )
+  // Check a name ending in '*' is rejected since '*' marks a modified file
+  await page.locator('[data-test="new-screen-name"] input').fill('adcs2*')
+  await expect(page.locator('.v-dialog')).toContainText(
+    "adcs2* is not a valid filename. Must not end in '*'.",
+  )
+  await expect(page.getByRole('button', { name: 'Save' })).toBeDisabled()
   // Create the screen name as upcase because OpenC3 upcases the name
   const screen = 'SCREEN' + Math.floor(Math.random() * 10000)
   await page.locator('[data-test="new-screen-name"] input').fill(screen)
@@ -276,7 +437,7 @@ test('opens SCREEN documentation from context menu', async ({
   page,
   utils,
 }) => {
-  await showScreen(page, utils, 'INST', 'ADCS', async function () {
+  await showScreen(page, utils, 'INST', 'ADCS', true, async function () {
     await page.locator('[data-test=edit-screen-icon]').click()
     await expect(
       page.locator(`.v-toolbar:has-text("Edit Screen")`),
@@ -296,97 +457,186 @@ test('opens SCREEN documentation from context menu', async ({
 })
 
 test('plays back to a screen', async ({ page, utils }) => {
-  await showScreen(page, utils, 'INST', 'ADCS', async function () {
-    // Helper to parse timestamp string to epoch seconds
-    const parseTime = (timeStr: string): number => {
-      // Format: "2026-01-26 15:16:13.116"
-      return Math.floor(new Date(timeStr).getTime() / 1000)
-    }
+  await showScreen(page, utils, 'INST', 'ADCS', false)
+  await showScreen(page, utils, 'INST', 'GRAPHS', false)
 
-    // Define the locator for the PACKET_TIMEFORMATTED value
-    const packetTimeInput = page
-      .locator('[data-test="label"]:has-text("PACKET_TIMEFORMATTED")')
-      .locator('..')
-      .locator('[data-test="value"] input')
+  // Helper to parse timestamp string to epoch seconds
+  const parseTime = (timeStr: string): number => {
+    // Format: "2026-01-26 15:16:13.116"
+    return Math.floor(new Date(timeStr).getTime() / 1000)
+  }
 
-    // Wait for it to have a valid timestamp value before entering playback mode
-    await expect(packetTimeInput).toHaveValue(
-      /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/,
-    )
+  // Define the locator for the PACKET_TIMEFORMATTED value
+  const packetTimeInput = page
+    .locator('[data-test="label"]:has-text("PACKET_TIMEFORMATTED")')
+    .locator('..')
+    .locator('[data-test="value"] input')
 
-    await page.locator('[data-test="telemetry-viewer-file"]').click()
-    await page.getByRole('checkbox', { name: 'Playback Mode' }).check()
-    await page.keyboard.press('Escape') // Close the file menu
+  // Wait for it to have a valid timestamp value before entering playback mode
+  await expect(packetTimeInput).toHaveValue(
+    /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/,
+  )
 
-    // Open and close the time dialog
-    await page
-      .locator('[data-test="playback-time"]')
-      .getByRole('button')
-      .click()
-    await utils.sleep(500)
+  await page.locator('[data-test="telemetry-viewer-file"]').click()
+  await page.getByRole('checkbox', { name: 'Playback Mode' }).check()
+  await page.keyboard.press('Escape') // Close the file menu
+
+  // Open and close the time dialog
+  await page.locator('[data-test="playback-time"]').getByRole('button').click()
+  await utils.sleep(500)
+  await page.keyboard.press('Escape')
+
+  const start = sub(new Date(), { minutes: 2 })
+  await page
+    .locator('[data-test=playback-date] input')
+    .fill(format(start, 'yyyy-MM-dd'))
+  await page
+    .locator('[data-test=playback-time] input')
+    .fill(format(start, 'HH:mm:ss'))
+
+  // Capture the live telemetry time just before entering playback
+  const live_time = parseTime(await packetTimeInput.inputValue())
+
+  // Click play and wait for playback to take over the display. Playback starts
+  // ~2 minutes in the past, so the displayed time drops well below the live
+  // time. We must wait for this transition before measuring increments;
+  // otherwise we'd capture the stale (higher) live value, which the playback
+  // values never exceed within the timeout, causing a flaky failure.
+  await page.getByRole('button', { name: 'Play / Pause' }).click()
+  await expect
+    .poll(async () => parseTime(await packetTimeInput.inputValue()))
+    .toBeLessThan(live_time)
+
+  // Now that playback is driving the display, verify the time increments
+  let previousTime = parseTime(await packetTimeInput.inputValue())
+  await expect
+    .poll(async () => parseTime(await packetTimeInput.inputValue()))
+    .toBeGreaterThan(previousTime)
+  await page.getByRole('button', { name: 'Play / Pause' }).click()
+  await utils.sleep(500)
+
+  // Verify step forward increments by 1s
+  previousTime = parseTime(await packetTimeInput.inputValue())
+  await page.locator('[data-test="playback-step-forward"]').click()
+  await expect
+    .poll(async () => parseTime(await packetTimeInput.inputValue()))
+    .toBe(previousTime + 1)
+
+  // Verify step backward decrements by 1s
+  previousTime = parseTime(await packetTimeInput.inputValue())
+  await page.locator('[data-test="playback-step-backward"]').click()
+  await expect
+    .poll(async () => parseTime(await packetTimeInput.inputValue()))
+    .toBe(previousTime - 1)
+
+  // Verify skip forward increments by 15s
+  previousTime = parseTime(await packetTimeInput.inputValue())
+  await page.locator('[data-test="playback-skip-forward"]').click()
+  await expect
+    .poll(async () => parseTime(await packetTimeInput.inputValue()))
+    .toBe(previousTime + 10)
+
+  // Verify skip backward decrements by 15s
+  previousTime = parseTime(await packetTimeInput.inputValue())
+  await page.locator('[data-test="playback-skip-backward"]').click()
+  await expect
+    .poll(async () => parseTime(await packetTimeInput.inputValue()))
+    .toBe(previousTime - 10)
+
+  // Change step value to 2 and verify step forward increments by 2s
+  await page.locator('[data-test="playback-speed"] input').fill('2')
+  previousTime = parseTime(await packetTimeInput.inputValue())
+  await page.locator('[data-test="playback-step-forward"]').click()
+  await expect
+    .poll(async () => parseTime(await packetTimeInput.inputValue()))
+    .toBe(previousTime + 2)
+
+  // Change skip value to 15 and verify skip forward increments by 15s
+  await page.locator('[data-test="skip"] input').fill('15')
+  previousTime = parseTime(await packetTimeInput.inputValue())
+  await page.locator('[data-test="playback-skip-forward"]').click()
+  await expect
+    .poll(async () => parseTime(await packetTimeInput.inputValue()))
+    .toBe(previousTime + 15)
+})
+
+test('prompts before closing dirty edit screen on ESC', async ({
+  page,
+  utils,
+}) => {
+  await showScreen(page, utils, 'INST', 'ADCS', true, async function () {
+    // Open the edit screen dialog
+    await page.locator('[data-test=edit-screen-icon]').click()
+    await expect(
+      page.locator('.v-toolbar:has-text("Edit Screen")'),
+    ).toBeVisible()
+
+    // Press ESC without making changes - dialog should close immediately
     await page.keyboard.press('Escape')
+    await expect(
+      page.locator('.v-toolbar:has-text("Edit Screen")'),
+    ).not.toBeVisible()
 
-    const start = sub(new Date(), { minutes: 2 })
-    await page
-      .locator('[data-test=playback-date] input')
-      .fill(format(start, 'yyyy-MM-dd'))
-    await page
-      .locator('[data-test=playback-time] input')
-      .fill(format(start, 'HH:mm:ss'))
+    // Reopen the edit screen dialog
+    await page.locator('[data-test=edit-screen-icon]').click()
+    await expect(
+      page.locator('.v-toolbar:has-text("Edit Screen")'),
+    ).toBeVisible()
 
-    // Click play, wait for time to increment, then pause
-    await page.getByRole('button', { name: 'Play / Pause' }).click()
-    await utils.sleep(1100)
-    // Get time after starting playback
-    let previousTime = parseTime(await packetTimeInput.inputValue())
-    await expect
-      .poll(async () => parseTime(await packetTimeInput.inputValue()))
-      .toBeGreaterThan(previousTime)
-    await page.getByRole('button', { name: 'Play / Pause' }).click()
+    // Type something into the Ace editor to make it dirty
+    await page
+      .locator('textarea')
+      .first()
+      .fill('SCREEN AUTO AUTO 0.5\nLABEL DIRTY_CHANGE')
     await utils.sleep(500)
 
-    // Verify step forward increments by 1s
-    previousTime = parseTime(await packetTimeInput.inputValue())
-    await page.locator('[data-test="playback-step-forward"]').click()
-    await expect
-      .poll(async () => parseTime(await packetTimeInput.inputValue()))
-      .toBe(previousTime + 1)
+    // Press ESC - should show the unsaved changes confirmation dialog
+    await page.keyboard.press('Escape')
+    await expect(page.getByText('You have unsaved changes')).toBeVisible()
 
-    // Verify step backward decrements by 1s
-    previousTime = parseTime(await packetTimeInput.inputValue())
-    await page.locator('[data-test="playback-step-backward"]').click()
-    await expect
-      .poll(async () => parseTime(await packetTimeInput.inputValue()))
-      .toBe(previousTime - 1)
+    // Click Cancel to stay in the editor
+    await page.locator('[data-test="confirm-dialog-cancel"]').click()
+    // The edit dialog should still be open
+    await expect(
+      page.locator('.v-toolbar:has-text("Edit Screen")'),
+    ).toBeVisible()
+    // Wait for the confirmation dialog to fully close before re-triggering it.
+    // Otherwise the reopened dialog overlaps the closing one and the overlay
+    // churn detaches the "close without saving" button mid-click.
+    await expect(page.getByText('You have unsaved changes')).not.toBeVisible()
 
-    // Verify skip forward increments by 15s
-    previousTime = parseTime(await packetTimeInput.inputValue())
-    await page.locator('[data-test="playback-skip-forward"]').click()
-    await expect
-      .poll(async () => parseTime(await packetTimeInput.inputValue()))
-      .toBe(previousTime + 10)
+    // Press ESC again to re-trigger the confirmation
+    await page.keyboard.press('Escape')
+    await expect(page.getByText('You have unsaved changes')).toBeVisible()
 
-    // Verify skip backward decrements by 15s
-    previousTime = parseTime(await packetTimeInput.inputValue())
-    await page.locator('[data-test="playback-skip-backward"]').click()
-    await expect
-      .poll(async () => parseTime(await packetTimeInput.inputValue()))
-      .toBe(previousTime - 10)
+    // This time confirm closing without saving
+    await page
+      .locator('[data-test="confirm-dialog-close without saving"]')
+      .click()
+    // The edit dialog should now be closed
+    await expect(
+      page.locator('.v-toolbar:has-text("Edit Screen")'),
+    ).not.toBeVisible()
+  })
+})
 
-    // Change step value to 2 and verify step forward increments by 2s
-    await page.getByRole('spinbutton', { name: 'Step (Speed)' }).fill('2')
-    previousTime = parseTime(await packetTimeInput.inputValue())
-    await page.locator('[data-test="playback-step-forward"]').click()
-    await expect
-      .poll(async () => parseTime(await packetTimeInput.inputValue()))
-      .toBe(previousTime + 2)
-
-    // Change skip value to 15 and verify skip forward increments by 15s
-    await page.getByRole('spinbutton', { name: 'Skip' }).fill('15')
-    previousTime = parseTime(await packetTimeInput.inputValue())
-    await page.locator('[data-test="playback-skip-forward"]').click()
-    await expect
-      .poll(async () => parseTime(await packetTimeInput.inputValue()))
-      .toBe(previousTime + 15)
+test('links array item to TlmGrapher', async ({ page, utils }) => {
+  await showScreen(page, utils, 'INST', 'ARRAY', true, async function () {
+    // Right-click the ARY[0] value widget to open the context menu
+    await page
+      .locator('[data-test="label"]:has-text("ARY[0]:")')
+      .locator('..')
+      .locator('[data-test="value"]')
+      .click({ button: 'right' })
+    // Click "Graph" in the context menu, which opens TlmGrapher in a new tab
+    const graphPagePromise = page.waitForEvent('popup')
+    await page.getByText('Graph', { exact: true }).click()
+    const graphPage = await graphPagePromise
+    await expect(graphPage).toHaveURL(
+      new RegExp(
+        `/tools/tlmgrapher/INST/HEALTH_STATUS/ARY${encodeURIComponent('[0]')}`,
+      ),
+    )
+    await graphPage.close()
   })
 })

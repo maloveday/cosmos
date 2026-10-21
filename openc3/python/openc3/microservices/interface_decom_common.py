@@ -20,7 +20,8 @@ from openc3.system.system import System
 from openc3.topics.telemetry_topic import TelemetryTopic
 from openc3.topics.topic import Topic
 from openc3.utilities.json import JsonDecoder, JsonEncoder
-from openc3.utilities.time import to_nsec_from_epoch
+from openc3.utilities.store import Store
+from openc3.utilities.time import from_nsec_from_epoch, to_nsec_from_epoch
 
 
 def handle_inject_tlm(inject_tlm_json, scope):
@@ -33,11 +34,30 @@ def handle_inject_tlm(inject_tlm_json, scope):
     if item_hash:
         for name, value in item_hash.items():
             packet.write(str(name), value, data_type)
-    packet.received_time = datetime.now(timezone.utc)
+    stored = inject_tlm_hash.get("stored", False)
+    packet.stored = str(stored).lower() == "true"
+    received_time = inject_tlm_hash.get("received_time")
+    packet.received_time = (
+        from_nsec_from_epoch(received_time) if received_time is not None else datetime.now(timezone.utc)
+    )
     packet.received_count = TargetModel.increment_telemetry_count(
         packet.target_name, packet.packet_name, 1, scope=scope
     )
     TelemetryTopic.write_packet(packet, scope)
+
+
+def handle_inject_tlm_with_ack(inject_tlm_json, msg_id, scope, logger=None):
+    inject_tlm_hash = json.loads(inject_tlm_json, cls=JsonDecoder)
+    target_name = inject_tlm_hash["target_name"]
+    ack_topic = f"{{{scope}__ACKCMD}}TARGET__{target_name}"
+    try:
+        handle_inject_tlm(inject_tlm_json, scope)
+        msg_hash = {"id": msg_id, "result": "SUCCESS"}
+    except Exception as error:
+        if logger:
+            logger.error(f"inject_tlm error due to {error}")
+        msg_hash = {"id": msg_id, "result": str(error)}
+    Topic.write_topic(ack_topic, msg_hash)
 
 
 def handle_build_cmd(build_cmd_json, msg_id, scope):
@@ -47,6 +67,7 @@ def handle_build_cmd(build_cmd_json, msg_id, scope):
     cmd_params = build_cmd_hash["cmd_params"]
     range_check = build_cmd_hash["range_check"]
     raw = build_cmd_hash["raw"]
+    db_shard = Store.db_shard_for_target(target_name, scope=scope)
     ack_topic = f"{{{scope}__ACKCMD}}TARGET__{target_name}"
     try:
         command = System.commands.build_cmd(target_name, cmd_name, cmd_params, range_check, raw)
@@ -64,14 +85,15 @@ def handle_build_cmd(build_cmd_json, msg_id, scope):
     # write the ACKCMD}TARGET topic and allow the TelemetryDecomTopic.build_cmd to return
     except Exception as error:
         # Return only the error message (not full traceback) to match Ruby behavior
-        msg_hash = {"id": msg_id, "result": "ERROR", "message": str(error)}
-    Topic.write_topic(ack_topic, msg_hash)
+        msg_hash = {"id": msg_id, "result": str(error)}
+    Topic.write_topic(ack_topic, msg_hash, db_shard=db_shard)
 
 
 def handle_get_tlm_buffer(get_tlm_buffer_json, msg_id, scope):
     get_tlm_buffer_hash = json.loads(get_tlm_buffer_json, cls=JsonDecoder)
     target_name = get_tlm_buffer_hash["target_name"]
     packet_name = get_tlm_buffer_hash["packet_name"]
+    db_shard = Store.db_shard_for_target(target_name, scope=scope)
     ack_topic = f"{{{scope}__ACKCMD}}TARGET__{target_name}"
     try:
         packet = System.telemetry.packet(target_name, packet_name)
@@ -83,7 +105,7 @@ def handle_get_tlm_buffer(get_tlm_buffer_json, msg_id, scope):
             "target_name": packet.target_name,
             "packet_name": packet.packet_name,
             "received_count": packet.received_count,
-            "stored": str(packet.stored),
+            "stored": str(packet.stored).lower(),  # Match ruby behavior of "true"/"false"
             "buffer": json.dumps(packet.buffer_no_copy(), cls=JsonEncoder),
         }
         if packet.extra:
@@ -92,5 +114,5 @@ def handle_get_tlm_buffer(get_tlm_buffer_json, msg_id, scope):
     # write the ACKCMD}TARGET topic and allow the source to return
     except Exception as error:
         # Return only the error message (not full traceback) to match Ruby behavior
-        msg_hash = {"id": msg_id, "result": "ERROR", "message": str(error)}
-    Topic.write_topic(ack_topic, msg_hash)
+        msg_hash = {"id": msg_id, "result": str(error)}
+    Topic.write_topic(ack_topic, msg_hash, db_shard=db_shard)

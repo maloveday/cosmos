@@ -7,8 +7,34 @@ const crypto_orig_createHash = crypto.createHash;
 crypto.createHash = (algorithm) => crypto_orig_createHash("sha256");
 
 const { themes } = require("prism-react-renderer");
-const lightCodeTheme = themes.nightOwlLight;
-const darkCodeTheme = themes.nightOwl;
+
+// Prism's YAML grammar tags mapping keys as "atrule" (the same token type CSS
+// uses for @rules) and YAML nulls and merge keys as "important". The nightOwl
+// themes style neither, so every YAML key renders in the plain foreground color
+// and the block looks unhighlighted. Add styles for both. The colors passed in
+// below are copied from each theme's keyword and boolean styles so YAML matches
+// the rest of the highlighting; update them if the themes change.
+function withYamlKeys(theme, keyColor, importantColor) {
+  return {
+    ...theme,
+    styles: [
+      ...theme.styles,
+      { types: ["atrule", "key"], style: { color: keyColor } },
+      { types: ["important"], style: { color: importantColor } },
+    ],
+  };
+}
+
+const lightCodeTheme = withYamlKeys(
+  themes.nightOwlLight,
+  "rgb(12, 150, 155)",
+  "rgb(188, 84, 84)",
+);
+const darkCodeTheme = withYamlKeys(
+  themes.nightOwl,
+  "rgb(127, 219, 202)",
+  "rgb(255, 88, 116)",
+);
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
@@ -17,9 +43,24 @@ const config = {
   favicon: "img/favicon.png",
 
   future: {
-    experimental_faster: true,
-    v4: true
+    v4: true,
   },
+
+  headTags: [
+    {
+      tagName: "script",
+      attributes: {},
+      innerHTML: `
+        if (window.location.hostname === 'docs.openc3.com') {
+          var s = document.createElement('script');
+          s.src = 'https://crawlchat.app/embed.js';
+          s.id = 'crawlchat-script';
+          s.dataset.id = '69c2c5539542f047e7848e0d';
+          document.head.appendChild(s);
+        }
+      `,
+    },
+  ],
 
   // Set the production url of your site here
   url: "https://docs.openc3.com",
@@ -39,7 +80,7 @@ const config = {
     hooks: {
       onBrokenMarkdownLinks: "throw",
       onBrokenMarkdownImages: "throw",
-    }
+    },
   },
 
   // Even if you don't use internalization, you can use this field to set useful
@@ -55,6 +96,11 @@ const config = {
       "@docusaurus/plugin-client-redirects",
       {
         redirects: [
+          { to: "/docs/guides/podman", from: "/docs/getting-started/podman" },
+          {
+            to: "/docs/meta/requirements",
+            from: "/docs/getting-started/requirements",
+          },
           { to: "/docs/", from: "/docs/v5/" },
           { to: "/docs/tools", from: "/docs/v5/tools" },
           {
@@ -67,10 +113,10 @@ const config = {
           },
           { to: "/docs/getting-started/upgrading", from: "/docs/v5/upgrading" },
           {
-            to: "/docs/getting-started/requirements",
+            to: "/docs/meta/requirements",
             from: "/docs/v5/requirements",
           },
-          { to: "/docs/getting-started/podman", from: "/docs/v5/podman" },
+          { to: "/docs/guides/podman", from: "/docs/v5/podman" },
           { to: "/docs/configuration/format", from: "/docs/v5/format" },
           { to: "/docs/configuration/plugins", from: "/docs/v5/plugins" },
           { to: "/docs/configuration/target", from: "/docs/v5/target" },
@@ -143,7 +189,7 @@ const config = {
       },
     ],
     [
-      require.resolve("docusaurus-lunr-search"),
+      require.resolve("./plugins/docusaurus-search/src/index.js"),
       {
         maxHits: "25", // Default is "5", increase to show more results
       },
@@ -186,7 +232,7 @@ const config = {
             label: "Home",
           },
           {
-            to: "https://openc3.com/enterprise/",
+            to: "https://openc3.com/cosmos-enterprise",
             label: "Enterprise",
           },
           {
@@ -263,7 +309,18 @@ const config = {
       prism: {
         theme: lightCodeTheme,
         darkTheme: darkCodeTheme,
-        additionalLanguages: ["ruby", "python", "bash", "diff", "json"],
+        additionalLanguages: [
+          "ruby",
+          "python",
+          "bash",
+          "diff",
+          "json",
+          "yaml",
+          "docker",
+          "batch",
+          "sql",
+          "c",
+        ],
       },
       colorMode: {
         defaultMode: "dark",

@@ -40,6 +40,10 @@ Both languages provides a script writer a lot of power. But with great power com
   - `class CcsdsUtility: # in 'ccsds_utility.py'`
 - Don't add useless comments but instead describe intent
 
+:::note[Languages Cannot Be Mixed]
+Script Runner supports both Python and Ruby, but each script must be written entirely in one language. You cannot import a Ruby script from a Python script (or vice versa) or mix the two syntaxes in a single file.
+:::
+
 <div style={{"clear": 'both'}}></div>
 
 The following is an example of good Ruby style:
@@ -132,21 +136,21 @@ wait_check("INST HEALTH_STATUS TYPE == 'NORMAL'", 5)
 or similarly with a counter that is sampled before the command.
 
 <Tabs groupId="script-language">
-<TabItem value="ruby" label="Ruby">
-
-```ruby
-count = tlm("INST HEALTH_STATUS COLLECTS")
-cmd("INST COLLECT with TYPE NORMAL, TEMP 10.0")
-wait_check("INST HEALTH_STATUS COLLECTS >= #{count + 1}", 5)
-```
-
-</TabItem>
 <TabItem value="python" label="Python">
 
 ```python
 count = tlm("INST HEALTH_STATUS COLLECTS")
 cmd("INST COLLECT with TYPE NORMAL, TEMP 10.0")
 wait_check(f"INST HEALTH_STATUS COLLECTS >= {count + 1}", 5)
+```
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```ruby
+count = tlm("INST HEALTH_STATUS COLLECTS")
+cmd("INST COLLECT with TYPE NORMAL, TEMP 10.0")
+wait_check("INST HEALTH_STATUS COLLECTS >= #{count + 1}", 5)
 ```
 
 </TabItem>
@@ -167,21 +171,21 @@ There are two common ways repetition presents itself: exact blocks of code to pe
 For example, a script that powers on a subsystem and ensures correct telemetry would become:
 
 <Tabs groupId="script-language">
-<TabItem value="ruby" label="Ruby">
-
-```ruby
-def power_on_subsystem
-  # 100 lines of cmd(), wait_check(), etc
-end
-```
-
-</TabItem>
 <TabItem value="python" label="Python">
 
 ```python
 def power_on_subsystem():
     # 100 lines of cmd(), wait_check(), etc
     pass
+```
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```ruby
+def power_on_subsystem
+  # 100 lines of cmd(), wait_check(), etc
+end
 ```
 
 </TabItem>
@@ -204,6 +208,16 @@ power_on_subsystem()
 Blocks of code where only the only variation is the mnemonics or values checked can be replaced by methods with arguments.
 
 <Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+def test_minimum_temp(enable_cmd_name, enable_tlm, temp_tlm, expected_temp):
+    cmd(f"TARGET {enable_cmd_name} with ENABLE TRUE")
+    wait_check(f"TARGET {enable_tlm} == 'TRUE'", 5)
+    wait_check(f"TARGET {temp_tlm} >= {expected_temp}", 50)
+```
+
+</TabItem>
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
@@ -212,16 +226,6 @@ def test_minimum_temp(enable_cmd_name, enable_tlm, temp_tlm, expected_temp)
   wait_check("TARGET #{enable_tlm} == 'TRUE'", 5)
   wait_check("TARGET #{temp_tlm} >= #{expected_temp}", 50)
 end
-```
-
-</TabItem>
-<TabItem value="python" label="Python">
-
-```python
-def test_minimum_temp(enable_cmd_name, enable_tlm, temp_tlm, expected_temp):
-    cmd(f"TARGET {enable_cmd_name} with ENABLE TRUE")
-    wait_check(f"TARGET {enable_tlm} == 'TRUE'", 5)
-    wait_check(f"TARGET {temp_tlm} >= {expected_temp}", 50)
 ```
 
 </TabItem>
@@ -251,20 +255,20 @@ The correct environment for the job is up to individual users, and many programs
 Loops are powerful constructs that allow you to perform the same operations multiple times without having to rewrite the same code over and over (See the DRY Concept). However, they can make restarting a COSMOS script at the point of a failure difficult or impossible. If there is a low probability of something failing, then loops are an excellent choice. If a script is running a loop over a list of telemetry points, it may be a better choice to “unroll” the loop by making the loop body into a method, and then calling that method directly for each iteration of a loop that would have occurred.
 
 <Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+for temperature_number in range(1, 11):
+    check_temperature(temperature_number)
+```
+
+</TabItem>
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
 10.times do |temperature_number|
   check_temperature(temperature_number + 1)
 end
-```
-
-</TabItem>
-<TabItem value="python" label="Python">
-
-```python
-for temperature_number in range(1, 11):
-    check_temperature(temperature_number)
 ```
 
 </TabItem>
@@ -289,11 +293,11 @@ In the unrolled version above, the COSMOS “Start script at selected line” fe
 
 ## Script Organization
 
-All scripts must be part of a [Plugin](../configuration/plugins.md). You can create a simple plugin called SCRIPTS or PROCEDURES that only contains lib and procedures directories to store scripts. If COSMOS detects a plugin without defined cmd/tlm it will not spawn microservices for telemetry processing.
+All scripts must be part of a [Target](../configuration/target.md) in a [Plugin](../configuration/plugins.md). You can create a simple plugin with a target called SCRIPTS or PROCEDURES that only contains lib and procedures directories to store scripts. If COSMOS detects a plugin without defined cmd/tlm it will not spawn microservices for telemetry processing.
 
 ### Organizing Your Scripts into a Plugin
 
-As your scripts become large with many methods, it makes sense to break them up into multiple files within a plugin. Here is a recommended organization for your plugin's scripts/procedures.
+As your scripts become large with many methods, it makes sense to break them up into multiple files and folders within a plugin. Here is a recommended organization for your plugin's scripts/procedures.
 
 | Folder                         | Description                                                               |
 | ------------------------------ | ------------------------------------------------------------------------- |
@@ -303,17 +307,17 @@ As your scripts become large with many methods, it makes sense to break them up 
 In your main procedure you will usually bring in the other files with instrumentation using load_utility.
 
 <Tabs groupId="script-language">
-<TabItem value="ruby" label="Ruby">
-
-```ruby
-load_utility('TARGET/lib/my_other_script.rb')
-```
-
-</TabItem>
 <TabItem value="python" label="Python">
 
 ```python
 load_utility('TARGET/procedures/my_other_script.py')
+```
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```ruby
+load_utility('TARGET/lib/my_other_script.rb')
 ```
 
 </TabItem>
@@ -324,6 +328,19 @@ load_utility('TARGET/procedures/my_other_script.py')
 Put each activity into a distinct method. Putting your scripts into methods makes organization easy and gives a great high-level overview of what the overall script does (assuming you name the methods well). There are no bonus points for vague, short method names. Make your method names long and clear.
 
 <Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+def test_1_heater_zone_control():
+    print("Verifies requirements 304, 306, and 310")
+    # Test code here
+
+def script_1_heater_zone_control():
+    print("Verifies requirements 304, 306, and 310")
+    # Test code here
+```
+
+</TabItem>
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
@@ -339,19 +356,6 @@ end
 ```
 
 </TabItem>
-<TabItem value="python" label="Python">
-
-```python
-def test_1_heater_zone_control():
-    print("Verifies requirements 304, 306, and 310")
-    # Test code here
-
-def script_1_heater_zone_control():
-    print("Verifies requirements 304, 306, and 310")
-    # Test code here
-```
-
-</TabItem>
 </Tabs>
 
 ### Using Classes vs Unscoped Methods
@@ -361,6 +365,34 @@ Classes in object-oriented programming allow you to organize a set of related me
 NOTE: The convention in COSMOS is to have a TARGET/lib/target.\[rb/py\] file which is named after the TARGET name and contains a class called Target. This discussion refers to scripts in the TARGET/procedures directory.
 
 <Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+class Gimbal:
+    def __init__(self):
+        self.gimbal_steps = 0
+
+    def move(self, steps_to_move):
+        # Move the gimbal
+        self.gimbal_steps += steps_to_move
+
+    def home_gimbal(self):
+        # Home the gimbal
+        self.gimbal_steps = 0
+
+def perform_common_math(x, y):
+    return x + y
+
+gimbal = Gimbal()
+gimbal.home_gimbal()
+gimbal.move(100)
+gimbal.move(200)
+print(f"Moved gimbal {gimbal.gimbal_steps}")
+result = perform_common_math(gimbal.gimbal_steps, 10)
+print(f"Math:{result}")
+```
+
+</TabItem>
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
@@ -393,34 +425,6 @@ puts "Math:#{result}"
 ```
 
 </TabItem>
-<TabItem value="python" label="Python">
-
-```python
-class Gimbal:
-    def __init__(self):
-        self.gimbal_steps = 0
-
-    def move(self, steps_to_move):
-        # Move the gimbal
-        self.gimbal_steps += steps_to_move
-
-    def home_gimbal(self):
-        # Home the gimbal
-        self.gimbal_steps = 0
-
-def perform_common_math(x, y):
-    return x + y
-
-gimbal = Gimbal()
-gimbal.home_gimbal()
-gimbal.move(100)
-gimbal.move(200)
-print(f"Moved gimbal {gimbal.gimbal_steps}")
-result = perform_common_math(gimbal.gimbal_steps, 10)
-print(f"Math:{result}")
-```
-
-</TabItem>
 </Tabs>
 
 ### Instrumented vs Uninstrumented Lines (require vs load)
@@ -436,6 +440,18 @@ In Python, libraries are included using the import syntax. Any code imported usi
 Finally, COSMOS scripting has a special syntax for disabling instrumentation in the middle of an instrumented script, with the disable_instrumentation method. This allows you to disable instrumentation for large loops and other activities that are too slow when running instrumented.
 
 <Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+temp = 0
+with disable_instrumentation():
+    # Make sure nothing in here will raise exceptions!
+    for x in range(0,5000000):
+        temp += 1
+print(temp)
+```
+
+</TabItem>
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
@@ -450,21 +466,9 @@ puts temp
 ```
 
 </TabItem>
-<TabItem value="python" label="Python">
-
-```python
-temp = 0
-with disable_instrumentation():
-    # Make sure nothing in here will raise exceptions!
-    for x in range(0,5000000):
-        temp += 1
-print(temp)
-```
-
-</TabItem>
 </Tabs>
 
-:::warning When Running Uninstrumented Code
+:::warning[When Running Uninstrumented Code]
 Make sure that the code will not raise any exceptions or have any check failures. If an exception is raised from uninstrumented code, then your entire script will stop.
 :::
 
@@ -519,6 +523,19 @@ The Ruby Syntax Check tool is found under the Script Menu. This tool uses the ru
 COSMOS provides several different methods to gather manual user input in scripts. When using user input methods that allow for arbitrary values (like ask() and ask_string()), it is very important to validate the value given in your script before moving on. When asking for text input, it is extra important to handle different casing possibilities and to ensure that invalid input will either re-prompt the user or take a safe path.
 
 <Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+answer = ask_string("Do you want to continue (y/n)?")
+if answer != 'y' and answer != 'Y':
+    raise RuntimeError(f"User entered: {answer}")
+
+temp = 0.0
+while temp < 10.0 or temp > 50.0:
+    temp = ask("Enter the desired temperature between 10.0 and 50.0")
+```
+
+</TabItem>
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
@@ -534,19 +551,6 @@ end
 ```
 
 </TabItem>
-<TabItem value="python" label="Python">
-
-```python
-answer = ask_string("Do you want to continue (y/n)?")
-if answer != 'y' and answer != 'Y':
-    raise RuntimeError(f"User entered: {answer}")
-
-temp = 0.0
-while temp < 10.0 or temp > 50.0:
-    temp = ask("Enter the desired temperature between 10.0 and 50.0")
-```
-
-</TabItem>
 </Tabs>
 
 When possible, always use one of the other user input methods that has a constrained list of choices for your users (message_box, vertical_message_box, combo_box).
@@ -558,6 +562,20 @@ Note that all these user input methods provide the user the option to “Cancel�
 When possible, a useful design pattern is to write your scripts such that they can run without prompting for any user input. This allows the scripts to be more easily tested and provides a documented default value for any user input choices or values. To implement this pattern, all manual steps such as ask(), prompt(), and infinite wait() statements need to be wrapped with an if statement that checks the value of $manual in Ruby or RunningScript.manual in Python. If the variable is set, then the manual steps should be executed. If not, then a default value should be used.
 
 <Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+if RunningScript.manual:
+    temp = ask("Please enter the temperature")
+else:
+    temp = 20.0
+if not RunningScript.manual:
+    print("Skipping infinite wait in auto mode")
+else:
+    wait()
+```
+
+</TabItem>
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
@@ -574,20 +592,6 @@ end
 ```
 
 </TabItem>
-<TabItem value="python" label="Python">
-
-```python
-if RunningScript.manual:
-    temp = ask("Please enter the temperature")
-else:
-    temp = 20.0
-if not RunningScript.manual:
-    print("Skipping infinite wait in auto mode")
-else:
-    wait()
-```
-
-</TabItem>
 </Tabs>
 
 When running suites, there is a checkbox at the top of the tool called “Manual” that affects this $manual variable directly.
@@ -597,6 +601,19 @@ When running suites, there is a checkbox at the top of the tool called “Manual
 COSMOS Script Runner operating on a script suite automatically generates a report that shows the PASS/FAILED/SKIPPED state for each script. You can also inject arbitrary text into this report using the example as follows. Alternatively, you can simply use print text into the Script Runner message log.
 
 <Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+from openc3.script.suite import Group
+class MyGroup(Group):
+    def script_1():
+        # The following text will be placed in the report
+        Group.print("Verifies requirements 304, 306, 310")
+        # This puts line will show up in the sr_messages log file
+        print("script_1 complete")
+```
+
+</TabItem>
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
@@ -608,19 +625,6 @@ class MyGroup < OpenC3::Group
     puts "script_1 complete"
   end
 end
-```
-
-</TabItem>
-<TabItem value="python" label="Python">
-
-```python
-from openc3.script.suite import Group
-class MyGroup(Group):
-    def script_1():
-        # The following text will be placed in the report
-        Group.print("Verifies requirements 304, 306, 310")
-        # This puts line will show up in the sr_messages log file
-        print("script_1 complete")
 ```
 
 </TabItem>
@@ -643,7 +647,22 @@ value = tlm("INST LATEST TEMP")
 
 When writing COSMOS scripts, checking the most recent value of a telemetry point normally gets the job done. The tlm(), tlm_raw(), etc methods all retrieve the most recent value of a telemetry point. Sometimes you need to perform analysis on every single sample of a telemetry point. This can be done using the COSMOS packet subscription system. The packet subscription system lets you choose one or more packets and receive them all from a queue. You can then pick out the specific telemetry points you care about from each packet. See the [Packet Data Subscriptions](scripting-api.md#packet-data-subscriptions) section of the Scripting API guide for the complete API documentation including the packet hash/dictionary structure.
 
+Note: when subscribing to multiple packets, packets returned from `get_packets` are ordered within each packet stream but are NOT interleaved by time across streams. Sort the returned array by the `time` field if you need chronological order across packets from different streams.
+
 <Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+id = subscribe_packets([['INST', 'HEALTH_STATUS'], ['INST', 'ADCS']])
+wait(1.5)
+id, packets = get_packets(id)
+for packet in packets:
+    print(f"{packet['PACKET_TIMESECONDS']}: {packet['target_name']} {packet['packet_name']}")
+# Wait for some time later and reuse the last returned ID
+id, packets = get_packets(id)
+```
+
+</TabItem>
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
@@ -658,19 +677,6 @@ id, packets = get_packets(id)
 ```
 
 </TabItem>
-<TabItem value="python" label="Python">
-
-```python
-id = subscribe_packets([['INST', 'HEALTH_STATUS'], ['INST', 'ADCS']])
-wait(1.5)
-id, packets = get_packets(id)
-for packet in packets:
-    print(f"{packet['PACKET_TIMESECONDS']}: {packet['target_name']} {packet['packet_name']}")
-# Wait for some time later and reuse the last returned ID
-id, packets = get_packets(id)
-```
-
-</TabItem>
 </Tabs>
 
 ### Using Variables in Mnemonics
@@ -678,6 +684,15 @@ id, packets = get_packets(id)
 Because command and telemetry mnemonics are just strings in COSMOS scripts, you can make use of variables in some contexts to make reusable code. For example, a method can take a target name as an input to support multiple instances of a target. You could also pass in the value for a set of numbered telemetry points.
 
 <Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+def example(target_name, temp_number):
+    cmd(f"{target_name} COLLECT with TYPE NORMAL")
+    wait_check(f"{target_name} TEMP{temp_number} > 50.0")
+```
+
+</TabItem>
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
@@ -685,15 +700,6 @@ def example(target_name, temp_number)
   cmd("#{target_name} COLLECT with TYPE NORMAL")
   wait_check("#{target_name} TEMP#{temp_number} > 50.0")
 end
-```
-
-</TabItem>
-<TabItem value="python" label="Python">
-
-```python
-def example(target_name, temp_number):
-    cmd(f"{target_name} COLLECT with TYPE NORMAL")
-    wait_check(f"{target_name} TEMP{temp_number} > 50.0")
 ```
 
 </TabItem>
@@ -706,20 +712,6 @@ This can also be useful when looping through a numbered set of telemetry points 
 The COSMOS wait_check_expression (and check_expression) allow you to perform more complicated checks and still stop the script with a CHECK error message if something goes wrong. For example, you can check variables against each other or check a telemetry point against a range. The exact string of text passed to wait_check_expression is repeatedly evaluated until it passes, or a timeout occurs. It is important to not use string interpolation within the actual expression or the values inside of the string interpolation syntax will only be evaluated once when it is converted into a string.
 
 <Tabs groupId="script-language">
-<TabItem value="ruby" label="Ruby">
-
-```ruby
-one = 1
-two = 2
-
-wait_check_expression("one == two", 1)
-# ERROR: CHECK: one == two is FALSE after waiting 1.017035 seconds
-
-# Checking an integer range
-wait_check_expression("one > 0 and one < 10 # init value one = #{one}", 1)
-```
-
-</TabItem>
 <TabItem value="python" label="Python">
 
 ```python
@@ -734,13 +726,73 @@ wait_check_expression("one > 0 and one < 10", 1, 0.25, locals())
 ```
 
 </TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```ruby
+one = 1
+two = 2
+
+wait_check_expression("one == two", 1)
+# ERROR: CHECK: one == two is FALSE after waiting 1.017035 seconds
+
+# Checking an integer range
+wait_check_expression("one > 0 and one < 10 # init value one = #{one}", 1)
+```
+
+</TabItem>
 </Tabs>
 
-### COSMOS Scripting Differences from Regular Ruby Scripting
+### COSMOS Scripting Insrumentation Pitfalls and Differences from Regular Ruby Scripting
 
-#### Do not use single line if statements
+COSMOS scripting instruments each line to catch exceptions if things go wrong, but this instrumentation cannot be done for the evaluation of `if` expressions. This means that if you had the following example code, the error would not be caught by COSMOS instrumentation, and associated features such as "Pause on Error" will not work.
 
-COSMOS scripting instruments each line to catch exceptions if things go wrong. With single line if statements the exception handling doesn't know which part of the statement failed and cannot properly continue. If an exception is raised in a single line if statement, then the entire script will stop and not be able to continue. Do not use single line if statements in COSMOS scripts. (However, they are fine to use in interfaces and other Ruby code, just not COSMOS scripts).
+<Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+if tlm("malformed-target-packet-item"): # tlm() throws a RuntimeError inside the `if` expression
+  print("hello")
+```
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```ruby
+if tlm("malformed-target-packet-item") # tlm() throws a RuntimeError inside the `if` expression
+  puts "hello"
+end
+```
+
+</TabItem>
+</Tabs>
+
+A recommended approach to avoid this is to not execute any code that could fail in an if statement. To fix the above example, you could instead write the code like this:
+
+<Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+tlm_result = tlm("malformed-target-packet-item") # tlm() throws a RuntimeError which is caught by instrumentation
+if tlm_result:
+  print("hello")
+```
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```ruby
+tlm_result = tlm("malformed-target-packet-item") # tlm() throws a RuntimeError which is caught by instrumentation
+if tlm_result
+  puts "hello"
+end
+```
+
+</TabItem>
+</Tabs>
+
+#### Do not use single line if statements in Ruby
+
+Ruby's single line `if` statements add another layer to this instrumentation pitfall. Here, the exception handling doesn't know which part of the compound statement failed. If an exception is raised in a single line if statement, then the entire script will stop and not be able to continue. Do not use single line if statements in COSMOS scripts. (However, they are fine to use in interfaces and other Ruby code, just not COSMOS scripts).
 
 Don't do this:
 
@@ -755,7 +807,9 @@ Do this instead:
 # tlm() could fail if the CmdTlmServer was not running or a mnemonic
 # was misspelled
 temp1 = tlm("INST HEALTH_STATUS TEMP1")
-if temp1 > 10.0
+# temp1 > 10.0 could fail if temp1 is nil
+temp1_is_above_threshold = temp1 > 10.0
+if temp1_is_above_threshold
   run_method()
 end
 ```
@@ -844,21 +898,21 @@ end
 For many COSMOS APIs, they can be imported from either the API or Script library, like the following:
 
 <Tabs groupId="script-language">
-<TabItem value="ruby" label="Ruby">
-
-```ruby
-require 'openc3/api/api'
-# or
-require 'openc3/script'
-```
-
-</TabItem>
 <TabItem value="python" label="Python">
 
 ```python
 from openc3.api import *
 # or
 from openc3.script import *
+```
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```ruby
+require 'openc3/api/api'
+# or
+require 'openc3/script'
 ```
 
 </TabItem>

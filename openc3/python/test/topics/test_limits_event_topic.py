@@ -9,6 +9,7 @@
 # This file may also be used under the terms of a commercial license
 # if purchased from OpenC3, Inc.
 
+import json
 import unittest
 from unittest.mock import *
 
@@ -44,6 +45,47 @@ class TestLimitsEventTopic(unittest.TestCase):
         self.assertEqual(out[0][1], "PKT")
         self.assertEqual(out[0][2], "ITEM")
         self.assertEqual(out[0][3], "YELLOW_LOW")
+
+    def test_skips_current_limits_update_when_event_has_suppress_stored_true(self):
+        event = {
+            "type": "LIMITS_CHANGE",
+            "target_name": "TGT",
+            "packet_name": "PKT",
+            "item_name": "ITEM",
+            "old_limits_state": "GREEN",
+            "new_limits_state": "RED_HIGH",
+            "time_nsec": 123456789,
+            "message": "stored change",
+            "suppress_stored": True,
+        }
+        LimitsEventTopic.write(event, scope="DEFAULT")
+
+        # Event is still written to the stream
+        events = LimitsEventTopic.read(scope="DEFAULT")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][1]["type"], "LIMITS_CHANGE")
+        self.assertTrue(events[0][1]["suppress_stored"])
+
+        # But current_limits hash is NOT updated
+        out = LimitsEventTopic.out_of_limits(scope="DEFAULT")
+        self.assertEqual(len(out), 0)
+
+    def test_updates_current_limits_when_event_has_no_suppress_stored_flag(self):
+        event = {
+            "type": "LIMITS_CHANGE",
+            "target_name": "TGT",
+            "packet_name": "PKT",
+            "item_name": "ITEM",
+            "old_limits_state": "GREEN",
+            "new_limits_state": "RED_HIGH",
+            "time_nsec": 123456789,
+            "message": "realtime change",
+        }
+        LimitsEventTopic.write(event, scope="DEFAULT")
+
+        out = LimitsEventTopic.out_of_limits(scope="DEFAULT")
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0][3], "RED_HIGH")
 
     def test_writes_and_reads_limits_settings_events(self):
         event = {
@@ -103,6 +145,25 @@ class TestLimitsEventTopic(unittest.TestCase):
         self.assertEqual(events[1][1]["green_high"], 10.0)
         self.assertEqual(events[1][1]["persistence"], 5)
         self.assertEqual(events[1][1]["enabled"], True)
+
+    def test_stores_zero_green_limits_in_current_limits_settings(self):
+        event = {
+            "type": "LIMITS_SETTINGS",
+            "limits_set": "CUSTOM",
+            "target_name": "TGT1",
+            "packet_name": "PKT1",
+            "item_name": "ITEM1",
+            "red_low": -4.0,
+            "yellow_low": -3.0,
+            "yellow_high": 2.0,
+            "red_high": 3.0,
+            "green_low": 0.0,
+            "green_high": 1.0,
+        }
+        LimitsEventTopic.write(event, scope="DEFAULT")
+        settings = json.loads(Store.hget("DEFAULT__current_limits_settings", "TGT1__PKT1__ITEM1"))
+        self.assertEqual(settings["CUSTOM"]["green_low"], 0.0)
+        self.assertEqual(settings["CUSTOM"]["green_high"], 1.0)
 
     def test_writes_and_reads_limits_event_state(self):
         event = {
@@ -175,7 +236,7 @@ class TestLimitsEventTopic(unittest.TestCase):
         self.assertEqual(sets["DEFAULT"], "false")
 
     def test_raise_limits_set_when_set_does_not_exist(self):
-        with self.assertRaisesRegex(RuntimeError, "Set 'BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Limits set 'BLAH' does not exist"):
             event = {"type": "LIMITS_SET", "set": "BLAH", "message": "Limits Set"}
             LimitsEventTopic.write(event, scope="DEFAULT")
 

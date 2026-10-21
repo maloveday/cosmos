@@ -26,6 +26,7 @@ from openc3.models.interface_model import InterfaceModel
 from openc3.models.microservice_model import MicroserviceModel
 from openc3.topics.telemetry_decom_topic import TelemetryDecomTopic
 from openc3.topics.telemetry_topic import TelemetryTopic
+from openc3.utilities.questdb_client import TlmItem
 from openc3.utilities.time import formatted
 from test.test_helper import System, mock_redis, setup_system
 
@@ -211,14 +212,24 @@ class TestTlmApi(unittest.TestCase):
         self.dm_thread.start()
         packet = System.telemetry.packet("INST", "HEALTH_STATUS")
         TelemetryTopic.write_packet(packet, scope="DEFAULT")
-        time.sleep(0.001)
+        # Wait until the microservice run loop has actually started and decommed
+        # the packet just written (count increments) before returning. A fixed
+        # 0.001s sleep was racy: callers immediately call inject_tlm, which writes
+        # to the DECOMINTERFACE topic and waits up to 5s for an ack -- if the run
+        # loop had not started reading yet on a loaded CI runner the ack could be
+        # delayed past that timeout. It also makes RECEIVED_COUNT deterministic:
+        # a late decom of this packet could otherwise overwrite the count after
+        # an inject_tlm had already bumped it.
+        start = time.time()
+        while self.dm.count < 1 and (time.time() - start) < 5:
+            time.sleep(0.001)
 
     def test_inject_tlm_complains_about_non_existant_targets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'BLAH HEALTH_STATUS' does not exist"):
             inject_tlm("BLAH", "HEALTH_STATUS")
 
     def test_inject_tlm_complains_about_non_existant_packets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'INST BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'INST BLAH' does not exist"):
             inject_tlm("INST", "BLAH")
 
     def test_inject_tlm_complains_about_non_existant_items(self):
@@ -240,40 +251,71 @@ class TestTlmApi(unittest.TestCase):
         )
         model.create()
         inject_tlm("INST", "HEALTH_STATUS", {"TEMP1": 5})
-        time.sleep(0.5)
+        time.sleep(0.1)
         obj.inject_tlm.assert_called_once()
 
     @patch("openc3.microservices.microservice.System")
     def test_inject_tlm_injects_a_packet_into_target_without_an_interface(self, mock_system):
         self.decom_stuff()
-        # Case doesn't matter
-        inject_tlm("inst", "Health_Status", {"temp1": 10, "Temp2": 20}, type="CONVERTED")
-        time.sleep(0.5)
-        self.assertAlmostEqual(tlm("INST HEALTH_STATUS TEMP1"), 10.0, delta=0.1)
-        self.assertAlmostEqual(tlm("INST HEALTH_STATUS TEMP2"), 20.0, delta=0.1)
+        try:
+            # Case doesn't matter
+            inject_tlm("inst", "Health_Status", {"temp1": 10, "Temp2": 20}, type="CONVERTED")
+            time.sleep(0.1)
+            self.assertAlmostEqual(tlm("INST HEALTH_STATUS TEMP1"), 10.0, delta=0.1)
+            self.assertAlmostEqual(tlm("INST HEALTH_STATUS TEMP2"), 20.0, delta=0.1)
 
-        inject_tlm("INST", "HEALTH_STATUS", {"TEMP1": 0, "TEMP2": 0}, type="RAW")
-        time.sleep(0.5)
-        self.assertEqual(tlm("INST HEALTH_STATUS TEMP1"), (-100.0))
-        self.assertEqual(tlm("INST HEALTH_STATUS TEMP2"), (-100.0))
-
-        self.dm.shutdown()
+            inject_tlm("INST", "HEALTH_STATUS", {"TEMP1": 0, "TEMP2": 0}, type="RAW")
+            time.sleep(0.1)
+            self.assertEqual(tlm("INST HEALTH_STATUS TEMP1"), (-100.0))
+            self.assertEqual(tlm("INST HEALTH_STATUS TEMP2"), (-100.0))
+        finally:
+            self.dm.shutdown()
 
     @patch("openc3.microservices.microservice.System")
     def test_inject_tlm_bumps_the_received_count(self, mock_system):
         self.decom_stuff()
+        try:
+            inject_tlm("INST", "HEALTH_STATUS")
+            time.sleep(0.1)
+            self.assertEqual(tlm("INST HEALTH_STATUS RECEIVED_COUNT"), 1)
+            inject_tlm("INST", "HEALTH_STATUS")
+            time.sleep(0.1)
+            self.assertEqual(tlm("INST HEALTH_STATUS RECEIVED_COUNT"), 2)
+            inject_tlm("INST", "HEALTH_STATUS")
+            time.sleep(0.1)
+            self.assertEqual(tlm("INST HEALTH_STATUS RECEIVED_COUNT"), 3)
+        finally:
+            self.dm.shutdown()
 
-        inject_tlm("INST", "HEALTH_STATUS")
-        time.sleep(0.5)
-        self.assertEqual(tlm("INST HEALTH_STATUS RECEIVED_COUNT"), 1)
-        inject_tlm("INST", "HEALTH_STATUS")
-        time.sleep(0.5)
-        self.assertEqual(tlm("INST HEALTH_STATUS RECEIVED_COUNT"), 2)
-        inject_tlm("INST", "HEALTH_STATUS")
-        time.sleep(0.5)
-        self.assertEqual(tlm("INST HEALTH_STATUS RECEIVED_COUNT"), 3)
+    @patch("openc3.microservices.microservice.System")
+    def test_inject_tlm_raises_error_for_derived_item_without_write_conversion(self, mock_system):
+        self.decom_stuff()
+        try:
+            with self.assertRaises(RuntimeError) as context:
+                inject_tlm("INST", "HEALTH_STATUS", {"RECEIVED_TIMESECONDS": 123.0})
+            self.assertIsInstance(context.exception.args[0], str)
+            self.assertIn("Cannot write DERIVED item", context.exception.args[0])
+        finally:
+            self.dm.shutdown()
 
-        self.dm.shutdown()
+    @patch("openc3.microservices.microservice.System")
+    def test_inject_tlm_does_not_update_cvt_when_stored_is_true(self, mock_system):
+        self.decom_stuff()
+        try:
+            inject_tlm("INST", "HEALTH_STATUS", {"TEMP1": 50}, type="CONVERTED")
+            time.sleep(0.1)
+            self.assertAlmostEqual(tlm("INST HEALTH_STATUS TEMP1"), 50.0, delta=0.1)
+
+            inject_tlm("INST", "HEALTH_STATUS", {"TEMP1": 99}, type="CONVERTED", stored=True)
+            time.sleep(0.1)
+            # CVT should still have the old value since stored packets don't update CVT
+            self.assertAlmostEqual(tlm("INST HEALTH_STATUS TEMP1"), 50.0, delta=0.1)
+
+            inject_tlm("INST", "HEALTH_STATUS", {"TEMP1": 99}, type="CONVERTED", stored=False)
+            time.sleep(0.1)
+            self.assertAlmostEqual(tlm("INST HEALTH_STATUS TEMP1"), 99.0, delta=0.1)
+        finally:
+            self.dm.shutdown()
 
     # override_tlm
     def test_overrides_complains_about_unknown_targets_packets_and_parameters(self):
@@ -487,7 +529,7 @@ class TestTlmApi(unittest.TestCase):
 
     # get_all_tlm
     def test_get_all_tlm_raises_if_the_target_does_not_exist(self):
-        with self.assertRaisesRegex(RuntimeError, "Target 'BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, r"Target 'BLAH' does not exist.*\(TargetModel\)"):
             get_all_tlm("BLAH", scope="DEFAULT")
 
     def test_get_all_tlm_returns_an_array_of_all_packet_hashes(self):
@@ -547,9 +589,9 @@ class TestTlmApi(unittest.TestCase):
 
     # get_tlm
     def test_get_tlm_raises_if_the_target_or_packet_do_not_exist(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'BLAH HEALTH_STATUS' does not exist"):
             get_tlm("BLAH", "HEALTH_STATUS", scope="DEFAULT")
-        with self.assertRaisesRegex(RuntimeError, "Packet 'INST BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'INST BLAH' does not exist"):
             get_tlm("INST BLAH", scope="DEFAULT")
 
     def test_get_tlm_returns_a_packet_hash(self):
@@ -562,11 +604,11 @@ class TestTlmApi(unittest.TestCase):
 
     # get_item
     def test_get_item_raises_if_the_target_or_packet_or_item_do_not_exist(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'BLAH HEALTH_STATUS' does not exist"):
             get_item("BLAH", "HEALTH_STATUS", "CCSDSVER", scope="DEFAULT")
-        with self.assertRaisesRegex(RuntimeError, "Packet 'INST BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'INST BLAH' does not exist"):
             get_item("INST BLAH CCSDSVER", scope="DEFAULT")
-        with self.assertRaisesRegex(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, r"Item 'INST HEALTH_STATUS BLAH' does not exist \(TargetModel\)"):
             get_item("INST", "HEALTH_STATUS", "BLAH", scope="DEFAULT")
         with self.assertRaisesRegex(RuntimeError, "ERROR: Target name, packet name and item name required."):
             get_item("INST HEALTH_STATUS", scope="DEFAULT")
@@ -602,15 +644,15 @@ class TestTlmApi(unittest.TestCase):
 
     # get_tlm_packet
     def test_complains_about_non_existant_targets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'BLAH HEALTH_STATUS' does not exist"):
             get_tlm_packet("BLAH", "HEALTH_STATUS")
 
     def test_complains_about_non_existant_packets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'INST BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'INST BLAH' does not exist"):
             get_tlm_packet("INST BLAH")
 
     def test_complains_using_latest(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'INST LATEST' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'INST LATEST' does not exist"):
             get_tlm_packet("INST", "LATEST")
 
     def test_complains_about_non_existant_value_types(self):
@@ -741,15 +783,15 @@ class TestTlmApi(unittest.TestCase):
 
     # get_tlm_values
     def test_get_tlm_values_complains_about_non_existant_targets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'BLAH HEALTH_STATUS' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet 'BLAH HEALTH_STATUS' has no current values in CVT"):
             get_tlm_values(["BLAH__HEALTH_STATUS__TEMP1__CONVERTED"])
 
     def test_get_tlm_values_complains_about_non_existant_packets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'INST BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet 'INST BLAH' has no current values in CVT"):
             get_tlm_values(["INST__BLAH__TEMP1__CONVERTED"])
 
     def test_get_tlm_values_complains_about_non_existant_items(self):
-        with self.assertRaisesRegex(RuntimeError, "Item 'INST HEALTH_STATUS BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, r"Item 'INST HEALTH_STATUS BLAH' does not exist \(get_tlm_values\)"):
             get_tlm_values(["INST__HEALTH_STATUS__BLAH__CONVERTED"])
         with self.assertRaisesRegex(RuntimeError, "Item 'INST LATEST BLAH' does not exist for scope: DEFAULT"):
             get_tlm_values(["INST__LATEST__BLAH__CONVERTED"])
@@ -765,6 +807,75 @@ class TestTlmApi(unittest.TestCase):
             get_tlm_values([["INST", "HEALTH_STATUS", "TEMP1"]])
         with self.assertRaisesRegex(ValueError, "items must be formatted"):
             get_tlm_values(["INST", "HEALTH_STATUS", "TEMP1"])
+        with self.assertRaisesRegex(ValueError, "items must be formatted"):
+            get_tlm_values(["INST__HEALTH_STATUS__TEMP1__CONVERTED__LIMITS__EXTRA"])
+
+    def test_get_tlm_values_historical_passes_the_limits_flag_to_the_tsdb_lookup(self):
+        # get_tlm_available tacks on __LIMITS which must be accepted and passed along
+        items = [
+            "INST__HEALTH_STATUS__TEMP1__CONVERTED",
+            "INST__HEALTH_STATUS__TEMP2__CONVERTED__LIMITS",
+        ]
+        with patch("openc3.models.cvt_model.QuestDBClient.tsdb_lookup") as tsdb_lookup:
+            tsdb_lookup.return_value = [[[0.0, None], [(-100.0), "RED_LOW"]]]
+            vals = get_tlm_values(items, start_time="2026-09-13T00:00:00Z", end_time="2026-09-13T01:00:00Z")
+        self.assertEqual(vals, [[[0.0, None], [(-100.0), "RED_LOW"]]])
+        lookup_items = tsdb_lookup.call_args[0][0]
+        self.assertEqual(lookup_items[0], TlmItem("INST", "HEALTH_STATUS", "TEMP1", "CONVERTED", None))
+        self.assertEqual(lookup_items[1], TlmItem("INST", "HEALTH_STATUS", "TEMP2", "CONVERTED", "LIMITS"))
+        self.assertEqual(lookup_items[1].limits, "LIMITS")
+        self.assertEqual(tsdb_lookup.call_args.kwargs["scope"], "DEFAULT")
+
+    def test_get_tlm_values_historical_passes_the_scope_to_the_tsdb_lookup(self):
+        with patch("openc3.models.cvt_model.QuestDBClient.tsdb_lookup") as tsdb_lookup:
+            tsdb_lookup.return_value = [[0.0, None]]
+            with patch("openc3.api.tlm_api.authorize"):
+                get_tlm_values(
+                    ["INST__HEALTH_STATUS__TEMP1__CONVERTED"], start_time="2026-09-13T00:00:00Z", scope="OTHER"
+                )
+        self.assertEqual(tsdb_lookup.call_args.kwargs["scope"], "OTHER")
+
+    def test_get_tlm_values_accepts_the_limits_suffix_from_the_cvt(self):
+        vals = get_tlm_values(["INST__HEALTH_STATUS__TEMP1__CONVERTED__LIMITS"])
+        self.assertEqual(vals[0][0], (-100.0))
+        self.assertEqual(vals[0][1], "RED_LOW")
+
+    def test_get_tlm_values_returns_none_for_items_which_do_not_exist(self):
+        # get_tlm_available returns None for an item which doesn't exist
+        vals = get_tlm_values([None, "INST__HEALTH_STATUS__TEMP1__CONVERTED", None])
+        self.assertEqual(vals[0], [None, None])
+        self.assertEqual(vals[1][0], (-100.0))
+        self.assertEqual(vals[1][1], "RED_LOW")
+        self.assertEqual(vals[2], [None, None])
+
+    def test_get_tlm_values_takes_the_get_tlm_available_result_directly(self):
+        items = [
+            "INST__HEALTH_STATUS__TEMP1__CONVERTED",
+            "INST__HEALTH_STATUS__BLAH__CONVERTED",
+        ]
+        available = get_tlm_available(items)
+        self.assertEqual(available[0], "INST__HEALTH_STATUS__TEMP1__CONVERTED__LIMITS")
+        self.assertIsNone(available[1])
+        vals = get_tlm_values(available)
+        self.assertEqual(vals[0][0], (-100.0))
+        self.assertEqual(vals[0][1], "RED_LOW")
+        self.assertEqual(vals[1], [None, None])
+
+    def test_get_tlm_values_historical_returns_nones_when_no_item_exists(self):
+        # Nothing to query, so this doesn't need (or touch) the time series database
+        vals = get_tlm_values([None, None], start_time="2026-09-13T00:00:00Z", end_time="2026-09-13T01:00:00Z")
+        self.assertEqual(vals, [[None, None], [None, None]])
+
+    def test_get_tlm_values_historical_passes_a_placeholder_for_items_which_do_not_exist(self):
+        with patch("openc3.models.cvt_model.QuestDBClient.tsdb_lookup") as tsdb_lookup:
+            tsdb_lookup.return_value = [[[0.0, None], [None, None]]]
+            get_tlm_values(
+                ["INST__HEALTH_STATUS__TEMP1__CONVERTED", None],
+                start_time="2026-09-13T00:00:00Z",
+                end_time="2026-09-13T01:00:00Z",
+            )
+        lookup_items = tsdb_lookup.call_args[0][0]
+        self.assertEqual(lookup_items[1], TlmItem(None, None, None, None, None))
 
     def test_get_tlm_values_reads_all_the_specified_items(self):
         items = []
@@ -1062,11 +1173,11 @@ class TestTlmApi(unittest.TestCase):
                     raise RuntimeError("Found too many packets")
 
     def test_get_tlm_cnt_complains_about_non_existant_targets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'BLAH ABORT' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'BLAH ABORT' does not exist"):
             get_tlm_cnt("BLAH", "ABORT")
 
     def test_get_tlm_cnt_complains_about_non_existant_packets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'INST BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'INST BLAH' does not exist"):
             get_tlm_cnt("INST", "BLAH")
 
     def test_get_tlm_cnt_complains_about_missing_packet(self):
@@ -1097,11 +1208,11 @@ class TestTlmApi(unittest.TestCase):
         self.assertEqual(cnts, ([result]))
 
     def test_get_packet_derived_items_complains_about_non_existant_targets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'BLAH ABORT' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'BLAH ABORT' does not exist"):
             get_packet_derived_items("BLAH", "ABORT")
 
     def test_get_packet_derived_items_complains_about_non_existant_packets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'INST BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet definition 'INST BLAH' does not exist"):
             get_packet_derived_items("INST", "BLAH")
 
     def test_get_packet_derived_items_returns_the_packet_derived_items(self):

@@ -20,27 +20,16 @@ require 'hiredis-client'
 require 'json'
 require 'connection_pool'
 
-if ENV['OPENC3_REDIS_CLUSTER']
-  require 'openc3-enterprise/utilities/store'
-  $openc3_redis_cluster = true
-else
-  $openc3_redis_cluster = false
-end
-
 module OpenC3
   class StoreConnectionPool < ConnectionPool
     def pipelined
-      if $openc3_redis_cluster
-        yield # TODO: Update keys to support pipelining in cluster
-      else
-        with do |redis|
-          redis.pipelined do |pipeline|
-            Thread.current[:pipeline] = pipeline
-            begin
-              yield
-            ensure
-              Thread.current[:pipeline] = nil
-            end
+      with do |redis|
+        redis.pipelined do |pipeline|
+          Thread.current[:pipeline] = pipeline
+          begin
+            yield
+          ensure
+            Thread.current[:pipeline] = nil
           end
         end
       end
@@ -57,8 +46,21 @@ module OpenC3
   end
 
   class Store
-    # Variable that holds the singleton instance
-    @instance = nil
+    # Variable that holds the singleton instances per db_shard
+    @instances = []
+
+    # DB_Shard cache: { "scope__target_name" => [db_shard_number, Time] }
+    @@db_shard_cache = {}
+    @@db_shard_cache_mutex = Mutex.new
+    DB_SHARD_CACHE_TIMEOUT = 60 # seconds
+
+    # Maximum number of entries read_topics returns PER STREAM when the caller
+    # does not pass a count. XREAD without COUNT returns everything from the
+    # offset to the tail of the stream, which for a consumer that has fallen
+    # behind on a high-rate stream can be an enormous reply materialized in
+    # memory all at once. Callers loop on their offsets so a capped read simply
+    # continues on the next call.
+    READ_TOPICS_DEFAULT_COUNT = 1000
 
     # Mutex used to ensure that only one instance is created
     @@instance_mutex = Mutex.new
@@ -66,14 +68,48 @@ module OpenC3
     attr_reader :redis_url
     attr_reader :redis_pool
 
+    # Look up the db_shard number for a target with a 1-minute cache.
+    # Reads directly from Redis db_shard 0 to avoid circular deps with TargetModel.
+    # Non-target-specific data (nil target_name) always returns db_shard 0.
+    def self.db_shard_for_target(target_name, scope: "DEFAULT")
+      return 0 unless target_name
+
+      cache_key = "#{scope}__#{target_name}"
+      now = Time.now
+
+      @@db_shard_cache_mutex.synchronize do
+        cached = @@db_shard_cache[cache_key]
+        if cached
+          db_shard, cached_at = cached
+          return db_shard if (now - cached_at) < DB_SHARD_CACHE_TIMEOUT
+        end
+      end
+
+      begin
+        json = Store.instance(db_shard: 0).hget("#{scope}__openc3_targets", target_name)
+        db_shard = json ? JSON.parse(json)['db_shard'].to_i : 0
+      rescue
+        db_shard = 0
+      end
+
+      @@db_shard_cache_mutex.synchronize do
+        @@db_shard_cache[cache_key] = [db_shard, now]
+      end
+
+      db_shard
+    end
+
     # Get the singleton instance
-    def self.instance(pool_size = 100)
+    def self.instance(pool_size = 100, db_shard: 0)
       # Logger.level = Logger::DEBUG
-      return @instance if @instance
+      @instances ||= []
+      the_instance = @instances[db_shard]
+      return the_instance if the_instance
 
       @@instance_mutex.synchronize do
-        @instance ||= self.new(pool_size)
-        return @instance
+        @instances ||= []
+        @instances[db_shard] ||= self.new(pool_size, db_shard: db_shard)
+        return @instances[db_shard]
       end
     end
 
@@ -87,16 +123,53 @@ module OpenC3
       @redis_pool.with { |redis| redis.public_send(message, *args, **kwargs, &block) }
     end
 
-    def initialize(pool_size = 10)
-      @redis_username = ENV['OPENC3_REDIS_USERNAME']
-      @redis_key = ENV['OPENC3_REDIS_PASSWORD']
-      @redis_url = "redis://#{ENV['OPENC3_REDIS_HOSTNAME']}:#{ENV['OPENC3_REDIS_PORT']}"
+    def initialize(pool_size = 10, db_shard: 0)
+      @redis_username = ENV.fetch('OPENC3_REDIS_USERNAME', nil)
+      @redis_key = ENV.fetch('OPENC3_REDIS_PASSWORD', nil)
+      hostname = ENV['OPENC3_REDIS_HOSTNAME'].to_s.gsub("SHARDNUM", db_shard.to_s)
+      @redis_url = "redis://#{hostname}:#{ENV.fetch('OPENC3_REDIS_PORT', 6379)}"
       @redis_pool = StoreConnectionPool.new(size: pool_size) { build_redis() }
     end
 
-    unless $openc3_redis_cluster
-      def build_redis
-        return Redis.new(url: @redis_url, username: @redis_username, password: @redis_key)
+    # cap/base for the equal-jitter reconnect backoff (seconds)
+    REDIS_BACKOFF_CAP = 5.0
+    REDIS_BACKOFF_BASE = 0.625
+
+    def build_redis
+      # reconnect_attempts retries the connection a few times with equal-jitter
+      # backoff so a transient network blip is handled inside the client instead
+      # of immediately surfacing a connection error to callers. The jitter
+      # de-syncs many clients retrying the same blip to avoid a thundering herd
+      # on recovery.
+      #
+      # This mirrors the Python store's Retry(EqualJitterBackoff(cap: 5, base:
+      # 0.625), 3): per-retry backoff tops out at 5s on the final (3rd) retry
+      # (~0.6-1.25s, ~1.25-2.5s, ~2.5-5s). redis-rb takes a fixed Array of delays
+      # (no per-failure backoff callable), so we sample the jittered delays once
+      # per connection here.
+      # Connection, read, and write timeouts are left as the default: 1s
+      return Redis.new(
+        url: @redis_url,
+        username: @redis_username,
+        password: @redis_key,
+        reconnect_attempts: reconnect_backoff_delays()
+      )
+    end
+
+    # Equal-jitter backoff delays for 3 retries, matching Python's
+    # EqualJitterBackoff. Each retry's delay is randomized within the upper half
+    # of an exponentially-growing ceiling.
+    def reconnect_backoff_delays
+      (1..3).map do |failures|
+        # ceiling = exponential growth (base doubles each retry), clamped to cap.
+        # For base=0.625, cap=5: failures 1,2,3 -> 1.25, 2.5, 5.0 seconds.
+        # temp = half the ceiling: the guaranteed minimum wait for this retry.
+        temp = [REDIS_BACKOFF_CAP, REDIS_BACKOFF_BASE * (2 ** failures)].min / 2.0
+        # Final delay = fixed half (temp) + random half (rand*temp, in [0, temp)),
+        # i.e. a value uniformly in [temp, 2*temp) = [ceiling/2, ceiling).
+        # The fixed half keeps a sane floor; the random half de-syncs clients so
+        # they don't all reconnect in lockstep (thundering herd) after a blip.
+        temp + rand * temp
       end
     end
 
@@ -160,30 +233,30 @@ module OpenC3
       return offsets
     end
 
-    unless $openc3_redis_cluster
-      def read_topics(topics, offsets = nil, timeout_ms = 1000, count = nil)
-        return {} if topics.empty?
-        Thread.current[:topic_offsets] ||= {}
-        topic_offsets = Thread.current[:topic_offsets]
-        begin
-          # Logger.debug "read_topics: #{topics}, #{offsets} pool:#{@redis_pool}"
-          @redis_pool.with do |redis|
-            offsets = update_topic_offsets(topics) unless offsets
-            result = redis.xread(topics, offsets, block: timeout_ms, count: count)
-            if result and result.length > 0
-              result.each do |topic, messages|
-                messages.each do |msg_id, msg_hash|
-                  topic_offsets[topic] = msg_id
-                  yield topic, msg_id, msg_hash, redis if block_given?
-                end
+    # @param count [Integer] Maximum entries to return per stream. nil uses READ_TOPICS_DEFAULT_COUNT.
+    def read_topics(topics, offsets = nil, timeout_ms = 1000, count = nil)
+      return {} if topics.empty?
+      count ||= READ_TOPICS_DEFAULT_COUNT
+      Thread.current[:topic_offsets] ||= {}
+      topic_offsets = Thread.current[:topic_offsets]
+      begin
+        # Logger.debug "read_topics: #{topics}, #{offsets} pool:#{@redis_pool}"
+        @redis_pool.with do |redis|
+          offsets = update_topic_offsets(topics) unless offsets
+          result = redis.xread(topics, offsets, block: timeout_ms, count: count)
+          if result and result.length > 0
+            result.each do |topic, messages|
+              messages.each do |msg_id, msg_hash|
+                topic_offsets[topic] = msg_id
+                yield topic, msg_id, msg_hash, redis if block_given?
               end
             end
-            # Logger.debug "result:#{result}" if result and result.length > 0
-            return result
           end
-        rescue Redis::TimeoutError
-          return {} # Should return an empty hash not array - xread returns a hash
+          # Logger.debug "result:#{result}" if result and result.length > 0
+          return result
         end
+      rescue Redis::TimeoutError
+        return {} # Should return an empty hash not array - xread returns a hash
       end
     end
 
@@ -233,9 +306,10 @@ module OpenC3
   end
 
   class EphemeralStore < Store
-    def initialize(pool_size = 10)
+    def initialize(pool_size = 10, db_shard: 0)
       super(pool_size)
-      @redis_url = "redis://#{ENV['OPENC3_REDIS_EPHEMERAL_HOSTNAME']}:#{ENV['OPENC3_REDIS_EPHEMERAL_PORT']}"
+      hostname = ENV['OPENC3_REDIS_EPHEMERAL_HOSTNAME'].to_s.gsub("SHARDNUM", db_shard.to_s)
+      @redis_url = "redis://#{hostname}:#{ENV.fetch('OPENC3_REDIS_EPHEMERAL_PORT', 6380)}"
       @redis_pool = StoreConnectionPool.new(size: pool_size) { build_redis() }
     end
   end

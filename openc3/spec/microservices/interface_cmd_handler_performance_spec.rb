@@ -26,13 +26,13 @@ require 'benchmark'
 if ENV['PROFILE']
   begin
     require 'ruby-prof'
-    PROFILE_AVAILABLE = true
+    $PROFILE_AVAILABLE = true
   rescue LoadError
     puts "Warning: ruby-prof not available"
-    PROFILE_AVAILABLE = false
+    $PROFILE_AVAILABLE = false
   end
 else
-  PROFILE_AVAILABLE = false
+  $PROFILE_AVAILABLE = false
 end
 
 require 'openc3/interfaces/interface'
@@ -84,7 +84,7 @@ RSpec.describe OpenC3::InterfaceCmdHandlerThread, if: ENV['PERFORMANCE'] do
   end
 
   before(:all) do
-    @original_no_simplecov = ENV['OPENC3_NO_SIMPLECOV']
+    @original_no_simplecov = ENV.fetch('OPENC3_NO_SIMPLECOV', nil)
     ENV['OPENC3_NO_SIMPLECOV'] = 'true'
   end
 
@@ -542,7 +542,7 @@ RSpec.describe OpenC3::InterfaceCmdHandlerThread, if: ENV['PERFORMANCE'] do
     end
   end
 
-  describe "profiling", if: PROFILE_AVAILABLE do
+  describe "profiling", if: $PROFILE_AVAILABLE do
     let(:profile_iterations) { (ENV['PROFILE_ITERATIONS'] || 1000).to_i }
 
     it "profiles CommandDecomTopic.write_packet" do

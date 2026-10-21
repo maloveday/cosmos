@@ -10,6 +10,7 @@
 # if purchased from OpenC3, Inc.
 
 import contextlib
+import json
 import re
 import threading
 import time
@@ -27,7 +28,8 @@ from openc3.system.system import System
 from openc3.topics.limits_event_topic import LimitsEventTopic
 from openc3.topics.telemetry_topic import TelemetryTopic
 from openc3.topics.topic import Topic
-from test.test_helper import capture_io, mock_redis, setup_system
+from openc3.utilities.store import Store
+from test.test_helper import capture_io, mock_redis, setup_system, wait_for_first_topic_read
 
 
 class TestDecomMicroservice(unittest.TestCase):
@@ -73,7 +75,7 @@ class TestDecomMicroservice(unittest.TestCase):
         self.dm = DecomMicroservice("DEFAULT__DECOM__INST_INT")
         self.dm_thread = threading.Thread(target=self.dm.run)
         self.dm_thread.start()
-        time.sleep(0.01)  # Allow the thread to start
+        wait_for_first_topic_read(redis, self.dm_thread)  # Allow the thread to start reading
 
     def tearDown(self):
         self.dm.shutdown()
@@ -193,6 +195,75 @@ class TestDecomMicroservice(unittest.TestCase):
             events[2][1]["message"],
         )
 
+    def test_limits_change_with_zero_value_is_not_disabled(self):
+        """A telemetry value of 0 must report a limits change, not 'is disabled'."""
+        packet = System.telemetry.packet("INST", "HEALTH_STATUS")
+        packet.received_time = datetime.now(timezone.utc)
+        item = packet.get_item("TEMP1")
+        item.limits.state = "BLUE"
+
+        # Call the callback directly with value=0
+        for stdout in capture_io():
+            self.dm.limits_change_callback(packet, item, "RED_LOW", 0, True)
+            output = stdout.getvalue()
+            # Value of 0 must NOT be treated as disabled
+            self.assertNotIn("is disabled", output)
+            # Should report the actual value and limits state
+            self.assertIn("INST HEALTH_STATUS TEMP1 = 0 is BLUE", output)
+
+    @patch("openc3.microservices.decom_microservice.System.limits_set")
+    def test_falls_back_to_default_limits_set_when_selected_set_is_not_defined(self, mock_limits_set):
+        """When the system limits set (e.g. TVAC) is not defined for an item,
+        the limits_change_callback should fall back to using DEFAULT limits."""
+        mock_limits_set.return_value = "TVAC"
+
+        packet = System.telemetry.packet("INST", "HEALTH_STATUS")
+        packet.received_time = datetime.now(timezone.utc)
+
+        # TEMP4 only has DEFAULT limits (no TVAC), TEMP1 has both DEFAULT and TVAC
+        temp4 = packet.get_item("TEMP4")
+        temp1 = packet.get_item("TEMP1")
+
+        # TEMP4 has no TVAC limits, should fall back to DEFAULT limits (-80.0 -70.0 60.0 80.0)
+        temp4.limits.state = "RED_LOW"
+        for stdout in capture_io():
+            self.dm.limits_change_callback(packet, temp4, None, -100.0, True)
+            # Should not raise a KeyError, and should use DEFAULT limits values
+            self.assertIn(
+                "INST HEALTH_STATUS TEMP4 = -100.0 is RED_LOW (-80.0)",
+                stdout.getvalue(),
+            )
+
+        # TEMP1 has TVAC limits (-80.0 -30.0 30.0 80.0), should use TVAC
+        temp1.limits.state = "RED_LOW"
+        for stdout in capture_io():
+            self.dm.limits_change_callback(packet, temp1, None, -100.0, True)
+            self.assertIn(
+                "INST HEALTH_STATUS TEMP1 = -100.0 is RED_LOW (-80.0)",
+                stdout.getvalue(),
+            )
+
+    @patch("openc3.microservices.decom_microservice.System.limits_set")
+    def test_falls_back_to_default_limits_set_for_green_and_blue_states(self, mock_limits_set):
+        """When the system limits set is not defined for an item and the state
+        is GREEN or BLUE, the callback should display correct range from DEFAULT limits."""
+        mock_limits_set.return_value = "TVAC"
+
+        packet = System.telemetry.packet("INST", "HEALTH_STATUS")
+        packet.received_time = datetime.now(timezone.utc)
+
+        # TEMP4 only has DEFAULT limits: -80.0 -70.0 60.0 80.0 (no green/blue range)
+        temp4 = packet.get_item("TEMP4")
+
+        # Test GREEN state - should display YELLOW_LOW to YELLOW_HIGH range
+        temp4.limits.state = "GREEN"
+        for stdout in capture_io():
+            self.dm.limits_change_callback(packet, temp4, "RED_LOW", 0.0, True)
+            self.assertIn(
+                "INST HEALTH_STATUS TEMP4 = 0.0 is GREEN (-70.0 to 60.0)",
+                stdout.getvalue(),
+            )
+
     def test_handles_exceptions_in_the_thread(self):
         with patch.object(self.dm, "microservice_cmd") as mock_microservice_cmd:
             mock_microservice_cmd.side_effect = Exception("Bad command")
@@ -243,6 +314,48 @@ class TestDecomMicroservice(unittest.TestCase):
         # Verify that even though the limits response sleeps for 0.1s, the decom thread is not blocked
         self.assertLess(self.dm.metric.data["decom_duration_seconds"]["value"], 0.02)
 
+    def test_constructor_handles_disabled_limits_during_sync_system(self):
+        # Regression: limits_response_queue must be initialized before the
+        # limits_change_callback is registered. LimitsEventTopic.sync_system
+        # (called from __init__) calls System.limits.disable on items persisted
+        # as disabled, which fires the callback - which writes to the queue.
+        self.dm.shutdown()
+        self.dm_thread.join()
+
+        class NoOpLimitsResponse(LimitsResponse):
+            def call(self, packet, item, old_limits_state):
+                # Simple stub to test the callback
+                pass
+
+        packet = System.telemetry.packet("INST", "HEALTH_STATUS")
+        packet.get_item("TEMP1").limits.response = NoOpLimitsResponse()
+
+        Store.hset(
+            "DEFAULT__current_limits_settings",
+            "INST__HEALTH_STATUS__TEMP1",
+            json.dumps(
+                {
+                    "enabled": False,
+                    "persistence_setting": 1,
+                    "DEFAULT": {
+                        "red_low": -80.0,
+                        "yellow_low": -70.0,
+                        "yellow_high": 60.0,
+                        "red_high": 80.0,
+                    },
+                }
+            ),
+        )
+
+        # Before the fix this raised AttributeError: 'DecomMicroservice'
+        # object has no attribute 'limits_response_queue'.
+        self.dm = DecomMicroservice("DEFAULT__DECOM__INST_INT")
+        self.assertEqual(self.dm.limits_response_queue.qsize(), 1)
+        # Restart the run thread so tearDown can shut it down cleanly.
+        self.dm_thread = threading.Thread(target=self.dm.run)
+        self.dm_thread.start()
+        time.sleep(0.01)
+
     def test_handles_exceptions_in_limits_responses(self):
         class BadLimitsResponse(LimitsResponse):
             def call(self, packet, item, old_limits_state):
@@ -255,7 +368,7 @@ class TestDecomMicroservice(unittest.TestCase):
         for stdout in capture_io():
             TelemetryTopic.write_packet(packet, scope="DEFAULT")
             # Wait for async processing to complete with retries for CI reliability
-            for _ in range(20):
+            for _ in range(500):
                 time.sleep(0.01)
                 if "Bad response" in stdout.getvalue():
                     break
@@ -266,3 +379,122 @@ class TestDecomMicroservice(unittest.TestCase):
             self.dm.limits_response_thread.metric.data["limits_response_error_total"]["value"],
             1,
         )
+
+    def test_defaults_stored_limits_mode_to_process(self):
+        self.assertEqual(self.dm.stored_limits_mode, "PROCESS")
+
+
+class TestDecomMicroserviceStoredLimitsMode(unittest.TestCase):
+    """Tests for the STORED_LIMITS_MODE target setting."""
+
+    def _start_decom_with_mode(self, mode):
+        redis = mock_redis(self)
+        setup_system()
+
+        orig_xread = redis.xread
+
+        def xread_side_effect(*args, **kwargs):
+            if "block" in kwargs:
+                kwargs.pop("block")
+            result = None
+            with contextlib.suppress(Exception):
+                result = orig_xread(*args, **kwargs)
+            if result and len(result) == 0:
+                time.sleep(0.01)
+            return result
+
+        redis.xread = Mock()
+        redis.xread.side_effect = xread_side_effect
+
+        # Create the target model. Python TargetModel doesn't override as_json, so
+        # stored_limits_mode isn't persisted by create(). We manually update the
+        # Redis hash to include it, mirroring what Ruby's as_json would store.
+        model = TargetModel(name="INST", stored_limits_mode=mode, scope="DEFAULT")
+        model.create()
+        existing = json.loads(Store.hget("DEFAULT__openc3_targets", "INST"))
+        existing["stored_limits_mode"] = mode
+        Store.hset("DEFAULT__openc3_targets", "INST", json.dumps(existing))
+
+        model = TargetModel(name="SYSTEM", scope="DEFAULT")
+        model.create()
+        model = MicroserviceModel(
+            "DEFAULT__DECOM__INST_INT",
+            scope="DEFAULT",
+            topics=["DEFAULT__TELEMETRY__{INST}__HEALTH_STATUS"],
+            target_names=["INST"],
+        )
+        model.create()
+
+        with patch("openc3.microservices.microservice.System"):
+            self.dm = DecomMicroservice("DEFAULT__DECOM__INST_INT")
+        self.dm_thread = threading.Thread(target=self.dm.run)
+        self.dm_thread.start()
+        wait_for_first_topic_read(redis, self.dm_thread)
+
+    def tearDown(self):
+        if hasattr(self, "dm"):
+            self.dm.shutdown()
+            self.dm_thread.join()
+
+    def test_loads_stored_limits_mode_from_target_model(self):
+        self._start_decom_with_mode("DISABLE")
+        self.assertEqual(self.dm.stored_limits_mode, "DISABLE")
+
+    @patch("openc3.system.system.System.limits_set")
+    def test_log_mode_logs_but_skips_reactions_for_stored_packets(self, limits_set):
+        limits_set.return_value = "DEFAULT"
+        self._start_decom_with_mode("LOG")
+
+        class TrackingLimitsResponse(LimitsResponse):
+            called = False
+
+            def call(self, packet, item, old_limits_state):
+                TrackingLimitsResponse.called = True
+
+        TrackingLimitsResponse.called = False
+        packet = System.telemetry.packet("INST", "HEALTH_STATUS")
+        temp1 = packet.get_item("TEMP1")
+        temp1.limits.response = TrackingLimitsResponse()
+        packet.received_time = datetime.now(timezone.utc)
+        packet.stored = True
+
+        for stdout in capture_io():
+            TelemetryTopic.write_packet(packet, scope="DEFAULT")
+            for _ in range(500):
+                time.sleep(0.01)
+                if "RED_LOW" in stdout.getvalue():
+                    break
+            # Limits changes are still logged
+            self.assertIn("INST HEALTH_STATUS TEMP1", stdout.getvalue())
+            self.assertIn("RED_LOW", stdout.getvalue())
+
+        # Limits response should NOT be called
+        self.assertFalse(TrackingLimitsResponse.called)
+
+        # Events are published but current_limits is NOT updated
+        out = LimitsEventTopic.out_of_limits(scope="DEFAULT")
+        self.assertEqual(len(out), 0)
+
+    @patch("openc3.system.system.System.limits_set")
+    def test_disable_mode_skips_limits_for_stored_packets(self, limits_set):
+        limits_set.return_value = "DEFAULT"
+        self._start_decom_with_mode("DISABLE")
+
+        packet = System.telemetry.packet("INST", "HEALTH_STATUS")
+        packet.received_time = datetime.now(timezone.utc)
+        packet.stored = True
+
+        for stdout in capture_io():
+            TelemetryTopic.write_packet(packet, scope="DEFAULT")
+            time.sleep(0.1)
+            # No limits change messages should be logged
+            self.assertNotIn("RED_LOW", stdout.getvalue())
+            self.assertNotIn("YELLOW", stdout.getvalue())
+
+        # No limits events
+        events = LimitsEventTopic.read(0, scope="DEFAULT")
+        self.assertEqual(len(events), 0)
+
+        # current_limits not updated
+        out = LimitsEventTopic.out_of_limits(scope="DEFAULT")
+        self.assertEqual(len(out), 0)

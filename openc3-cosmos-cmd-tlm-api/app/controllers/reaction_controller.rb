@@ -40,7 +40,7 @@ class ReactionController < ApplicationController
       render json: ret
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -56,13 +56,13 @@ class ReactionController < ApplicationController
       render json: model.as_json()
     rescue OpenC3::ReactionInputError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 404
+      render json: { status: 'error', message: e.message, type: e.class }, status: :not_found
     rescue OpenC3::ReactionError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 400
+      render json: { status: 'error', message: e.message, type: e.class }, status: :bad_request
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -101,22 +101,25 @@ class ReactionController < ApplicationController
   def create
     return unless authorization('script_run')
     begin
-      hash = params.to_unsafe_h.slice(:triggers, :trigger_level, :actions, :snooze).to_h
-      name = @model_class.create_unique_name(scope: params[:scope])
+      hash = params.permit(:trigger_level, :snooze, :label, :name, triggers: [:name, :group], actions: [:type, :value, :severity, :alert, { environment: [:key, :value] }]).to_h
+      name = hash.delete('name')
+      if name.nil? || name.strip.empty?
+        name = @model_class.create_unique_name(scope: params[:scope])
+      end
       hash[:username] = username()
       model = @model_class.from_json(hash.symbolize_keys, name: name, scope: params[:scope])
       model.create()
       model.deploy()
-      render json: model.as_json(), status: 201
+      render json: model.as_json(), status: :created
     rescue OpenC3::ReactionInputError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 400
+      render json: { status: 'error', message: e.message, type: e.class }, status: :bad_request
     rescue OpenC3::ReactionError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 418
+      render json: { status: 'error', message: e.message, type: e.class }, status: :unprocessable_entity
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -143,14 +146,15 @@ class ReactionController < ApplicationController
     begin
       model = @model_class.get(name: params[:name], scope: params[:scope])
       if model.nil?
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
-      hash = params.to_unsafe_h.slice(:snooze, :triggers, :trigger_level, :actions).to_h
+      hash = params.permit(:snooze, :trigger_level, :label, triggers: [:name, :group], actions: [:type, :value, :severity, :alert, { environment: [:key, :value] }]).to_h
       model.triggers = hash['triggers'] if hash['triggers']
       model.actions = hash['actions'] if hash['actions']
       model.trigger_level = hash['trigger_level'] if hash['trigger_level']
       model.snooze = hash['snooze'] if hash['snooze']
+      model.label = hash['label'] if hash.key?('label')
       # Update the timestamp before notifying so the event has the current time
       model.updated_at = Time.now.to_nsec_from_epoch
       # Notify the ReactionMicroservice to update the ReactionModel
@@ -160,13 +164,13 @@ class ReactionController < ApplicationController
       render json: model.as_json()
     rescue OpenC3::ReactionInputError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 400
+      render json: { status: 'error', message: e.message, type: e.class }, status: :bad_request
     rescue OpenC3::ReactionError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 418
+      render json: { status: 'error', message: e.message, type: e.class }, status: :unprocessable_entity
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -191,7 +195,7 @@ class ReactionController < ApplicationController
     begin
       model = @model_class.get(name: params[:name], scope: params[:scope])
       if model.nil?
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
       # Notify the ReactionMicroservice to enable the ReactionModel
@@ -201,7 +205,7 @@ class ReactionController < ApplicationController
       render json: model.as_json()
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -226,7 +230,7 @@ class ReactionController < ApplicationController
     begin
       model = @model_class.get(name: params[:name], scope: params[:scope])
       if model.nil?
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
       # Notify the ReactionMicroservice to disable the ReactionModel
@@ -236,7 +240,7 @@ class ReactionController < ApplicationController
       render json: model.as_json()
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -246,7 +250,7 @@ class ReactionController < ApplicationController
     begin
       model = @model_class.get(name: params[:name], scope: params[:scope])
       if model.nil?
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
       # Notify the ReactionMicroservice to execute the ReactionModel
@@ -256,7 +260,7 @@ class ReactionController < ApplicationController
       render json: model.as_json()
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 
@@ -277,7 +281,7 @@ class ReactionController < ApplicationController
     begin
       model = @model_class.get(name: params[:name], scope: params[:scope])
       if model.nil?
-        render json: { status: 'error', message: NOT_FOUND }, status: 404
+        render json: { status: 'error', message: NOT_FOUND }, status: :not_found
         return
       end
       # Notify the ReactionMicroservice to delete the ReactionModel
@@ -287,13 +291,13 @@ class ReactionController < ApplicationController
       render json: model.as_json()
     rescue OpenC3::ReactionInputError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 404
+      render json: { status: 'error', message: e.message, type: e.class }, status: :not_found
     rescue OpenC3::ReactionError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class }, status: 400
+      render json: { status: 'error', message: e.message, type: e.class }, status: :bad_request
     rescue StandardError => e
       log_error(e)
-      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: 500
+      render json: { status: 'error', message: e.message, type: e.class, backtrace: e.backtrace }, status: :internal_server_error
     end
   end
 end

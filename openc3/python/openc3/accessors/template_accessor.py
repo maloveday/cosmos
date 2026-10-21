@@ -56,6 +56,10 @@ class TemplateAccessor(Accessor):
             return None
         self.configure()
 
+        # No template items to read (e.g. command with fixed template string)
+        if not self.item_keys:
+            return None
+
         # Scan the response for all the variables in brackets <VARIABLE>
         values = self.read_regexp.match(buffer.decode())
         if values is not None:
@@ -82,6 +86,12 @@ class TemplateAccessor(Accessor):
     def read_items(self, items, buffer):
         result = {}
         self.configure()
+
+        # No template items to read (e.g. command with fixed template string)
+        if not self.item_keys:
+            for item in items:
+                result[item.name] = None
+            return result
 
         # Scan the response for all the variables in brackets <VARIABLE>
         values = self.read_regexp.match(buffer.decode())
@@ -120,7 +130,7 @@ class TemplateAccessor(Accessor):
         updated_buffer = buffer.decode().replace(f"{self.left_char}{key}{self.right_char}", str(value)).encode()
 
         if buffer == updated_buffer:
-            raise RuntimeError(f"Key {key} not found in template")
+            raise RuntimeError(f"Key '{key}' not found in template (write_item)")
         buffer[0:] = updated_buffer
         return value
 
@@ -136,7 +146,7 @@ class TemplateAccessor(Accessor):
             )
 
             if buffer == updated_buffer:
-                raise RuntimeError(f"Key {key} not found in template")
+                raise RuntimeError(f"Key '{key}' not found in template (write_items)")
             buffer[0:] = updated_buffer
         return values
 

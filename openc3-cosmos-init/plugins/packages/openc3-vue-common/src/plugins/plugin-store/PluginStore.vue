@@ -1,5 +1,5 @@
 <!--
-# Copyright 2025 OpenC3, Inc.
+# Copyright 2026 OpenC3, Inc.
 # All Rights Reserved.
 #
 # This program is distributed in the hope that it will be useful,
@@ -54,6 +54,28 @@
       />
     </div>
     <v-spacer />
+    <v-alert
+      v-if="showApiKeyBanner"
+      class="my-3"
+      type="info"
+      density="compact"
+      data-test="api-key-banner"
+    >
+      You're using COSMOS Enterprise, but you haven't set an OpenC3 Store API
+      key yet. You must set this to access Enterprise plugins.
+      <br />
+      Visit the
+      <a :href="accountSettingsUrl" target="_blank" class="text-white">
+        OpenC3 Store account settings<v-icon
+          icon="mdi-open-in-new"
+          size="x-small"
+        />
+      </a>
+      to generate an API key. Then, return here and open the Plugin Store
+      settings with the
+      <v-icon icon="mdi-cog" size="small" /> icon above, and finally paste your
+      API key into the API key field.
+    </v-alert>
     <span class=""> Click on a plugin to see more information about it </span>
     <v-alert
       v-if="storeError"
@@ -62,10 +84,22 @@
       :title="storeError.title"
       :text="storeError.body"
     />
+    <div
+      v-else-if="loading"
+      class="d-flex justify-center align-center py-12"
+      data-test="plugin-store-loading"
+    >
+      <v-progress-circular indeterminate color="primary" size="48" />
+      <span class="ml-4 text-subtitle-1">Loading plugins...</span>
+    </div>
     <v-container v-else>
       <v-row>
         <v-col v-for="plugin in filteredPlugins" :key="plugin.id" cols="4">
-          <plugin-card v-bind="plugin" @trigger-install="install" />
+          <plugin-card
+            v-bind="plugin"
+            :install-allowed="installAllowed"
+            @trigger-install="install"
+          />
         </v-col>
       </v-row>
     </v-container>
@@ -97,9 +131,21 @@ export default {
       plugins: [],
       storeError: null,
       storeUrl: DEFAULT_STORE_URL,
+      isEnterprise: false,
+      isAdmin: true,
+      isApiKeySet: localStorage.getItem('pluginStore.isApiKeySet') === 'true',
+      loading: false,
     }
   },
   computed: {
+    showApiKeyBanner: function () {
+      return this.isEnterprise && !this.isApiKeySet
+    },
+    accountSettingsUrl: function () {
+      const url = this.storeUrl || DEFAULT_STORE_URL
+      const navigableHost = url.replace('host.docker.internal', 'localhost')
+      return new URL('account', navigableHost)
+    },
     filteredPlugins: function () {
       let filtered = this.plugins
       if (this.search.length) {
@@ -112,25 +158,52 @@ export default {
     formattedStoreUrl: function () {
       return this.storeUrl.split('://').at(-1)
     },
+    installAllowed: function () {
+      return !this.isEnterprise || this.isAdmin
+    },
+  },
+  watch: {
+    showSettingsDialog: function (val) {
+      if (!val) {
+        this.isApiKeySet =
+          localStorage.getItem('pluginStore.isApiKeySet') === 'true'
+      }
+    },
   },
   mounted: function () {
     // Don't call updatePluginStore() here. It should be called in the background before the user opens this store
     // view (see PluginsTab.vue `created()`) to keep this feeling fast
     this.fetchPluginStoreData()
+    this.fetchUserContext()
     // TODO: do something with plugins that are already installed (no uninstall button: https://github.com/OpenC3/cosmos/pull/2162#discussion_r2249339853 )
   },
   methods: {
     fetchPluginStoreData: function () {
-      Api.get('/openc3-api/pluginstore').then(({ data }) => {
-        if (data.error) {
-          const { title, body } = data
-          this.storeError = { title, body }
-          this.plugins = []
-        } else {
-          this.storeError = null
-          this.plugins = data
-        }
-      })
+      this.loading = true
+      Api.get('/openc3-api/pluginstore')
+        .then(({ data }) => {
+          if (data.error) {
+            const { title, body } = data
+            this.storeError = { title, body }
+            this.plugins = []
+          } else {
+            this.storeError = null
+            this.plugins = data
+          }
+        })
+        .catch(console.error)
+        .finally(() => {
+          this.loading = false
+        })
+    },
+    fetchUserContext: function () {
+      Api.get('/openc3-api/info')
+        .then(({ data }) => {
+          this.isEnterprise = !!data.enterprise
+        })
+        .catch(console.error)
+      const roles = OpenC3Auth.userroles() || []
+      this.isAdmin = roles.includes('admin')
     },
     close: function () {
       this.$emit('close')
@@ -144,6 +217,7 @@ export default {
     },
     updatePluginStore: function (storeUrl) {
       this.storeUrl = storeUrl
+      this.loading = true
       this.api.update_plugin_store().then((response) => {
         this.fetchPluginStoreData()
       })

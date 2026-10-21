@@ -24,9 +24,11 @@ import threading
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import NamedTuple
 
 import numpy
 import psycopg
+from psycopg.rows import dict_row
 from questdb.ingress import Protocol, Sender, TimestampNanos
 
 
@@ -112,6 +114,21 @@ def decode_float_special_values(value):
     return value
 
 
+class TlmItem(NamedTuple):
+    """A telemetry item to look up in the CVT or QuestDB.
+
+    All fields are None for a placeholder representing an item which doesn't exist
+    (get_tlm_available returns None for these). limits is "LIMITS" when the limits
+    state should also be returned (only used by the QuestDB lookup).
+    """
+
+    target_name: str | None
+    packet_name: str | None
+    item_name: str | None
+    value_type: str | None
+    limits: str | None = None
+
+
 class QuestDBClient:
     """
     QuestDB client for managing connections and data ingestion.
@@ -136,19 +153,31 @@ class QuestDBClient:
         },
     }
 
-    # Class-level shared connection for query operations (singleton pattern)
-    _shared_conn = None
-    _shared_conn_mutex = threading.Lock()
+    # Stored timestamp items that are stored as timestamp_ns columns and need
+    # conversion to float seconds on read. Distinguished from calculated items above.
+    STORED_TIMESTAMP_ITEMS = frozenset(["PACKET_TIMESECONDS", "RECEIVED_TIMESECONDS"])
 
-    # Class-level shared connection for query operations (singleton pattern)
-    _shared_conn = None
-    _shared_conn_mutex = threading.Lock()
+    # Class-level shared connections for query operations (per-db_shard singleton pattern)
+    # { db_shard_number: psycopg_connection }
+    _shared_conns = {}
+    _shared_conns_mutex = threading.Lock()
 
     @staticmethod
-    def _create_query_connection(**extra_kwargs):
+    def hostname_for_db_shard(db_shard=0):
+        """Resolve the hostname for a given db_shard number.
+
+        If OPENC3_TSDB_HOSTNAME contains "SHARDNUM", it is replaced with the db_shard number.
+        Otherwise, all db_shards connect to the same host (backward compatible).
+        """
+        hostname = os.environ.get("OPENC3_TSDB_HOSTNAME", "")
+        return hostname.replace("SHARDNUM", str(db_shard))
+
+    @staticmethod
+    def _create_query_connection(db_shard=0, **extra_kwargs):
         """Create a new psycopg connection to QuestDB using standard env vars.
 
         Args:
+            db_shard: DB_Shard number (default 0). Used to resolve hostname.
             **extra_kwargs: Additional keyword arguments passed to psycopg.connect
                 (e.g., autocommit=True, connect_timeout=2).
 
@@ -156,7 +185,7 @@ class QuestDBClient:
             A new psycopg connection.
         """
         return psycopg.connect(
-            host=os.environ.get("OPENC3_TSDB_HOSTNAME"),
+            host=QuestDBClient.hostname_for_db_shard(db_shard),
             port=os.environ.get("OPENC3_TSDB_QUERY_PORT"),
             user=os.environ.get("OPENC3_TSDB_USERNAME"),
             password=os.environ.get("OPENC3_TSDB_PASSWORD"),
@@ -165,32 +194,43 @@ class QuestDBClient:
         )
 
     @classmethod
-    def connection(cls):
-        """Get or create a thread-safe shared psycopg connection.
+    def connection(cls, db_shard=0):
+        """Get or create a thread-safe shared psycopg connection for the given db_shard.
 
         Returns a shared singleton connection — callers should not close it.
         """
-        with cls._shared_conn_mutex:
-            if cls._shared_conn is None:
-                cls._shared_conn = cls._create_query_connection()
-            return cls._shared_conn
+        with cls._shared_conns_mutex:
+            conn = cls._shared_conns.get(db_shard)
+            if conn is None:
+                conn = cls._create_query_connection(db_shard=db_shard)
+                cls._shared_conns[db_shard] = conn
+            return conn
 
     @classmethod
-    def disconnect(cls):
-        """Reset the shared connection (close if open, set to None). Used after errors."""
-        with cls._shared_conn_mutex:
-            if cls._shared_conn is not None:
-                with contextlib.suppress(Exception):
-                    cls._shared_conn.close()
-                cls._shared_conn = None
+    def disconnect(cls, db_shard=None):
+        """Reset the shared connection(s). Used after errors.
+
+        If db_shard is None, closes all db_shard connections. Otherwise closes only the specified db_shard.
+        """
+        with cls._shared_conns_mutex:
+            if db_shard is None:
+                for conn in cls._shared_conns.values():
+                    with contextlib.suppress(Exception):
+                        conn.close()
+                cls._shared_conns = {}
+            else:
+                conn = cls._shared_conns.pop(db_shard, None)
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
 
     @classmethod
-    def check_connection(cls):
+    def check_connection(cls, db_shard=0):
         """Health check — attempt to connect and immediately close.
 
         Returns True if successful, raises on failure.
         """
-        conn = cls._create_query_connection(autocommit=True, connect_timeout=2)
+        conn = cls._create_query_connection(db_shard=db_shard, autocommit=True, connect_timeout=2)
         conn.close()
         return True
 
@@ -209,7 +249,7 @@ class QuestDBClient:
         - Arrays are JSON-encoded: "[1, 2, 3]" or '["a", "b"]'
         - Objects/Dicts are JSON-encoded: '{"key": "value"}'
         - Binary data (BLOCK) is base64-encoded
-        - Large integers (64-bit) are stored as DECIMAL (returned as Decimal objects)
+        - Large integers (≥64-bit) are stored as VARCHAR strings
 
         Args:
             value: The value to decode
@@ -219,7 +259,8 @@ class QuestDBClient:
         Returns:
             The decoded value
         """
-        # Handle Decimal values from QuestDB DECIMAL columns (used for 64-bit integers)
+        # Handle Decimal values from legacy QuestDB DECIMAL columns
+        # (pre-existing tables may still use DECIMAL; new tables use VARCHAR)
         if isinstance(value, Decimal):
             if data_type in ("INT", "UINT"):
                 return int(value)
@@ -254,7 +295,7 @@ class QuestDBClient:
             except json.JSONDecodeError:
                 return value
 
-        # Integer values stored as strings (fallback path, normally DECIMAL)
+        # Integer values stored as VARCHAR strings (≥64-bit integers)
         if data_type in ("INT", "UINT"):
             try:
                 return int(value)
@@ -288,33 +329,37 @@ class QuestDBClient:
         # Return as-is (STRING type or unknown)
         return value
 
-    def __init__(self, logger=None, name=None):
+    DEFAULT_BATCH_SIZE = 500
+
+    def __init__(self, logger=None, name=None, batch_size=None, db_shard=0):
         """
         Initialize QuestDB client.
 
         Args:
             logger: Optional logger instance. If not provided, uses print.
             name: Optional name for error messages (e.g., microservice name)
+            batch_size: Number of rows to buffer before auto-flushing (default: DEFAULT_BATCH_SIZE)
+            db_shard: DB_Shard number (default 0). Used to resolve hostname via SHARDNUM replacement.
         """
+        self.batch_size = batch_size or self.DEFAULT_BATCH_SIZE
         self.logger = logger
         self.name = name or "QuestDBClient"
+        self.db_shard = db_shard
         self.ingest = None
         self.query = None
         # Track columns that need JSON serialization due to type conflicts or DERIVED type
         # Key is "table__column", value is True
         self.json_columns = {}
-        # Track columns that store integers as DECIMAL (for 64-bit items)
-        # These need integer values converted to strings before ILP ingestion
-        # (QuestDB casts strings to DECIMAL for pre-created DECIMAL columns)
-        # Key is "table__column", value is True
-        self.decimal_int_columns = {}
-        # Track columns that are VARCHAR type (for state __C columns, etc.)
+        # Track columns that are VARCHAR type (for ≥64-bit integers, state __C columns, etc.)
         # Non-string values must be converted to strings before ILP ingestion.
         # Key is "table__column", value is True
         self.varchar_columns = {}
         # Track FLOAT column bit sizes for proper inf/nan sentinel encoding
         # Key is "table__column", value is bit_size (32 or 64)
         self.float_bit_sizes = {}
+        # Track pending rows for error recovery (cleared on successful flush)
+        # Each entry is (table_name, columns_dict, timestamp_ns)
+        self.pending_rows = []
 
     def _log_info(self, msg):
         if self.logger:
@@ -346,7 +391,7 @@ class QuestDBClient:
         Raises:
             RuntimeError: If any required environment variable is missing
         """
-        host = os.environ.get("OPENC3_TSDB_HOSTNAME")
+        host = self.hostname_for_db_shard(self.db_shard)
         port = os.environ.get(port_env_var)
         username = os.environ.get("OPENC3_TSDB_USERNAME")
         password = os.environ.get("OPENC3_TSDB_PASSWORD")
@@ -375,7 +420,9 @@ class QuestDBClient:
         try:
             if self.ingest:
                 self.ingest.close()
-            self.ingest = Sender(Protocol.Http, host, port, username=username, password=password)
+            self.ingest = Sender(
+                Protocol.Http, host, port, username=username, password=password, auto_flush_interval="off"
+            )
             self.ingest.establish()
         except Exception as e:
             raise ConnectionError(f"Failed to connect to QuestDB: {e}") from e
@@ -391,7 +438,7 @@ class QuestDBClient:
             if self.query:
                 self.query.close()
 
-            self.query = self._create_query_connection(autocommit=True)
+            self.query = self._create_query_connection(db_shard=self.db_shard, autocommit=True)
         except Exception as e:
             raise ConnectionError(f"Failed to connect to QuestDB: {e}") from e
 
@@ -434,8 +481,10 @@ class QuestDBClient:
             elif converted_bit_size < 64:
                 return "long", False
             else:
-                self.decimal_int_columns[f"{table_name}__{column_name}"] = True
-                return "DECIMAL(20, 0)", False
+                # ≥64-bit integers stored as VARCHAR to avoid LONG NULL sentinel
+                # (0x8000000000000000) and DECIMAL limitations
+                self.varchar_columns[f"{table_name}__{column_name}"] = True
+                return "varchar", False
         elif converted_type == "TIME" or converted_type == "STRING":
             return "varchar", False
         elif converted_type == "BLOCK":
@@ -444,6 +493,518 @@ class QuestDBClient:
         else:
             # Unknown converted_type - fall back to JSON serialization
             return "varchar", True
+
+    @staticmethod
+    def find_item_def(packet_def, item_name):
+        """Find an item definition within a packet definition by name.
+
+        Args:
+            packet_def: Packet definition dict from TargetModel.packet, or None
+            item_name: Item name to find
+
+        Returns:
+            Item definition dict, or None if not found
+        """
+        if not packet_def:
+            return None
+        for item in packet_def.get("items", []):
+            if item.get("name") == item_name:
+                return item
+        return None
+
+    @staticmethod
+    def resolve_item_type(item_def, value_type):
+        """Resolve the data_type and array_size for a QuestDB column based on
+        the item definition and requested value type.
+
+        Args:
+            item_def: Item definition dict from packet definition, or None
+            value_type: One of 'RAW', 'CONVERTED', 'FORMATTED', 'WITH_UNITS'
+
+        Returns:
+            dict with 'data_type' and 'array_size' keys
+        """
+        if value_type in ("FORMATTED", "WITH_UNITS"):
+            return {"data_type": "STRING", "array_size": None}
+        elif value_type == "CONVERTED":
+            if item_def:
+                rc = item_def.get("read_conversion")
+                if rc and rc.get("converted_type"):
+                    return {
+                        "data_type": rc.get("converted_type"),
+                        "array_size": item_def.get("array_size"),
+                    }
+                elif item_def.get("states"):
+                    return {"data_type": "STRING", "array_size": None}
+                else:
+                    return {
+                        "data_type": item_def.get("data_type"),
+                        "array_size": item_def.get("array_size"),
+                    }
+            else:
+                return {"data_type": None, "array_size": None}
+        else:  # RAW or default
+            if item_def:
+                return {
+                    "data_type": item_def.get("data_type"),
+                    "array_size": item_def.get("array_size"),
+                }
+            else:
+                return {"data_type": None, "array_size": None}
+
+    @classmethod
+    def query_with_retry(cls, query, params=None, max_retries=5, label=None, db_shard=0):
+        """Execute a SQL query with automatic retry on connection errors.
+
+        Args:
+            query: SQL query string
+            params: Query parameters (list/tuple), or None
+            max_retries: Maximum number of retry attempts (default 5)
+            label: Optional label for log messages
+            db_shard: DB_Shard number to query (default 0)
+
+        Returns:
+            List of result rows (dicts)
+
+        Raises:
+            RuntimeError: After exhausting retries
+        """
+        from openc3.utilities.logger import Logger
+
+        retry_count = 0
+        label_str = f" ({label})" if label else ""
+        while True:
+            try:
+                conn = cls.connection(db_shard=db_shard)
+                with conn.cursor(binary=True, row_factory=dict_row) as cursor:
+                    cursor.execute(query, params or None)
+                    return cursor.fetchall()
+            except (psycopg.Error, OSError) as e:
+                retry_count += 1
+                if retry_count >= max_retries:
+                    raise RuntimeError(f"Error querying TSDB{label_str}: {e!s}") from e
+                Logger.warn(f"TSDB{label_str}: Retrying due to error: {e!s}")
+                Logger.warn(f"TSDB{label_str}: Last query: {query}")
+                cls.disconnect(db_shard=db_shard)
+                time.sleep(0.1)
+
+    @staticmethod
+    def nsec_to_utc_time(nsec):
+        """Convert a nanosecond integer timestamp to a UTC datetime.
+
+        Args:
+            nsec: Nanoseconds since epoch
+
+        Returns:
+            UTC-aware datetime or None
+        """
+        if nsec is None:
+            return None
+        seconds = nsec / 1_000_000_000
+        remainder_ns = nsec % 1_000_000_000
+        microseconds = remainder_ns / 1000
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).replace(microsecond=int(microseconds))
+
+    @staticmethod
+    def coerce_to_utc(value):
+        """Coerce a value from QuestDB into a UTC datetime.
+
+        Handles datetime, float (unix seconds), int (nanoseconds), and string timestamps.
+
+        Args:
+            value: Timestamp value in any supported format
+
+        Returns:
+            UTC-aware datetime or None
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+        elif isinstance(value, float):
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        elif isinstance(value, int):
+            return QuestDBClient.nsec_to_utc_time(value)
+        elif isinstance(value, str):
+            from datetime import datetime as dt
+
+            parsed = dt.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.astimezone(timezone.utc)
+        else:
+            # Assume PG timestamp-like object
+            return QuestDBClient.pg_timestamp_to_utc(value)
+
+    # QuestDB column types that can be aggregated with min/max/avg/stddev. Used by reduced
+    # queries to decide whether a converted (__C) column is numeric or must fall back to the
+    # raw column (e.g. states stored as VARCHAR).
+    NUMERIC_COLUMN_TYPES = frozenset({"BYTE", "SHORT", "INT", "LONG", "FLOAT", "DOUBLE"})
+
+    @staticmethod
+    def numeric_column_type(column_type):
+        """Return True if the given QuestDB column type can be numerically aggregated.
+
+        Args:
+            column_type: QuestDB column type (e.g. 'DOUBLE', 'VARCHAR'), or None
+
+        Returns:
+            True if the type can be aggregated with min/max/avg/stddev
+        """
+        return column_type is not None and str(column_type).upper() in QuestDBClient.NUMERIC_COLUMN_TYPES
+
+    @staticmethod
+    def column_suffix_for_value_type(value_type):
+        """Return the QuestDB column suffix for a given value type.
+
+        Args:
+            value_type: One of 'RAW', 'CONVERTED', 'FORMATTED', 'WITH_UNITS'
+
+        Returns:
+            Column suffix ('__C', '__F', or '')
+        """
+        return {"FORMATTED": "__F", "WITH_UNITS": "__F", "CONVERTED": "__C"}.get(value_type, "")
+
+    @staticmethod
+    def value_type_for_column_suffix(column_name):
+        """Determine the value type from a QuestDB column name's suffix.
+
+        Args:
+            column_name: Column name possibly ending in __C, __F, __L
+
+        Returns:
+            One of 'FORMATTED', 'CONVERTED', 'RAW'
+        """
+        if column_name.endswith("__F"):
+            return "FORMATTED"
+        elif column_name.endswith("__C"):
+            return "CONVERTED"
+        else:
+            return "RAW"
+
+    @staticmethod
+    def fetch_packet_def(target_name, packet_name, type="TLM", scope="DEFAULT"):
+        """Fetch a packet definition from TargetModel, returning None if not found.
+
+        Args:
+            target_name: Target name
+            packet_name: Packet name
+            type: 'CMD' or 'TLM' (default 'TLM')
+            scope: Scope name
+
+        Returns:
+            Packet definition dict or None
+        """
+        from openc3.models.target_model import TargetModel
+
+        try:
+            return TargetModel.packet(target_name, packet_name, type=type, scope=scope)
+        except RuntimeError:
+            return None
+
+    @classmethod
+    def build_item_defs_map(cls, packet_def):
+        """Build a dict mapping sanitized column names to item definitions.
+
+        Args:
+            packet_def: Packet definition dict from TargetModel.packet, or None
+
+        Returns:
+            dict of {sanitized_column_name: item_def_dict}
+        """
+        result = {}
+        if not packet_def:
+            return result
+        for item in packet_def.get("items", []):
+            result[cls.sanitize_column_name(item["name"])] = item
+        return result
+
+    @staticmethod
+    def build_aggregation_selects(safe_item_name, value_type, item_name=None, existing_columns=None):
+        """Build aggregation SELECT columns (min/max/avg/stddev) for a single item.
+
+        Args:
+            safe_item_name: Sanitized column name
+            value_type: 'RAW' or 'CONVERTED'
+            item_name: Original (unsanitized) item name for mapping values.
+                Defaults to safe_item_name if not provided.
+            existing_columns: Optional dict mapping column name to QuestDB column type for the
+                table. When provided and a converted (__C) column is absent or non-numeric
+                (e.g. a states column stored as VARCHAR), CONVERTED aggregation falls back to
+                the raw column (mirrors the non-reduced read path).
+
+        Returns:
+            Tuple of (select_fragments_list, column_mapping_dict)
+            column_mapping maps result column alias to [item_name, reduced_type, value_type]
+        """
+        if item_name is None:
+            item_name = safe_item_name
+        selects = []
+        mapping = {}
+        if value_type == "RAW":
+            col = safe_item_name
+            for suffix, reduced_type in [("N", "MIN"), ("X", "MAX"), ("A", "AVG"), ("S", "STDDEV")]:
+                alias_name = f"{safe_item_name}__{suffix}"
+                selects.append(f'{reduced_type.lower()}("{col}") as "{alias_name}"')
+                mapping[alias_name] = [item_name, reduced_type, "RAW"]
+        elif value_type == "CONVERTED":
+            # The converted (__C) column only exists, and is only numerically aggregatable, when
+            # the item has a numeric conversion. When it is absent (e.g. an item with only a
+            # format string) or non-numeric (e.g. a states column stored as VARCHAR), aggregate
+            # the raw column instead.
+            col = f"{safe_item_name}__C"
+            if existing_columns is not None and not QuestDBClient.numeric_column_type(existing_columns.get(col)):
+                col = safe_item_name
+            for suffix, reduced_type in [("CN", "MIN"), ("CX", "MAX"), ("CA", "AVG"), ("CS", "STDDEV")]:
+                alias_name = f"{safe_item_name}__{suffix}"
+                selects.append(f'{reduced_type.lower()}("{col}") as "{alias_name}"')
+                mapping[alias_name] = [item_name, reduced_type, "CONVERTED"]
+        return selects, mapping
+
+    @classmethod
+    def add_timestamp_entries(cls, entry, timestamp_ns, prefix):
+        """Add TIMESECONDS and TIMEFORMATTED entries to a dict from a nanosecond timestamp.
+
+        Args:
+            entry: Entry dict to populate
+            timestamp_ns: Nanoseconds since epoch
+            prefix: 'PACKET' or 'RECEIVED'
+        """
+        if timestamp_ns is None:
+            return
+        utc_time = cls.nsec_to_utc_time(timestamp_ns)
+        entry[f"{prefix}_TIMESECONDS"] = cls.format_timestamp(utc_time, "seconds")
+        entry[f"{prefix}_TIMEFORMATTED"] = cls.format_timestamp(utc_time, "formatted")
+
+    @classmethod
+    def db_shard_for_target(cls, target_name, scope="DEFAULT"):
+        """Look up the db_shard number for a target (cached). None target_name returns db_shard 0."""
+        from openc3.utilities.store import Store
+
+        return Store.db_shard_for_target(target_name, scope=scope)
+
+    @classmethod
+    def tsdb_lookup(cls, items, start_time, end_time=None, scope="DEFAULT"):
+        """Query historical telemetry data from QuestDB for a list of items.
+        Builds the SQL query, executes it, and decodes all results.
+        Supports cross-db_shard queries by grouping items by db_shard, executing
+        separate queries per db_shard, and merging results positionally.
+
+        Args:
+            items: List of TlmItem (or [target_name, packet_name, item_name, value_type, limits]).
+                item_name may be None to indicate a placeholder (non-existent item).
+            start_time: Start timestamp for the query
+            end_time: End timestamp, or None for "latest single row"
+            scope: Scope name
+
+        Returns:
+            Array of [value, limits_state] pairs per row, or {} if no results.
+            Single-row results return a flat array; multi-row results return array of arrays.
+        """
+        items = [TlmItem(*item) for item in items]
+
+        # Every item is a placeholder for an item which doesn't exist, so there's
+        # nothing to query. Return a single row of None values, one per item.
+        if all(item.item_name is None for item in items):
+            return [[None, None] for _ in items]
+
+        # Group items by db_shard number while preserving their original positions
+        db_shard_groups = {}  # db_shard => {"positions": [], "items": []}
+        for pos, item in enumerate(items):
+            db_shard = cls.db_shard_for_target(item.target_name, scope=scope)
+            group = db_shard_groups.setdefault(db_shard, {"positions": [], "items": []})
+            group["positions"].append(pos)
+            group["items"].append(item)
+
+        # Single-db_shard fast path (most common case)
+        if len(db_shard_groups) == 1:
+            db_shard, group = next(iter(db_shard_groups.items()))
+            return cls._tsdb_lookup_single_db_shard(
+                group["items"], start_time=start_time, end_time=end_time, scope=scope, db_shard=db_shard
+            )
+
+        # Cross-db_shard: execute per-db_shard queries (as lists of rows) and merge results
+        db_shard_rows = {}
+        for db_shard, group in db_shard_groups.items():
+            result = cls._tsdb_lookup_single_db_shard(
+                group["items"], start_time=start_time, end_time=end_time, scope=scope, db_shard=db_shard, flatten=False
+            )
+            db_shard_rows[db_shard] = result if isinstance(result, list) else []
+
+        # Merge results positionally back into the original item order. Each db_shard
+        # may have different row counts so use the maximum row count and fill missing
+        # positions with [None, None]. If all db_shards returned empty, return empty.
+        max_rows = max(len(rows) for rows in db_shard_rows.values())
+        if max_rows == 0:
+            return {}
+
+        merged = [[[None, None] for _ in items] for _ in range(max_rows)]
+        for db_shard, group in db_shard_groups.items():
+            for row_num, row in enumerate(db_shard_rows[db_shard]):
+                for db_shard_idx, orig_pos in enumerate(group["positions"]):
+                    if db_shard_idx < len(row) and row[db_shard_idx]:
+                        merged[row_num][orig_pos] = row[db_shard_idx]
+        # Match the single db_shard behavior of returning a flat array for a single row
+        if max_rows == 1:
+            return merged[0]
+        return merged
+
+    @classmethod
+    def _tsdb_lookup_single_db_shard(cls, items, start_time, end_time=None, scope="DEFAULT", db_shard=0, flatten=True):
+        """Execute a tsdb_lookup query against a single db_shard.
+        This contains the ASOF JOIN logic for items all on the same QuestDB instance.
+        When flatten is True a single row result is returned as a flat array rather than a list of rows.
+        """
+        tables = {}
+        names = []
+        nil_count = 0
+        packet_cache = {}
+        item_types = {}
+        calculated_items = {}
+        needed_timestamps = {}
+        current_position = 0
+
+        for item in items:
+            target_name, packet_name, item_name, value_type, limits = item
+            if item_name is None:
+                names.append(f"PACKET_TIMESECONDS as __nil{nil_count}")
+                nil_count += 1
+                current_position += 1
+                continue
+
+            table_name, _ = cls.sanitize_table_name(target_name, packet_name, scope=scope)
+            tables[table_name] = 1
+            index = list(tables.keys()).index(table_name)
+
+            if item_name in cls.STORED_TIMESTAMP_ITEMS:
+                names.append(f'"T{index}.{item_name}"')
+                current_position += 1
+                continue
+
+            if item_name in cls.TIMESTAMP_ITEMS:
+                ts_info = cls.TIMESTAMP_ITEMS[item_name]
+                calculated_items[current_position] = {
+                    "source": ts_info["source"],
+                    "format": ts_info["format"],
+                    "table_index": index,
+                }
+                if index not in needed_timestamps:
+                    needed_timestamps[index] = set()
+                needed_timestamps[index].add(ts_info["source"])
+                current_position += 1
+                continue
+
+            safe_item_name = cls.sanitize_column_name(item_name)
+
+            cache_key = (target_name, packet_name)
+            if cache_key not in packet_cache:
+                packet_cache[cache_key] = cls.fetch_packet_def(target_name, packet_name, scope=scope)
+
+            packet_def = packet_cache[cache_key]
+            item_def = cls.find_item_def(packet_def, item_name)
+
+            suffix = cls.column_suffix_for_value_type(value_type)
+            col_name = f"T{index}.{safe_item_name}{suffix}"
+            names.append(f'"{col_name}"')
+            item_types[col_name] = cls.resolve_item_type(item_def, value_type)
+
+            current_position += 1
+            if limits:
+                names.append(f'"T{index}.{safe_item_name}__L"')
+
+        # Every item in this db_shard is a placeholder so there's no table to query.
+        # Return no results and let tsdb_lookup fill these positions with [None, None]
+        # when it merges the db_shards (an all placeholder lookup returns before this)
+        if not tables:
+            return {}
+
+        # Add needed timestamp columns to the SELECT for calculated items
+        for table_index, ts_columns in needed_timestamps.items():
+            for ts_col in ts_columns:
+                names.append(f"T{table_index}.{ts_col} as T{table_index}___ts_{ts_col}")
+
+        # Build the SQL query
+        query = f"SELECT {', '.join(names)} FROM "
+        for index, (table_name, _) in enumerate(tables.items()):
+            if index == 0:
+                query += f'"{table_name}" as T{index} '
+            else:
+                query += f'ASOF JOIN "{table_name}" as T{index} '
+
+        query_params = []
+        if start_time and not end_time:
+            query += "WHERE T0.PACKET_TIMESECONDS < %s LIMIT -1"
+            query_params.append(start_time)
+        elif start_time and end_time:
+            query += "WHERE T0.PACKET_TIMESECONDS >= %s AND T0.PACKET_TIMESECONDS < %s"
+            query_params.append(start_time)
+            query_params.append(end_time)
+
+        result = cls.query_with_retry(query, params=query_params or None, label="tsdb_lookup", db_shard=db_shard)
+
+        if not result:
+            return {}
+
+        data = []
+        for row_index, row in enumerate(result):
+            data.append([])
+            col_index = 0
+            row_timestamps = {}
+            for col_name, col_value in row.items():
+                if "__L" in col_name:
+                    if col_index > 0:
+                        data[row_index][col_index - 1] = [
+                            data[row_index][col_index - 1][0],
+                            col_value,
+                        ]
+                elif col_name.startswith("__nil"):
+                    data[row_index].append([None, None])
+                    col_index += 1
+                elif re.match(r"^T(\d+)___ts_(.+)$", col_name):
+                    match = re.match(r"^T(\d+)___ts_(.+)$", col_name)
+                    table_idx = int(match.group(1))
+                    ts_source = match.group(2)
+                    row_timestamps[f"T{table_idx}.{ts_source}"] = col_value
+                elif (
+                    col_name.endswith(".PACKET_TIMESECONDS")
+                    or col_name.endswith(".RECEIVED_TIMESECONDS")
+                    or col_name in ("PACKET_TIMESECONDS", "RECEIVED_TIMESECONDS")
+                ):
+                    ts_utc = cls.coerce_to_utc(col_value)
+                    seconds_value = cls.format_timestamp(ts_utc, "seconds")
+                    data[row_index].append([seconds_value, None])
+                    col_index += 1
+                    if "." in col_name:
+                        row_timestamps[col_name] = col_value
+                    else:
+                        row_timestamps[f"T0.{col_name}"] = col_value
+                else:
+                    type_info = item_types.get(col_name, {})
+                    if not type_info:
+                        for prefix in [f"T{i}." for i in range(len(tables))]:
+                            prefixed_name = prefix + col_name
+                            type_info = item_types.get(prefixed_name, {})
+                            if type_info:
+                                break
+                    decoded_value = cls.decode_value(
+                        col_value,
+                        data_type=type_info.get("data_type"),
+                        array_size=type_info.get("array_size"),
+                    )
+                    data[row_index].append([decoded_value, None])
+                    col_index += 1
+
+            for position in sorted(calculated_items.keys()):
+                calc_info = calculated_items[position]
+                ts_key = f"T{calc_info['table_index']}.{calc_info['source']}"
+                ts_value = row_timestamps.get(ts_key)
+                ts_utc = cls.coerce_to_utc(ts_value)
+                calculated_value = cls.format_timestamp(ts_utc, calc_info["format"])
+                data[row_index].insert(position, [calculated_value, None])
+
+        if flatten and len(result) == 1:
+            data = data[0]
+        return data
 
     @classmethod
     def sanitize_table_name(cls, target_name, packet_name, cmd_or_tlm="TLM", scope="DEFAULT"):
@@ -520,30 +1081,74 @@ class QuestDBClient:
     def _canonical_type(sql_type):
         """Normalize a SQL type string for comparison.
 
-        Uppercases and strips internal whitespace so that e.g.
-        'DECIMAL(20, 0)' and 'DECIMAL(20,0)' compare equal,
-        while preserving parameters so DECIMAL(20,0) != DECIMAL(22,0).
+        Uppercases and strips internal whitespace so that parameterized types
+        like 'DECIMAL(20, 0)' and 'DECIMAL(20,0)' compare equal.
         """
         return re.sub(r"\s+", "", sql_type.upper())
 
-    def _get_existing_columns(self, table_name):
+    # psycopg errors that indicate the connection itself is broken (vs a SQL error).
+    # These are the only DDL failures we retry — schema errors, missing tables, etc.
+    # bubble up so the caller sees them.
+    _CONNECTION_ERROR_TYPES = (psycopg.OperationalError, psycopg.InterfaceError)
+
+    def _execute_ddl(self, sql, max_retries=3):
+        """Execute a DDL statement, reconnecting and retrying on connection errors.
+
+        Raises the last exception after retries are exhausted, or any non-connection
+        psycopg error immediately.
+        """
+        for attempt in range(max_retries):
+            try:
+                with self.query.cursor() as cur:
+                    cur.execute(sql)
+                return
+            except self._CONNECTION_ERROR_TYPES as error:
+                if attempt == max_retries - 1:
+                    raise
+                self._log_warn(
+                    f"QuestDB: DDL connection error on attempt {attempt + 1}/{max_retries}, reconnecting: {error}"
+                )
+                try:
+                    self.connect_query()
+                except Exception as reconnect_err:
+                    self._log_warn(f"QuestDB: Reconnect failed: {reconnect_err}")
+                time.sleep(0.1 * (attempt + 1))
+
+    def _get_existing_columns(self, table_name, max_retries=3):
         """Query QuestDB for existing column names and types.
 
         Returns:
-            Dict of column_name -> column_type (e.g., {"VALUE": "LONG", "STATUS": "VARCHAR"}),
-            or None if the table does not exist.
+            Dict of column_name -> column_type, or None if the table does not exist.
+
+        Raises:
+            psycopg.OperationalError / psycopg.InterfaceError if the connection
+            cannot be reestablished within max_retries.
         """
-        try:
-            with self.query.cursor() as cur:
-                cur.execute(f'SHOW COLUMNS FROM "{table_name}"')
-                columns = {}
-                for row in cur.fetchall():
-                    columns[row[0]] = row[1]
-                return columns
-        except (psycopg.Error, TypeError):
-            # psycopg.Error: table doesn't exist in QuestDB
-            # TypeError: can occur in unit tests with mock cursors
-            return None
+        for attempt in range(max_retries):
+            try:
+                with self.query.cursor() as cur:
+                    cur.execute(f'SHOW COLUMNS FROM "{table_name}"')
+                    columns = {}
+                    for row in cur.fetchall():
+                        columns[row[0]] = row[1]
+                    return columns
+            except self._CONNECTION_ERROR_TYPES as error:
+                if attempt == max_retries - 1:
+                    raise
+                self._log_warn(
+                    f"QuestDB: SHOW COLUMNS connection error on attempt {attempt + 1}/{max_retries}, "
+                    f"reconnecting: {error}"
+                )
+                try:
+                    self.connect_query()
+                except Exception as reconnect_err:
+                    self._log_warn(f"QuestDB: Reconnect failed: {reconnect_err}")
+                time.sleep(0.1 * (attempt + 1))
+            except (psycopg.Error, TypeError):
+                # psycopg.Error: table doesn't exist in QuestDB
+                # TypeError: can occur in unit tests with mock cursors
+                return None
+        return None
 
     def create_table(self, target_name, packet_name, packet, cmd_or_tlm="TLM", retain_time=None, scope="DEFAULT"):
         """
@@ -630,6 +1235,17 @@ class QuestDBClient:
                 if item.get("states"):
                     desired_columns[f"{item_name}__C"] = "varchar"
                     self.varchar_columns[f"{table_name}__{item_name}__C"] = True
+                elif cmd_or_tlm == "CMD" and item.get("write_conversion"):
+                    # Commands log the value the user gave rather than the post write
+                    # conversion value in the buffer (see CommandDecomTopic.write_packet).
+                    # Write conversions typically take engineering units so the given
+                    # value can be a float even for an integer item. Use double so the
+                    # value isn't truncated to the item data type.
+                    if item.get("data_type") in ["STRING", "BLOCK"]:
+                        desired_columns[f"{item_name}__C"] = "varchar"
+                        self.varchar_columns[f"{table_name}__{item_name}__C"] = True
+                    else:
+                        desired_columns[f"{item_name}__C"] = "double"
                 elif item.get("read_conversion"):
                     rc = item.get("read_conversion")
                     converted_type = rc.get("converted_type") if rc else None
@@ -651,89 +1267,172 @@ class QuestDBClient:
         existing_columns = self._get_existing_columns(table_name)
 
         if existing_columns is not None:
-            # Table exists — check for type mismatches and missing columns
+            # Table exists — check for type mismatches and missing columns.
+            # Connection errors bubble out of _execute_ddl (fatal). Non-connection
+            # errors on a single column are logged so other columns still reconcile.
             altered = False
-            try:
-                with self.query.cursor() as cur:
-                    for col_name, desired_sql_type in desired_columns.items():
-                        desired_canonical = self._canonical_type(desired_sql_type)
-                        existing_raw = existing_columns.get(col_name)
-                        existing_type = self._canonical_type(existing_raw) if existing_raw else None
+            for col_name, desired_sql_type in desired_columns.items():
+                desired_canonical = self._canonical_type(desired_sql_type)
+                existing_raw = existing_columns.get(col_name)
+                existing_type = self._canonical_type(existing_raw) if existing_raw else None
 
-                        if existing_type is None:
-                            # Column doesn't exist yet — add it
-                            alter = f'ALTER TABLE "{table_name}" ADD COLUMN {col_name} {desired_sql_type}'
-                            cur.execute(alter)
-                            self._log_info(f"QuestDB: Added column: {alter}")
-                            altered = True
-                        elif existing_type != desired_canonical:
-                            # Type mismatch — ALTER the column type
-                            alter = f'ALTER TABLE "{table_name}" ALTER COLUMN {col_name} TYPE {desired_sql_type}'
-                            cur.execute(alter)
-                            self._log_info(
-                                f"QuestDB: Altered column type: {alter} (was {existing_type}, now {desired_canonical})"
-                            )
-                            altered = True
-            except psycopg.Error as error:
-                self._log_error(f"QuestDB: Error reconciling table {table_name}: {error}")
+                try:
+                    if existing_type is None:
+                        # Column doesn't exist yet — add it
+                        alter = f'ALTER TABLE "{table_name}" ADD COLUMN "{col_name}" {desired_sql_type}'
+                        self._execute_ddl(alter)
+                        self._log_info(f"QuestDB: Added column: {alter}")
+                        altered = True
+                    elif existing_type != desired_canonical:
+                        # Type mismatch — ALTER the column type
+                        alter = f'ALTER TABLE "{table_name}" ALTER COLUMN "{col_name}" TYPE {desired_sql_type}'
+                        self._execute_ddl(alter)
+                        self._log_info(
+                            f"QuestDB: Altered column type: {alter} (was {existing_type}, now {desired_canonical})"
+                        )
+                        altered = True
+                except self._CONNECTION_ERROR_TYPES:
+                    # Connection is fatally broken — let caller see it.
+                    raise
+                except psycopg.Error as error:
+                    # Per-column schema error (bad type, constraint, etc.) — log and continue
+                    # so other columns still reconcile.
+                    self._log_error(f"QuestDB: Error reconciling column {col_name} in table {table_name}: {error}")
 
             if altered:
                 # QuestDB applies ALTER asynchronously — wait for changes to propagate
                 time.sleep(0.5)
                 # Reconnect ILP sender to clear its cached schema
                 self.connect_ingest()
+
+            # TTL is only accepted in CREATE TABLE, so an existing table needs an explicit
+            # ALTER to pick up a changed (or newly added / removed) retain time.
+            self._reconcile_ttl(table_name, retain_time)
         else:
-            # Table doesn't exist — create it
+            # Table doesn't exist — create it. _execute_ddl retries connection errors;
+            # any non-connection failure propagates so the caller knows table creation failed.
             columns_sql = ",\n".join(f'"{col}" {col_type}' for col, col_type in desired_columns.items())
 
-            try:
-                with self.query.cursor() as cur:
-                    # Create table with COSMOS_DATA_TAG as a symbol for use as filtering/indexing column,
-                    sql = f"""
-                        CREATE TABLE IF NOT EXISTS "{table_name}" (
-                            PACKET_TIMESECONDS timestamp_ns,
-                            RECEIVED_TIMESECONDS timestamp_ns,
-                            RECEIVED_COUNT long,
-                            COSMOS_DATA_TAG symbol """
+            # Create table with COSMOS_DATA_TAG as a symbol for use as filtering/indexing column,
+            sql = f"""
+                CREATE TABLE IF NOT EXISTS "{table_name}" (
+                    PACKET_TIMESECONDS timestamp_ns,
+                    RECEIVED_TIMESECONDS timestamp_ns,
+                    RECEIVED_COUNT long,
+                    COSMOS_DATA_TAG symbol """
 
-                    # COSMOS command packets have an extra field for command information: user, approver, etc
-                    # COSMOS telemetry packets may also have an extra field for additional information that doesn't fit in defined items
-                    sql += ",\nCOSMOS_EXTRA varchar"
-                    if columns_sql:
-                        sql += f",\n{columns_sql}"
+            # COSMOS command packets have an extra field for command information: user, approver, etc
+            # COSMOS telemetry packets may also have an extra field for additional information that doesn't fit in defined items
+            sql += ",\nCOSMOS_EXTRA varchar"
+            if columns_sql:
+                sql += f",\n{columns_sql}"
 
-                    # Primary DEDUP will be on PACKET_TIMESECONDS, RECEIVED_TIMESECONDS
-                    # If for some reason you're duplicating RECEIVED_TIMESECONDS you can
-                    # explicitly include COSMOS_DATA_TAG as well.
-                    sql += """
-                        ) TIMESTAMP(PACKET_TIMESECONDS)
-                            PARTITION BY DAY
-                            DEDUP UPSERT KEYS (PACKET_TIMESECONDS, RECEIVED_TIMESECONDS, COSMOS_DATA_TAG)
-                    """
+            # Primary DEDUP will be on PACKET_TIMESECONDS
+            # If for some reason you're duplicating PACKET_TIMESECONDS you can
+            # explicitly include COSMOS_DATA_TAG as well.
+            sql += """
+                ) TIMESTAMP(PACKET_TIMESECONDS)
+                    PARTITION BY DAY
+            """
 
-                    # Add TTL clause if specified
-                    # QuestDB TTL format: TTL <value> <unit> where unit is HOUR, DAY, WEEK, MONTH, YEAR
-                    if retain_time:
-                        retain_time_sql = self._convert_retain_time_to_questdb_format(retain_time)
-                        if retain_time_sql:
-                            sql += f"\n                        TTL {retain_time_sql}"
+            # Add TTL clause if specified
+            # QuestDB TTL format: TTL <value> <unit> where unit is HOUR, DAY, WEEK, MONTH, YEAR
+            if retain_time:
+                retain_time_sql = self._convert_retain_time_to_questdb_format(retain_time)
+                if retain_time_sql:
+                    sql += f"\n                TTL {retain_time_sql}"
 
-                    self._log_info(f"QuestDB: Creating table:\n{sql}")
-                    cur.execute(sql)
-            except psycopg.Error as error:
-                self._log_error(f"QuestDB: Error creating table {table_name}: {error}")
+            # This is good debugging info but can be noisy in production especially with a lot of packets
+            # self._log_info(f"QuestDB: Creating table:\n{sql}")
+            self._execute_ddl(sql)
 
         return table_name
 
-    def _convert_retain_time_to_questdb_format(self, retain_time):
+    def _reconcile_ttl(self, table_name, retain_time):
         """
-        Convert TTL from compact format (e.g., "30d", "1y") to QuestDB format (e.g., "30 DAY", "1 YEAR").
+        Apply retain_time to an already existing table via ALTER TABLE SET TTL.
+
+        TTL can only be declared in CREATE TABLE, so a table created before a
+        retain time was configured (or created with a different one) keeps its old
+        TTL forever unless it is explicitly altered.
+
+        This is best effort and never raises. Retention is not load bearing for ingest
+        and callers such as the tsdb microservice ingress error recovery path clear
+        buffered rows when create_table raises.
+
+        Args:
+            table_name: Sanitized table name
+            retain_time: TTL string like "30d", or None to remove any existing TTL
+        """
+        desired = self._normalize_retain_time(retain_time)
+        existing = self._get_existing_ttl(table_name)
+        if existing is None:
+            # Couldn't read the current TTL, don't guess and thrash the table with DDL
+            return
+
+        # QuestDB reports "no TTL" as value 0. Use the same sentinel for a removed retain time.
+        if desired is None:
+            if retain_time:
+                # Invalid value, already warned in _normalize_retain_time. Leave the table alone.
+                return
+            desired = (0, "HOUR")
+
+        if desired == existing:
+            return
+
+        try:
+            self._execute_ddl(f'ALTER TABLE "{table_name}" SET TTL {desired[0]} {desired[1]}')
+        except psycopg.Error as error:
+            self._log_error(f"QuestDB: Error setting TTL on table {table_name}: {error}")
+            return
+        if desired[0] == 0:
+            self._log_info(f"QuestDB: Removed TTL from table {table_name} (was {existing[0]} {existing[1]})")
+        else:
+            self._log_info(
+                f"QuestDB: Set TTL on table {table_name} to {desired[0]} {desired[1]} (was {existing[0]} {existing[1]})"
+            )
+
+    def _get_existing_ttl(self, table_name):
+        """
+        Query QuestDB for the TTL currently set on a table.
+
+        Returns:
+            Tuple of (value, unit) where value 0 means no TTL, or None if the TTL
+            could not be determined.
+        """
+        try:
+            with self.query.cursor() as cur:
+                cur.execute("SELECT ttlValue, ttlUnit FROM tables() WHERE table_name = %s", (table_name,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return (int(row[0]), str(row[1]).upper())
+        except (psycopg.Error, TypeError, ValueError) as error:
+            # Connection errors are swallowed too. Retention is best effort and callers
+            # like the ingress error recovery path drop buffered rows on exception.
+            # TypeError / ValueError can occur in unit tests with mock cursors
+            self._log_warn(f"QuestDB: Could not read TTL for table {table_name}: {error}")
+            return None
+
+    def _normalize_retain_time(self, retain_time):
+        """
+        Convert TTL from compact format (e.g., "30d") to the normalized (value, unit)
+        pair QuestDB reports in tables().
+
+        QuestDB rewrites TTLs into the largest unit that divides evenly (48 HOUR becomes
+        2 DAY, 7 DAY becomes 1 WEEK, 12 MONTH becomes 1 YEAR), so applying the same
+        normalization here lets the desired TTL be compared directly against the existing one.
+
+        QuestDB also requires the TTL to be an integer multiple of the partition size and
+        only ever drops whole partitions. Tables are PARTITION BY DAY, so an hours value
+        that isn't a multiple of 24 is rejected outright by QuestDB and is rounded up to
+        the next whole day here instead ("1h" and "23h" become 1 DAY, "25h" becomes 2 DAY).
 
         Args:
             retain_time: TTL string in format like "30d", "1w", "6M", "1y"
 
         Returns:
-            QuestDB-compatible TTL string or None if invalid
+            Tuple of (value, unit) such as (30, "DAY"), or None if invalid
         """
         if not retain_time:
             return None
@@ -753,15 +1452,46 @@ class QuestDBClient:
             self._log_warn(f"QuestDB: Invalid retain_time format '{retain_time}', expected format like '30d', '1y'")
             return None
 
-        value = match.group(1)
-        unit_suffix = match.group(2)
-        questdb_unit = unit_map.get(unit_suffix)
+        value = int(match.group(1))
+        unit = unit_map[match.group(2)]
 
-        if not questdb_unit:
-            self._log_warn(f"QuestDB: Unknown retain_time unit '{unit_suffix}'")
+        if value == 0:
+            self._log_warn(f"QuestDB: Invalid retain_time '{retain_time}', value must be greater than 0")
             return None
 
-        return f"{value} {questdb_unit}"
+        if unit == "HOUR":
+            # Tables are PARTITION BY DAY and QuestDB drops whole partitions only, so round
+            # up to the next whole day rather than retain less data than requested
+            days = -(-value // 24)
+            if value % 24 != 0:
+                self._log_warn(
+                    f"QuestDB: retain_time '{retain_time}' is not a multiple of the DAY partition size, "
+                    f"using {days} DAY instead"
+                )
+            value = days
+            unit = "DAY"
+        if unit == "DAY" and value % 7 == 0:
+            value //= 7
+            unit = "WEEK"
+        if unit == "MONTH" and value % 12 == 0:
+            value //= 12
+            unit = "YEAR"
+        return (value, unit)
+
+    def _convert_retain_time_to_questdb_format(self, retain_time):
+        """
+        Convert TTL from compact format (e.g., "30d", "1y") to QuestDB format (e.g., "30 DAY", "1 YEAR").
+
+        Args:
+            retain_time: TTL string in format like "30d", "1w", "6M", "1y"
+
+        Returns:
+            QuestDB-compatible TTL string or None if invalid
+        """
+        normalized = self._normalize_retain_time(retain_time)
+        if normalized is None:
+            return None
+        return f"{normalized[0]} {normalized[1]}"
 
     def convert_value(self, value, item_name, table_name=None):
         """
@@ -801,21 +1531,12 @@ class QuestDBClient:
         if is_varchar and not isinstance(value, str):
             return str(value), False
 
-        # Check if this column stores integers as DECIMAL (64-bit integer columns)
-        if table_name:
-            decimal_int_key = f"{table_name}__{item_name}"
-            is_decimal_int = decimal_int_key in self.decimal_int_columns
-        else:
-            is_decimal_int = False
-
         # Handle various data types for non-DERIVED columns
         match value:
             case int():
-                # 64-bit integer columns are stored as DECIMAL - send as string via ILP
-                # QuestDB casts string values to DECIMAL for pre-created DECIMAL columns.
                 # QuestDB Python client uses C long internally (signed 64-bit).
-                # Values outside this range must be strings for DECIMAL columns.
-                if is_decimal_int or value > 9223372036854775807 or value < -9223372036854775808:
+                # Values outside signed 64-bit range must be sent as strings.
+                if value > 9223372036854775807 or value < -9223372036854775808:
                     value = str(value)
 
             case float():
@@ -911,16 +1632,26 @@ class QuestDBClient:
             columns: Dict of column_name -> value
             timestamp_ns: Packet timestamp in nanoseconds (stored as PACKET_TIMESECONDS)
             rx_timestamp_ns: Received timestamp in nanoseconds (stored as RECEIVED_TIMESECONDS, optional)
+
+        Returns:
+            True if a batch flush was performed, False otherwise
         """
         if rx_timestamp_ns is not None:
             # Convert nanoseconds to datetime for QuestDB timestamp column
             columns["RECEIVED_TIMESECONDS"] = datetime.fromtimestamp(rx_timestamp_ns / 1_000_000_000, tz=timezone.utc)
+        self.pending_rows.append((table_name, columns.copy(), timestamp_ns))
         self.ingest.row(table_name, columns=columns, at=TimestampNanos(timestamp_ns))
+        # Flush in batches to avoid overwhelming QuestDB's HTTP endpoint
+        if len(self.pending_rows) >= self.batch_size:
+            self.flush()
+            return True
+        return False
 
     def flush(self):
         """Flush pending writes to QuestDB."""
         if self.ingest:
             self.ingest.flush()
+            self.pending_rows.clear()
 
     def _convert_column_to_json(self, table_name, column_name, columns):
         """Mark a column for JSON serialization and convert its current value."""
@@ -932,10 +1663,11 @@ class QuestDBClient:
             else:
                 columns[column_name] = json.dumps(value)
 
-    def _reconnect_and_retry_row(self, table_name, columns, timestamp_ns):
-        """Reconnect the ILP sender and retry writing the row."""
+    def _reconnect_and_retry_pending(self):
+        """Reconnect the ILP sender and replay all pending rows."""
         self.connect_ingest()
-        self.ingest.row(table_name, columns=columns, at=TimestampNanos(timestamp_ns))
+        for table_name, columns, timestamp_ns in self.pending_rows:
+            self.ingest.row(table_name, columns=columns, at=TimestampNanos(timestamp_ns))
 
     # Map QuestDB column types to Python casting functions for value conversion.
     # Used by handle_ingress_error to cast mismatched values to fit the column type.
@@ -949,6 +1681,7 @@ class QuestDBClient:
         "VARCHAR": str,
         "STRING": str,
         "SYMBOL": str,
+        # Legacy DECIMAL columns accept string values via ILP auto-cast
         "DECIMAL": str,
     }
 
@@ -970,7 +1703,7 @@ class QuestDBClient:
         except (ValueError, TypeError, OverflowError):
             return None
 
-    def handle_ingress_error(self, error, table_name, columns, timestamp_ns):
+    def handle_ingress_error(self, error):
         """
         Handle an IngressError by casting the value to fit the column type.
 
@@ -978,89 +1711,103 @@ class QuestDBClient:
         IngressErrors indicate the data doesn't match the user's definitions.
         We cast the value to fit the column type rather than altering the schema.
 
+        Uses self.pending_rows (populated by write_row) to find and fix the
+        affected row data, then replays all pending rows.
+
         Args:
             error: The IngressError
-            table_name: Table name
-            columns: Column values dict
-            timestamp_ns: Timestamp in nanoseconds
 
         Returns:
             True if error was handled and retry succeeded, False otherwise
         """
         self._log_warn(f"QuestDB: IngressError: {error}\n")
 
-        if "cast error from protocol type" not in str(error):
+        error_message = str(error)
+        is_cast_error = "cast error from protocol type" in error_message
+        is_value_error = "cannot be converted to column type" in error_message
+
+        if not is_cast_error and not is_value_error:
             self._log_error(f"QuestDB: Error writing to QuestDB: {error}\n")
+            self.pending_rows.clear()
+            try:
+                time.sleep(0.1)
+                self.connect_ingest()
+                self._log_info("QuestDB: Reconnected after connection error")
+            except Exception as reconnect_err:
+                self._log_error(f"QuestDB: Failed to reconnect: {reconnect_err}")
             return False
 
         try:
-            error_message = str(error)
-            table_match = re.search(r"table:\s+(.+?),", error_message)
-            column_match = re.search(r"column:\s+(.+?);", error_message)
-            type_match = re.search(r"protocol type:\s+([A-Z]+(?:\[\])?)\s", error_message)
+            table_match = re.search(r"table:\s+(\S[^,\n]*),", error_message)
+            column_match = re.search(r"column:\s+(\S[^;\n]*);", error_message)
             to_type_match = re.search(r"column type:\s+([A-Z]+)", error_message)
 
-            if not (table_match and column_match and type_match):
-                self._log_error("QuestDB: Could not parse table, column, or type from error message")
+            # "cast error from protocol type" includes the protocol type;
+            # "cannot be converted to column type" does not
+            type_match = re.search(r"protocol type:\s+([A-Z]+(?:\[\])?)\s", error_message)
+            protocol_type = type_match.group(1) if type_match else None
+
+            if not (table_match and column_match):
+                self._log_error("QuestDB: Could not parse table or column from error message")
                 return False
 
             err_table_name = table_match.group(1)
             column_name = column_match.group(1)
-            protocol_type = type_match.group(1)
             column_type = to_type_match.group(1) if to_type_match else ""
 
-            is_array_protocol = protocol_type.endswith("[]") or protocol_type.upper() == "ARRAY"
+            is_array_protocol = protocol_type is not None and (
+                protocol_type.endswith("[]") or protocol_type.upper() == "ARRAY"
+            )
 
-            # Handle array type mismatches — convert to JSON string
+            # Apply the fix to all pending rows for the affected table
+            fixed = False
+            for _row_table, columns, _row_ts in self.pending_rows:
+                if _row_table != err_table_name:
+                    continue
+
+                # Handle array type mismatches — convert to JSON string
+                if is_array_protocol:
+                    self._convert_column_to_json(err_table_name, column_name, columns)
+                    fixed = True
+                    continue
+
+                # For scalar type mismatches, cast the value to fit the column type
+                if column_name not in columns:
+                    continue
+
+                value = columns[column_name]
+                casted = self._cast_value_to_column_type(value, column_type)
+                if casted is not None:
+                    columns[column_name] = casted
+                    fixed = True
+                else:
+                    # Can't cast — remove from row (will be NULL in QuestDB)
+                    del columns[column_name]
+                    fixed = True
+
+            if not fixed:
+                self._log_error(
+                    f"QuestDB: Could not find column {column_name} in pending rows for table {err_table_name}"
+                )
+                return False
+
+            # Log and persist tracking for future rows
             if is_array_protocol:
-                self._convert_column_to_json(err_table_name, column_name, columns)
                 self._log_warn(
                     f"QuestDB: Column {column_name} in table {err_table_name} "
                     f"received array data but column type is {column_type}. "
                     f"Serializing as JSON string."
                 )
-                self._reconnect_and_retry_row(table_name, columns, timestamp_ns)
-                return True
-
-            # Handle INTEGER to DECIMAL cast error by converting value to string
-            # QuestDB casts string values to DECIMAL for pre-created DECIMAL columns
-            if protocol_type == "INTEGER" and column_type == "DECIMAL":
-                if column_name in columns:
-                    columns[column_name] = str(columns[column_name])
-                    self.decimal_int_columns[f"{err_table_name}__{column_name}"] = True
-                    self._log_warn(
-                        f"QuestDB: Column {column_name} in table {err_table_name} "
-                        f"is DECIMAL but received INTEGER. Converting value to string."
-                    )
-                    self._reconnect_and_retry_row(table_name, columns, timestamp_ns)
-                    return True
-                return False
-
-            # For scalar type mismatches, cast the value to fit the column type
-            if column_name not in columns:
-                return False
-
-            value = columns[column_name]
-            casted = self._cast_value_to_column_type(value, column_type)
-            if casted is not None:
-                columns[column_name] = casted
-                # Persist tracking so convert_value() handles future rows
-                if column_type in ("VARCHAR", "STRING"):
+            else:
+                if column_type in ("VARCHAR", "STRING", "DECIMAL"):
                     self.varchar_columns[f"{err_table_name}__{column_name}"] = True
                 self._log_warn(
                     f"QuestDB: Column {column_name} in table {err_table_name} "
                     f"expected {column_type} but received {protocol_type}. "
-                    f"Cast value from {repr(value)} to {repr(casted)}."
+                    f"Value cast applied."
                 )
-            else:
-                # Can't cast — remove from row (will be NULL in QuestDB)
-                del columns[column_name]
-                self._log_warn(
-                    f"QuestDB: Column {column_name} in table {err_table_name} "
-                    f"expected {column_type} but received {protocol_type}. "
-                    f"Could not cast {repr(value)}, storing as NULL."
-                )
-            self._reconnect_and_retry_row(table_name, columns, timestamp_ns)
+
+            self._reconnect_and_retry_pending()
             return True
 
         except Exception as exc:

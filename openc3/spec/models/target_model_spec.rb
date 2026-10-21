@@ -21,6 +21,7 @@
 require 'spec_helper'
 require 'fileutils'
 require 'openc3/models/target_model'
+require 'openc3/packets/packet'
 require 'openc3/models/microservice_model'
 require 'openc3/utilities/aws_bucket'
 require 'openc3/utilities/s3_autoload'
@@ -148,6 +149,33 @@ module OpenC3
         mods = TargetModel.modified_files('TEST', scope: "DEFAULT")
         expect(mods).to match_array([]) # return empty array when none modified
       end
+
+      it "returns bucket files as scope relative names" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT")
+        model.create
+        Bucket.getClient().put_object(bucket: ENV['OPENC3_CONFIG_BUCKET'],
+          key: "DEFAULT/targets_modified/TEST/procedures/new.rb", body: "puts 'hi'")
+        mods = TargetModel.modified_files('TEST', scope: "DEFAULT")
+        expect(mods).to match_array(["TEST/procedures/new.rb"])
+      end
+
+      it "combines local mode files with bucket only files" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT")
+        model.create
+        Bucket.getClient().put_object(bucket: ENV['OPENC3_CONFIG_BUCKET'],
+          key: "DEFAULT/targets_modified/TEST/target.txt", body: "IGNORE_PARAMETER CCSDSVER")
+        # LocalMode reports target relative paths and only knows about files
+        # COSMOS wrote locally, not one placed directly in the bucket
+        expect(LocalMode).to receive(:modified_files).with('TEST', scope: "DEFAULT")
+          .and_return(["screens/blah.txt"])
+        ENV['OPENC3_LOCAL_MODE'] = '1'
+        begin
+          mods = TargetModel.modified_files('TEST', scope: "DEFAULT")
+        ensure
+          ENV.delete('OPENC3_LOCAL_MODE')
+        end
+        expect(mods).to match_array(["TEST/screens/blah.txt", "TEST/target.txt"])
+      end
     end
 
     describe "self.delete_modified" do
@@ -158,6 +186,235 @@ module OpenC3
         model.create
         dels = TargetModel.delete_modified('TEST', scope: "DEFAULT")
         expect(dels).to match_array([] )# return empty array when none modified
+      end
+
+      it "deletes only the given files via TargetFile when a files list is passed" do
+        allow(TargetModel).to receive(:modified_files).with('TEST', scope: "DEFAULT")
+          .and_return(["TEST/screens/a.txt", "TEST/lib/b.rb", "TEST/lib/c.rb"])
+        expect(OpenC3::TargetFile).to receive(:destroy).with("DEFAULT", "TEST/screens/a.txt")
+        expect(OpenC3::TargetFile).to receive(:destroy).with("DEFAULT", "TEST/lib/b.rb")
+        TargetModel.delete_modified('TEST', scope: "DEFAULT", files: ["TEST/screens/a.txt", "TEST/lib/b.rb*"])
+      end
+
+      it "ignores files that are not modified files of the target" do
+        allow(TargetModel).to receive(:modified_files).with('TEST', scope: "DEFAULT")
+          .and_return(["TEST/screens/a.txt"])
+        expect(OpenC3::TargetFile).to_not receive(:destroy)
+        TargetModel.delete_modified('TEST', scope: "DEFAULT", files: [
+          "TEST/../../OTHER/targets_modified/INST/procedures/x.rb",
+          "../../OTHER/targets_modified/INST/procedures/x.rb",
+          "OTHER_TARGET/screens/a.txt",
+          { "not" => "a string" },
+        ])
+      end
+
+      it "rejects an invalid target_name" do
+        expect { TargetModel.delete_modified('../OTHER', scope: "DEFAULT") }.to raise_error(ArgumentError)
+        expect { TargetModel.delete_modified('A/B', scope: "DEFAULT") }.to raise_error(ArgumentError)
+      end
+
+      it "falls back to deleting all modified files when the files list is empty" do
+        # Empty list takes the original (delete-all) path, not the per-file path
+        expect(OpenC3::TargetFile).to_not receive(:destroy)
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT")
+        model.create
+        TargetModel.delete_modified('TEST', scope: "DEFAULT", files: [])
+      end
+    end
+
+    describe "self.plugin_version_label" do
+      it "returns the plugin name and version derived from the plugin instance name" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT",
+          plugin: "openc3-cosmos-demo-7.2.0.gem__0")
+        model.create
+        expect(TargetModel.plugin_version_label("TEST", scope: "DEFAULT")).to eql("openc3-cosmos-demo 7.2.0")
+      end
+
+      it "returns nil when the target does not exist" do
+        expect(TargetModel.plugin_version_label("NOPE", scope: "DEFAULT")).to be_nil
+      end
+
+      it "returns nil when the target has no plugin" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT")
+        model.create
+        expect(TargetModel.plugin_version_label("TEST", scope: "DEFAULT")).to be_nil
+      end
+
+      it "returns nil when the plugin name has no version segment" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT",
+          plugin: "singleword__0")
+        model.create
+        expect(TargetModel.plugin_version_label("TEST", scope: "DEFAULT")).to be_nil
+      end
+    end
+
+    describe "self.plugin_name_version" do
+      it "splits a plugin instance name into base name and version" do
+        expect(TargetModel.plugin_name_version("openc3-cosmos-demo-7.2.0.gem__0")).to eql(["openc3-cosmos-demo", "7.2.0"])
+      end
+
+      it "drops the .gem extension when no instance suffix is present" do
+        expect(TargetModel.plugin_name_version("openc3-cosmos-demo-7.2.0.gem")).to eql(["openc3-cosmos-demo", "7.2.0"])
+      end
+
+      it "returns nil for nil, empty, or version-less names" do
+        expect(TargetModel.plugin_name_version(nil)).to be_nil
+        expect(TargetModel.plugin_name_version("")).to be_nil
+        expect(TargetModel.plugin_name_version("singleword__0")).to be_nil
+      end
+    end
+
+    describe "self.plugin_base_name" do
+      it "returns the version-stripped base name for the target's plugin" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT",
+          plugin: "openc3-cosmos-demo-7.2.0.gem__0")
+        model.create
+        expect(TargetModel.plugin_base_name("TEST", scope: "DEFAULT")).to eql("openc3-cosmos-demo")
+      end
+
+      it "is stable across version upgrades (only the version segment changes)" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT",
+          plugin: "openc3-cosmos-demo-7.3.0.gem__0")
+        model.create
+        expect(TargetModel.plugin_base_name("TEST", scope: "DEFAULT")).to eql("openc3-cosmos-demo")
+      end
+
+      it "returns nil when the target does not exist" do
+        expect(TargetModel.plugin_base_name("NOPE", scope: "DEFAULT")).to be_nil
+      end
+
+      it "returns nil when the target has no plugin" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT")
+        model.create
+        expect(TargetModel.plugin_base_name("TEST", scope: "DEFAULT")).to be_nil
+      end
+    end
+
+    describe "self.destroy_script_versions" do
+      it "calls VersionStore.destroy_repo with the base name when the store is present" do
+        store = Class.new do
+          def self.calls; @calls ||= []; end
+          def self.destroy_repo(scope:, plugin:); calls << [scope, plugin]; end
+        end
+        stub_const("VersionStore", store)
+        # Skip the enterprise require; the constant is already defined.
+        allow(TargetModel).to receive(:require).with("openc3-enterprise/utilities/version_store").and_return(true)
+        TargetModel.destroy_script_versions("openc3-cosmos-demo-7.2.0.gem__0", scope: "DEFAULT")
+        expect(store.calls).to eql([["DEFAULT", "openc3-cosmos-demo"]])
+      end
+
+      it "is a no-op for a version-less plugin name" do
+        store = Class.new do
+          def self.called; @called ||= false; end
+          def self.destroy_repo(scope:, plugin:); @called = true; end
+        end
+        stub_const("VersionStore", store)
+        TargetModel.destroy_script_versions("singleword__0", scope: "DEFAULT")
+        expect(store.called).to be false
+      end
+
+      it "is a no-op when the enterprise store gem is absent" do
+        hide_const("VersionStore") if defined?(VersionStore)
+        allow(TargetModel).to receive(:require).with("openc3-enterprise/utilities/version_store").and_raise(LoadError)
+        expect { TargetModel.destroy_script_versions("openc3-cosmos-demo-7.2.0.gem__0", scope: "DEFAULT") }.not_to raise_error
+      end
+    end
+
+    describe "plugin upgrade Version History helpers" do
+      let(:model) { TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT") }
+      let(:bucket) { double("bucket") }
+      before(:each) { model.instance_variable_set(:@bucket, bucket) }
+
+      def shadow_response(body)
+        double("resp", body: double("io", read: body))
+      end
+
+      describe "#collect_modified_diff" do
+        it "appends the name when the modified copy differs from the plugin content" do
+          allow(bucket).to receive(:get_object).and_return(shadow_response("user version"))
+          collector = []
+          model.send(:collect_modified_diff, "TEST/screen.txt", "plugin version", collector)
+          expect(collector).to eql(["TEST/screen.txt"])
+        end
+
+        it "does not append when the modified copy matches the plugin content" do
+          allow(bucket).to receive(:get_object).and_return(shadow_response("same"))
+          collector = []
+          model.send(:collect_modified_diff, "TEST/screen.txt", "same", collector)
+          expect(collector).to be_empty
+        end
+
+        it "does not append when there is no modified copy" do
+          allow(bucket).to receive(:get_object).and_return(nil)
+          collector = []
+          model.send(:collect_modified_diff, "TEST/screen.txt", "anything", collector)
+          expect(collector).to be_empty
+        end
+
+        it "logs and swallows bucket errors" do
+          allow(bucket).to receive(:get_object).and_raise("boom")
+          expect(Logger).to receive(:warn).with(/Modified diff check failed/)
+          collector = []
+          expect { model.send(:collect_modified_diff, "TEST/screen.txt", "x", collector) }.to_not raise_error
+          expect(collector).to be_empty
+        end
+      end
+
+      describe "#version_store_available?" do
+        it "is true when the store is present and enabled" do
+          stub_const("VersionStore", double("VersionStore", enabled?: true))
+          expect(model.send(:version_store_available?)).to be true
+        end
+
+        it "is false when the store is present but disabled" do
+          stub_const("VersionStore", double("VersionStore", enabled?: false))
+          expect(model.send(:version_store_available?)).to be false
+        end
+
+        it "is false when the enterprise store gem is absent" do
+          hide_const("VersionStore") if defined?(VersionStore)
+          allow(model).to receive(:require).with("openc3-enterprise/utilities/version_store").and_raise(LoadError)
+          expect(model.send(:version_store_available?)).to be false
+        end
+      end
+
+      describe "#apply_upgrade_version" do
+        let(:store) { double("VersionStore") }
+        before(:each) { stub_const("VersionStore", store) }
+
+        it "versions the modified copy, drops the shadow, then versions the plugin content" do
+          allow(bucket).to receive(:get_object).and_return(shadow_response("modified"))
+          ctx = { username: "upgrader", plugin: "test-plugin 1.0.0", version_files: ["TEST/screen.txt"] }
+          # Order: commit the pre-upgrade modified body, remove the shadow, then
+          # commit the incoming plugin content attributed to the upgrade.
+          expect(store).to receive(:commit).with(scope: "DEFAULT", name: "TEST/screen.txt", text: "modified").ordered
+          expect(OpenC3::TargetFile).to receive(:destroy).with("DEFAULT", "TEST/screen.txt").ordered
+          expect(store).to receive(:commit).with(scope: "DEFAULT", name: "TEST/screen.txt", text: "plugin",
+            username: "upgrader", source: 'plugin-upgrade', plugin: "test-plugin 1.0.0").ordered
+          model.send(:apply_upgrade_version, "TEST/screen.txt", "plugin", ctx)
+        end
+
+        it "does nothing when the modified copy already matches the plugin content" do
+          allow(bucket).to receive(:get_object).and_return(shadow_response("identical"))
+          expect(store).to_not receive(:commit)
+          expect(OpenC3::TargetFile).to_not receive(:destroy)
+          model.send(:apply_upgrade_version, "TEST/screen.txt", "identical", { username: "u", plugin: "p 1", version_files: [] })
+        end
+
+        it "does nothing when there is no modified copy" do
+          allow(bucket).to receive(:get_object).and_return(nil)
+          expect(store).to_not receive(:commit)
+          model.send(:apply_upgrade_version, "TEST/screen.txt", "plugin", { username: "u", plugin: "p 1", version_files: [] })
+        end
+
+        it "logs and swallows errors so the upgrade is not aborted" do
+          allow(bucket).to receive(:get_object).and_return(shadow_response("modified"))
+          allow(store).to receive(:commit).and_raise("git boom")
+          expect(Logger).to receive(:warn).with(/Version History upgrade capture failed/)
+          expect {
+            model.send(:apply_upgrade_version, "TEST/screen.txt", "plugin", { username: "u", plugin: "p 1", version_files: [] })
+          }.to_not raise_error
+        end
       end
     end
 
@@ -231,7 +488,7 @@ module OpenC3
       end
 
       it "raises for a non-existent target" do
-        expect { TargetModel.packets("BLAH", scope: "DEFAULT") }.to raise_error("Target 'BLAH' does not exist for scope: DEFAULT")
+        expect { TargetModel.packets("BLAH", scope: "DEFAULT") }.to raise_error("Target 'BLAH' does not exist for scope: DEFAULT (TargetModel)")
       end
 
       it "returns all telemetry packets" do
@@ -310,11 +567,11 @@ module OpenC3
       end
 
       it "raises for a non-existent target" do
-        expect { TargetModel.packet("BLAH", "HEALTH_STATUS", type: :TLM, scope: "DEFAULT") }.to raise_error("Packet 'BLAH HEALTH_STATUS' does not exist")
+        expect { TargetModel.packet("BLAH", "HEALTH_STATUS", type: :TLM, scope: "DEFAULT") }.to raise_error("Packet definition 'BLAH HEALTH_STATUS' does not exist")
       end
 
       it "raises for a non-existent packet" do
-        expect { TargetModel.packet("INST", "BLAH", type: :TLM, scope: "DEFAULT") }.to raise_error("Packet 'INST BLAH' does not exist")
+        expect { TargetModel.packet("INST", "BLAH", type: :TLM, scope: "DEFAULT") }.to raise_error("Packet definition 'INST BLAH' does not exist")
       end
 
       it "returns packet hash if the telemetry exists" do
@@ -332,13 +589,14 @@ module OpenC3
       it "caches packet lookups" do
         # Clear cache before test
         TargetModel.clear_packet_cache
+        store_instance = Store.instance(db_shard: 0)
 
-        # First call should hit the Store
-        expect(Store).to receive(:hget).once.and_call_original
+        # First call should hit the Store instance
+        expect(store_instance).to receive(:hget).with("DEFAULT__openc3tlm__INST", "HEALTH_STATUS").once.and_call_original
         pkt1 = TargetModel.packet("INST", "HEALTH_STATUS", type: :TLM, scope: "DEFAULT")
 
-        # Second call should hit cache and NOT call Store
-        expect(Store).not_to receive(:hget)
+        # Second call should hit cache and NOT call Store instance for packet data
+        expect(store_instance).not_to receive(:hget).with("DEFAULT__openc3tlm__INST", "HEALTH_STATUS")
         pkt2 = TargetModel.packet("INST", "HEALTH_STATUS", type: :TLM, scope: "DEFAULT")
 
         # Both packets should be equivalent
@@ -348,9 +606,10 @@ module OpenC3
       it "expires cache after timeout" do
         # Clear cache before test
         TargetModel.clear_packet_cache
+        store_instance = Store.instance(db_shard: 0)
 
         # First call populates cache
-        expect(Store).to receive(:hget).once.and_call_original
+        expect(store_instance).to receive(:hget).with("DEFAULT__openc3tlm__INST", "HEALTH_STATUS").once.and_call_original
         TargetModel.packet("INST", "HEALTH_STATUS", type: :TLM, scope: "DEFAULT")
 
         # Set timeout to 0 to force expiration
@@ -360,7 +619,7 @@ module OpenC3
         end
 
         # Next call should miss cache due to expiration and hit Store again
-        expect(Store).to receive(:hget).once.and_call_original
+        expect(store_instance).to receive(:hget).with("DEFAULT__openc3tlm__INST", "HEALTH_STATUS").once.and_call_original
         TargetModel.packet("INST", "HEALTH_STATUS", type: :TLM, scope: "DEFAULT")
 
         # Restore timeout
@@ -372,29 +631,31 @@ module OpenC3
       it "invalidates cache on set_packet" do
         # Clear cache before test
         TargetModel.clear_packet_cache
+        store_instance = Store.instance(db_shard: 0)
 
         # Populate cache
-        expect(Store).to receive(:hget).once.and_call_original
+        expect(store_instance).to receive(:hget).with("DEFAULT__openc3tlm__INST", "HEALTH_STATUS").once.and_call_original
         pkt = TargetModel.packet("INST", "HEALTH_STATUS", type: :TLM, scope: "DEFAULT")
 
         # set_packet should invalidate the cache entry
         TargetModel.set_packet("INST", "HEALTH_STATUS", pkt, type: :TLM, scope: "DEFAULT")
 
         # Next get should miss cache and hit Store again
-        expect(Store).to receive(:hget).once.and_call_original
+        expect(store_instance).to receive(:hget).with("DEFAULT__openc3tlm__INST", "HEALTH_STATUS").once.and_call_original
         TargetModel.packet("INST", "HEALTH_STATUS", type: :TLM, scope: "DEFAULT")
       end
 
       it "caches different packet types separately" do
         # Clear cache before test
         TargetModel.clear_packet_cache
+        store_instance = Store.instance(db_shard: 0)
 
         # Get telemetry packet - should hit Store
-        expect(Store).to receive(:hget).with("DEFAULT__openc3tlm__INST", "HEALTH_STATUS").once.and_call_original
+        expect(store_instance).to receive(:hget).with("DEFAULT__openc3tlm__INST", "HEALTH_STATUS").once.and_call_original
         tlm_pkt = TargetModel.packet("INST", "HEALTH_STATUS", type: :TLM, scope: "DEFAULT")
 
         # Get command packet - should also hit Store (different cache key)
-        expect(Store).to receive(:hget).with("DEFAULT__openc3cmd__INST", "ABORT").once.and_call_original
+        expect(store_instance).to receive(:hget).with("DEFAULT__openc3cmd__INST", "ABORT").once.and_call_original
         cmd_pkt = TargetModel.packet("INST", "ABORT", type: :CMD, scope: "DEFAULT")
 
         # Verify they are different packets
@@ -421,15 +682,15 @@ module OpenC3
       end
 
       it "raises for a non-existent target" do
-        expect { TargetModel.packet_item("BLAH", "HEALTH_STATUS", "CCSDSVER", scope: "DEFAULT") }.to raise_error("Packet 'BLAH HEALTH_STATUS' does not exist")
+        expect { TargetModel.packet_item("BLAH", "HEALTH_STATUS", "CCSDSVER", scope: "DEFAULT") }.to raise_error("Packet definition 'BLAH HEALTH_STATUS' does not exist")
       end
 
       it "raises for a non-existent packet" do
-        expect { TargetModel.packet_item("INST", "BLAH", "CCSDSVER", scope: "DEFAULT") }.to raise_error("Packet 'INST BLAH' does not exist")
+        expect { TargetModel.packet_item("INST", "BLAH", "CCSDSVER", scope: "DEFAULT") }.to raise_error("Packet definition 'INST BLAH' does not exist")
       end
 
       it "raises for a non-existent item" do
-        expect { TargetModel.packet_item("INST", "HEALTH_STATUS", "BLAH", scope: "DEFAULT") }.to raise_error("Item 'INST HEALTH_STATUS BLAH' does not exist")
+        expect { TargetModel.packet_item("INST", "HEALTH_STATUS", "BLAH", scope: "DEFAULT") }.to raise_error("Item 'INST HEALTH_STATUS BLAH' does not exist (TargetModel)")
       end
 
       it "returns item hash if the telemetry item exists" do
@@ -458,11 +719,11 @@ module OpenC3
       end
 
       it "raises for a non-existent target" do
-        expect { TargetModel.packet_items("BLAH", "HEALTH_STATUS", ["CCSDSVER"], scope: "DEFAULT") }.to raise_error("Packet 'BLAH HEALTH_STATUS' does not exist")
+        expect { TargetModel.packet_items("BLAH", "HEALTH_STATUS", ["CCSDSVER"], scope: "DEFAULT") }.to raise_error("Packet definition 'BLAH HEALTH_STATUS' does not exist")
       end
 
       it "raises for a non-existent packet" do
-        expect { TargetModel.packet_items("INST", "BLAH", ["CCSDSVER"], scope: "DEFAULT") }.to raise_error("Packet 'INST BLAH' does not exist")
+        expect { TargetModel.packet_items("INST", "BLAH", ["CCSDSVER"], scope: "DEFAULT") }.to raise_error("Packet definition 'INST BLAH' does not exist")
       end
 
       it "raises for non-existent items" do
@@ -590,6 +851,7 @@ module OpenC3
         tf.puts "TARGET_MICROSERVICE CLEANUP"
         tf.puts "TLM_LOG_CYCLE_TIME 5"
         tf.puts "TLM_LOG_CYCLE_SIZE 6"
+        tf.puts "STORED_LIMITS_MODE DISABLE"
         tf.close
         parser.parse_file(tf.path) do |keyword, params|
           model.handle_config(parser, keyword, params)
@@ -602,6 +864,7 @@ module OpenC3
         expect(json['cmd_decom_retain_time']).to eql '30d'
         expect(json['tlm_decom_retain_time']).to eql '60d'
         expect(json['shard']).to eql 9
+        expect(json['stored_limits_mode']).to eql 'DISABLE'
         tf.unlink
       end
 
@@ -635,6 +898,86 @@ module OpenC3
         tf.unlink
       end
 
+      it "parses STORED_LIMITS_MODE PROCESS" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT")
+        model.create
+        parser = ConfigParser.new
+        tf = Tempfile.new
+        tf.puts "STORED_LIMITS_MODE PROCESS"
+        tf.close
+        parser.parse_file(tf.path) do |keyword, params|
+          model.handle_config(parser, keyword, params)
+        end
+        expect(model.stored_limits_mode).to eql 'PROCESS'
+        expect(model.as_json()['stored_limits_mode']).to eql 'PROCESS'
+        tf.unlink
+      end
+
+      it "parses STORED_LIMITS_MODE LOG" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT")
+        model.create
+        parser = ConfigParser.new
+        tf = Tempfile.new
+        tf.puts "STORED_LIMITS_MODE LOG"
+        tf.close
+        parser.parse_file(tf.path) do |keyword, params|
+          model.handle_config(parser, keyword, params)
+        end
+        expect(model.stored_limits_mode).to eql 'LOG'
+        expect(model.as_json()['stored_limits_mode']).to eql 'LOG'
+        tf.unlink
+      end
+
+      it "parses STORED_LIMITS_MODE DISABLE" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT")
+        model.create
+        parser = ConfigParser.new
+        tf = Tempfile.new
+        tf.puts "STORED_LIMITS_MODE DISABLE"
+        tf.close
+        parser.parse_file(tf.path) do |keyword, params|
+          model.handle_config(parser, keyword, params)
+        end
+        expect(model.stored_limits_mode).to eql 'DISABLE'
+        expect(model.as_json()['stored_limits_mode']).to eql 'DISABLE'
+        tf.unlink
+      end
+
+      it "parses STORED_LIMITS_MODE case-insensitively" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT")
+        model.create
+        parser = ConfigParser.new
+        tf = Tempfile.new
+        tf.puts "STORED_LIMITS_MODE log"
+        tf.close
+        parser.parse_file(tf.path) do |keyword, params|
+          model.handle_config(parser, keyword, params)
+        end
+        expect(model.stored_limits_mode).to eql 'LOG'
+        tf.unlink
+      end
+
+      it "rejects STORED_LIMITS_MODE with invalid value" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT")
+        model.create
+        parser = ConfigParser.new
+        tf = Tempfile.new
+        tf.puts "STORED_LIMITS_MODE INVALID"
+        tf.close
+        expect do
+          parser.parse_file(tf.path) do |keyword, params|
+            model.handle_config(parser, keyword, params)
+          end
+        end.to raise_error(ConfigParser::Error, /STORED_LIMITS_MODE must be one of PROCESS, LOG, or DISABLE/)
+        tf.unlink
+      end
+
+      it "defaults STORED_LIMITS_MODE to PROCESS" do
+        model = TargetModel.new(folder_name: "TEST", name: "TEST", scope: "DEFAULT")
+        expect(model.stored_limits_mode).to eql 'PROCESS'
+        expect(model.as_json()['stored_limits_mode']).to eql 'PROCESS'
+      end
+
     end
 
    describe "deploy" do
@@ -650,6 +993,25 @@ module OpenC3
         model = TargetModel.new(folder_name: @target, name: @target, scope: @scope, plugin: 'PLUGIN')
         model.create
         expect { model.deploy(@target_dir, variables) }.to raise_error(/No target files found/)
+      end
+
+      it "converts the target to .xtce and says which item is the packet time" do
+        model = TargetModel.new(folder_name: @target, name: @target, scope: @scope, plugin: 'PLUGIN')
+        model.create
+        Dir.mktmpdir do |output_dir|
+          expect { model.deploy(@target_dir, { "xtce_output" => output_dir, "time_association_name" => "PACKET_TIME" }) }
+            .to output(/Using mnemonic 'PACKET_TIME' as the packet time item/).to_stdout
+          expect(File.exist?(File.join(output_dir, @target, "cmd_tlm", "inst.xtce"))).to be true
+        end
+      end
+
+      it "says no TimeAssociation is written when no packet time item is given" do
+        model = TargetModel.new(folder_name: @target, name: @target, scope: @scope, plugin: 'PLUGIN')
+        model.create
+        Dir.mktmpdir do |output_dir|
+          expect { model.deploy(@target_dir, { "xtce_output" => output_dir }) }
+            .to output(/No packet time item given/).to_stdout
+        end
       end
 
       it "puts the packets in Redis" do
@@ -727,7 +1089,7 @@ module OpenC3
         expect(MicroserviceModel.names()).to be_empty
       end
 
-      it "deploys only command microservices if no telemetry" do
+      it "deploys COMMANDLOG and DECOM microservices if no telemetry" do
         @target = "EMPTY"
         FileUtils.mkdir_p("#{@target_dir}/targets/#{@target}/cmd_tlm")
         File.open("#{@target_dir}/targets/#{@target}/cmd_tlm/cmd.txt", 'w') do |file|
@@ -740,9 +1102,12 @@ module OpenC3
           model.deploy(@target_dir, {})
           expect(stdout.string).to include("#{@scope}__COMMANDLOG__#{@target}")
           expect(stdout.string).to_not include("#{@scope}__PACKETLOG__#{@target}")
-          expect(stdout.string).to_not include("#{@scope}__DECOM__#{@target}")
+          # DECOM deploys even without telemetry so build_cmd (routed via DECOMINTERFACE) still works
+          expect(stdout.string).to include("#{@scope}__DECOM__#{@target}")
         end
-        expect(MicroserviceModel.names()).to include("#{@scope}__COMMANDLOG__#{@target}")
+        expect(MicroserviceModel.names()).to include(
+          "#{@scope}__COMMANDLOG__#{@target}",
+          "#{@scope}__DECOM__#{@target}")
         FileUtils.rm_rf("#{@target_dir}/targets/#{@target}/cmd_tlm")
       end
 
@@ -797,6 +1162,27 @@ module OpenC3
         # Verify specific topic patterns
         expect(decom_topics.first).to match(/#{@scope}__DECOM__\{#{@target}\}__/)
         expect(decomcmd_topics.first).to match(/#{@scope}__DECOMCMD__\{#{@target}\}__/)
+      end
+    end
+
+    describe "check_column_header_lengths" do
+      def build_system(packet)
+        packet_config = double("PacketConfig", telemetry: { "INST" => { "PKT" => packet } }, commands: {})
+        double("System", packet_config: packet_config)
+      end
+
+      it "raises if an item name exceeds the QuestDB column header limit" do
+        model = TargetModel.new(folder_name: "INST", name: "INST", scope: "DEFAULT", plugin: 'PLUGIN')
+        packet = Packet.new("INST", "PKT")
+        packet.define_item("A" * 128, 0, 8, :UINT)
+        expect { model.check_column_header_lengths(build_system(packet)) }.to raise_error(/127 characters or less/)
+      end
+
+      it "does not raise for names within the limit" do
+        model = TargetModel.new(folder_name: "INST", name: "INST", scope: "DEFAULT", plugin: 'PLUGIN')
+        packet = Packet.new("INST", "PKT")
+        packet.define_item("A" * 127, 0, 8, :UINT)
+        expect { model.check_column_header_lengths(build_system(packet)) }.to_not raise_error
       end
     end
 

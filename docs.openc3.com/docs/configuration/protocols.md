@@ -8,14 +8,14 @@ sidebar_custom_props:
 
 Protocols process data on behalf of an [Interface](interfaces). They can modify the data being written, data being read, or both. Protocols can also mark a packet as stored instead of real-time which means COSMOS will not update the current value table with the packet data. Protocols can be layered and will be processed in order. For example, if you have a low-level encryption layer that must be first removed before processing a higher level buffer length protocol.
 
-:::info Protocol Run Order
+:::info[Protocol Run Order]
 Read protocols execute in the order specified (first specified runs first). Write protocols execute in the reverse order (last specified executes first).
 
 This ordering is critical when combining packet delineation protocols (e.g. Length, Terminated) with helper protocols (e.g. CRC, Ignore). Delineation protocols must run before helper protocols on reads so they can assemble complete packets first. On writes, delineation protocols must run after helper protocols so fields like the length are filled in before the CRC is calculated. Since write protocols execute in reverse order, the helper protocol must be listed before the delineation protocol for writes.
 
 To satisfy both directions, you may need to define a helper protocol twice — once for WRITE (before the delineation protocol) and once for READ (after it). For example, with a Length protocol and CRC protocol:
 
-```ruby
+```cosmos
 PROTOCOL WRITE CrcProtocol ...
 PROTOCOL READ_WRITE LengthProtocol ...
 PROTOCOL READ CrcProtocol ...
@@ -40,11 +40,19 @@ For more information about how Protocols fit with Interfaces and Accessors see [
 
 COSMOS provides the following packet delineation protocols: COBS, SLIP, Burst, Fixed, Length, Terminated and Preidentified. Each of these protocols has the primary purpose of separating out packets from a byte stream.
 
-COSMOS Enterprise provides the following packet delineation protocols: CCSDS CLTU (with BCH Encoding), CCSDS TCTF (with Randomizer), CCSDS TMTF (with Randomizer), and GEMS.
+COSMOS Enterprise provides the GEMS packet delineation protocol as well as the CCSDS TCTF, CLTU, TMTF, USLP and AOS framing protocols. It also provides COP-1 (a reliability layer on top of TC or USLP framing) and SDLS (a security engine used by the framing protocols), which do not delineate packets themselves. See [CCSDS Protocols](#ccsds-protocols-enterprise) for details.
 
 Note that all protocols take a final parameter called "Allow Empty Data". This indicates whether the protocol will allow an empty string to be passed down to later Protocols (instead of returning :STOP). Can be true, false, or nil, where nil is interpreted as true unless the Protocol is the last Protocol of the chain. End users of a protocol will almost always simply leave off this parameter. For more information read the [Custom Protocols](protocols.md#custom-protocols) documentation.
 
 Note the first parameter after the PROTOCOL keyword is how to apply the protocol: READ, WRITE, or READ_WRITE. Read applies the protocol on incoming packets (telemetry) and write on outgoing packets (commands). The next parameter is the protocol filename or class name. All other parameters are protocol specific.
+
+#### Maximum Buffer Size
+
+Protocols which delineate packets have to accumulate bytes until a complete packet has arrived. The Length and Preidentified protocols buffer until the number of bytes named by a length field on the wire has been received; the Terminated protocol buffers until it sees the termination characters. In all three cases the peer on the other end controls how much COSMOS buffers, so a peer which declares an enormous length, or never sends a terminator, can drive an interface microservice to memory exhaustion.
+
+COSMOS bounds this with a maximum buffer size, which defaults to 100,000,000 bytes (100 MB). This is far larger than any realistic packet, so it does not affect normal configurations. When the limit is hit the interface logs an error and disconnects, which drops the offending peer and clears the buffer. The Length and Preidentified protocols additionally reject a declared length larger than the limit immediately, without buffering the declared number of bytes first.
+
+Set the `OPENC3_PROTOCOL_MAX_BUFFER_SIZE` environment variable to change the limit for all protocols. Note that the Length and Preidentified protocols also take a Max Length parameter which bounds the value of the length field itself. Max Length is checked before the buffer size and gives a tighter, per-interface bound, so it is worth setting on those protocols in addition to the global limit.
 
 ### COBS Protocol
 
@@ -53,7 +61,7 @@ The Consistent Overhead Byte Stuffing (COBS) Protocol is an algorithm for encodi
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
 
-```python
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   PROTOCOL READ openc3/interfaces/protocols/cobs_protocol.py
 ```
@@ -63,7 +71,7 @@ Source code for [cobs_protocol.py](https://github.com/OpenC3/cosmos/blob/main/op
 </TabItem>
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   PROTOCOL READ CobsProtocol
 ```
@@ -93,7 +101,7 @@ The Serial Line IP (SLIP) Protocol defines a sequence of characters that frame I
 
 Usage in plugin.txt:
 
-```python
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Since we're using the defaults, none of the parameters are actually required
   PROTOCOL READ openc3/interfaces/protocols/slip_protocol.py None True True True 0xC0 0xDB 0xDC 0xDD
@@ -106,7 +114,7 @@ Source code for [slip_protocol.py](https://github.com/OpenC3/cosmos/blob/main/op
 
 Usage in plugin.txt:
 
-```ruby
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Since we're using the defaults, none of the parameters are actually required
   PROTOCOL READ SlipProtocol nil true true true 0xC0 0xDB 0xDC 0xDD
@@ -121,6 +129,8 @@ Source code for [slip_protocol.rb](https://github.com/OpenC3/cosmos/blob/main/op
 
 The Burst Protocol simply reads as much data as it can from the interface before returning the data as a COSMOS Packet (It returns a packet for each burst of data read). This Protocol relies on regular bursts of data delimited by time and thus is not very robust. However, it can utilize a sync pattern which does allow it to re-sync if necessary. It can also discard bytes from the incoming data to remove the sync pattern. Finally, it can add sync patterns to data being written out of the Interface.
 
+Note that Burst Protocol is the base class for many of the other protocols.
+
 | Parameter             | Description                                                                                                                                                                                 | Required | Default                  |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------------------------ |
 | Discard Leading Bytes | The number of bytes to discard from the binary data after reading. Note that this applies to bytes starting with the sync pattern if the sync pattern is being used.                        | No       | 0 (do not discard bytes) |
@@ -130,7 +140,7 @@ The Burst Protocol simply reads as much data as it can from the interface before
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
 
-```python
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Use a sync pattern but discard it
   PROTOCOL READ openc3/interfaces/protocols/burst_protocol.py 4 0x1ACFFC1D
@@ -141,7 +151,7 @@ Source code for [burst_protocol.py](https://github.com/OpenC3/cosmos/blob/main/o
 </TabItem>
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Use a sync pattern but discard it
   PROTOCOL READ BurstProtocol 4 0x1ACFFC1D
@@ -168,7 +178,7 @@ The Fixed Protocol reads a preset minimum amount of data which is necessary to p
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
 
-```python
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   PROTOCOL READ openc3/interfaces/protocols/fixed_protocol.py 6 4 0x1ACFFC1D True
 ```
@@ -178,7 +188,7 @@ Source code for [fixed_protocol.py](https://github.com/OpenC3/cosmos/blob/main/o
 </TabItem>
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   PROTOCOL READ FixedProtocol 6 4 0x1ACFFC1D true
 ```
@@ -201,7 +211,7 @@ The Length Protocol depends on a length field at a fixed location in the defined
 | Length Endianness            | The endianness of the length field. Must be either 'BIG_ENDIAN' or 'LITTLE_ENDIAN'.                                                                                                                                                                                                                                                                                                                                          | No       | 'BIG_ENDIAN'             |
 | Discard Leading Bytes        | The number of bytes to discard from the binary data after reading. Note that this applies to bytes including the sync pattern if the sync pattern is being used. Discarding is one of the very last steps so any size and offsets above need to account for all the data before discarding.                                                                                                                                  | No       | 0 (do not discard bytes) |
 | Sync Pattern                 | Hex string representing a byte pattern that will be searched for in the raw data. This pattern represents a packet delimiter and all data found including the sync pattern will be returned.                                                                                                                                                                                                                                 | No       | nil (no sync pattern)    |
-| Max Length                   | The maximum allowed value in the length field                                                                                                                                                                                                                                                                                                                                                                                | No       | nil (no maximum length)  |
+| Max Length                   | The maximum allowed value in the length field. Strongly recommended: it is the only per-interface bound on how much data a peer can make COSMOS buffer. For a UDP-backed interface 65535 is a natural value since a UDP payload cannot exceed 65507 bytes. See [Maximum Buffer Size](#maximum-buffer-size).                                                                                                                  | No       | nil (no maximum length)  |
 | Fill Length and Sync Pattern | Setting this flag to true causes the length field and sync pattern (if present) to be filled automatically on outgoing packets.                                                                                                                                                                                                                                                                                              | No       | false                    |
 
 The most confusing aspect of the Length Protocol is calculating the Length Value Offset. This is especially true in the commonly used CCSDS Space Packet Protocol. The best way to illustrate this is with an example. Suppose you have CCSDS Space Packets prepended with a Sync Pattern of 0x1ACFFC1D. This would look like the following:
@@ -215,7 +225,7 @@ In this case the total length of the packet is 14 bytes: **4 + 4 + 2 + 4 = 14**.
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
 
-```python
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Example length protocol parameters for a CCSDS packet
   PROTOCOL READ openc3/interfaces/protocols/length_protocol.py 64 16 11 1 BIG_ENDIAN 4 0x1ACFFC1D None True
@@ -226,7 +236,7 @@ Source code for [length_protocol.py](https://github.com/OpenC3/cosmos/blob/main/
 </TabItem>
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Example length protocol parameters for a CCSDS packet
   PROTOCOL READ LengthProtocol 64 16 11 1 BIG_ENDIAN 4 0x1ACFFC1D nil true
@@ -253,7 +263,7 @@ The Terminated Protocol delineates packets using termination characters found at
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
 
-```python
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Example newline (0x0A) delimiter and sync pattern of 'DATA' (0x44415441 is ascii for 'DATA')
   PROTOCOL READ openc3/interfaces/protocols/terminated_protocol.py 0x0A 0x0A True 4 0x44415441
@@ -264,7 +274,7 @@ Source code for [terminated_protocol.py](https://github.com/OpenC3/cosmos/blob/m
 </TabItem>
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Example newline (0x0A) delimiter and sync pattern of 'DATA' (0x44415441 is ascii for 'DATA')
   PROTOCOL READ TerminatedProtocol 0x0A 0x0A True 4 0x44415441
@@ -284,7 +294,7 @@ The GEMS protocol doesn't take any parameters but should be added to an interfac
 <Tabs groupId="script-language">
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 INTERFACE GEMS_INT tcpip_client_interface.rb openc3-operator 8080 8080 10.0 nil nil
   # TerminatedProtocol 0x7C454E44 0x7C454E44 false 0       0x7C47454D53 false ... means:
   #                    wtc        rtc        strip discard sync         fill
@@ -302,126 +312,12 @@ INTERFACE GEMS_INT tcpip_client_interface.rb openc3-operator 8080 8080 10.0 nil 
   PROTOCOL READ_WRITE GemsProtocol
 ```
 
-Source code for [gems_protocol.rb](https://github.com/OpenC3/cosmos-enterprise-plugins/blob/main/openc3-cosmos-gems-interface/lib/gems_protocol.rb)
+Source code for [gems_protocol.rb](https://repos.openc3.com/OpenC3/openc3-cosmos-gems-interface/src/branch/main/lib/gems_protocol.rb)
 
 </TabItem>
 </Tabs>
 
-For a full example, please see the [openc3-cosmos-gems-interface](https://github.com/OpenC3/cosmos-enterprise-plugins/tree/main/openc3-cosmos-gems-interface) in the COSMOS Enterprise Plugins.
-
-### CCSDS CLTU Protocol (Enterprise)
-
-The CCSDS CLTU Protocol handles the CLTU (Communicates Link Transfer Unit) for Command Streams. It encodes outgoing messages with a BCH encoding and then applies a header and footer to the data.
-
-| Parameter | Description                    | Required | Default            |
-| --------- | ------------------------------ | -------- | ------------------ |
-| Header    | Header before BCH encoded data | No       | 0xEB90             |
-| Footer    | Footer after BCH encoded data  | No       | 0xC5C5C5C5C5C5C579 |
-| Fill Byte | BCH encoding fill byte         | No       | 0x55               |
-
-<Tabs groupId="script-language">
-<TabItem value="ruby" label="Ruby">
-
-```ruby
-INTERFACE INTERFACE_NAME <params>
-  PROTOCOL WRITE CcsdsCltuProtocol
-```
-
-Source code for [cltu_protocol.rb](https://github.com/OpenC3/cosmos-enterprise-plugins/blob/main/openc3-cosmos-ccsds-protocols/lib/ccsds_cltu_protocol.rb)
-
-</TabItem>
-
-<TabItem value="python" label="Python">
-
-```python
-INTERFACE INTERFACE_NAME <params>
-  PROTOCOL WRITE openc3/interfaces/protocols/ccsds_cltu_protocol.py
-```
-
-Source code for [cltu_protocol.py](https://github.com/OpenC3/cosmos-enterprise-plugins/blob/main/openc3-cosmos-ccsds-protocols-python/openc3_ccsds_protocols/ccsds_cltu_protocol.py)
-
-</TabItem>
-
-</Tabs>
-
-For a full example, please see the [openc3-cosmos-ccsds-protocols](https://github.com/OpenC3/cosmos-enterprise-plugins/tree/main/openc3-cosmos-ccsds-protocols) in the COSMOS Enterprise Plugins.
-
-### CCSDS TCTF Protocol (Enterprise)
-
-The CCSDS TCTF Protocol handles the Telecommand Transfer Frame for Command Streams.
-
-| Parameter     | Description                                                                   | Required | Default |
-| ------------- | ----------------------------------------------------------------------------- | -------- | ------- |
-| Randomization | Whether to encode and randomize the transfer frame                            | No       | true    |
-| Error Control | Whether to use the Frame Error Control Field and apply a 16 bit CRC           | No       | false   |
-| Bypass        | Bypass bit where 0 is Type-A and 1 is Type-B (bypass frame acceptance checks) | No       | 1       |
-| SCID          | Spacecraft Identifier (10 bits)                                               | No       | 0       |
-| VCID          | Virtual Channel Identifier (6 bits)                                           | No       | 0       |
-
-<Tabs groupId="script-language">
-<TabItem value="ruby" label="Ruby">
-
-```ruby
-INTERFACE INTERFACE_NAME <params>
-  PROTOCOL WRITE CcsdsTctfProtocol true false 1 0xA 0x1
-```
-
-Source code for [ccsds_tctf_protocol.rb](https://github.com/OpenC3/cosmos-enterprise-plugins/blob/main/openc3-cosmos-ccsds-protocols/lib/ccsds_tctf_protocol.rb)
-
-</TabItem>
-<TabItem value="python" label="Python">
-
-```python
-INTERFACE INTERFACE_NAME <params>
-  PROTOCOL WRITE openc3/interfaces/protocols/ccsds_tctf_protocol.py True False 1 0xA 0x1
-```
-
-Source code for [ccsds_tctf_protocol.py](https://github.com/OpenC3/cosmos-enterprise-plugins/blob/main/openc3-cosmos-ccsds-protocols-python/openc3_ccsds_protocols/ccsds_tctf_protocol.py)
-
-</TabItem>
-</Tabs>
-
-For a full example, please see the [openc3-cosmos-ccsds-protocols](https://github.com/OpenC3/cosmos-enterprise-plugins/tree/main/openc3-cosmos-ccsds-protocols) in the COSMOS Enterprise Plugins.
-
-### CCSDS TMTF Protocol (Enterprise)
-
-The CCSDS TMTF Protocol handles the Telemetry Transfer Frame for Telemetry Streams. It adds VCID, MC_FRM_CNT, VC_FRM_CNT to extra which will be included in the Decom data.
-
-| Parameter             | Description                                                                                                                                                                                  | Required | Default                  |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------------------------ |
-| SCID                  | Spacecraft Identifier (10 bits)                                                                                                                                                              | Yes      |                          |
-| Frame Length          |                                                                                                                                                                                              | No       | 2048                     |
-| Randomization         | Whether the transfer frame was encoded and randomized                                                                                                                                        | No       | true                     |
-| Discard Leading Bytes | The number of bytes to discard from the binary data after reading. Note that this applies to bytes including the sync pattern if the sync pattern is being used.                             | No       | 0 (do not discard bytes) |
-| Sync Pattern          | Hex string representing a byte pattern that will be searched for in the raw data. This pattern represents a packet delimiter and all data found including the sync pattern will be returned. | No       | 0x1ACFFC1D               |
-| Fill Fields           | Whether to fill in the sync pattern on outgoing packets                                                                                                                                      | No       | true                     |
-
-<Tabs groupId="script-language">
-<TabItem value="ruby" label="Ruby">
-
-```ruby
-INTERFACE INTERFACE_NAME <params>
-  PROTOCOL READ CcsdsTmtfProtocol true 0 0x1ACFFC1D true
-```
-
-Source code for [ccsds_tmtf_protocol.rb](https://github.com/OpenC3/cosmos-enterprise-plugins/blob/main/openc3-cosmos-ccsds-protocols/lib/ccsds_tmtf_protocol.rb)
-
-</TabItem>
-
-<TabItem value="python" label="Python">
-
-```python
-INTERFACE INTERFACE_NAME <params>
-  PROTOCOL READ openc3/interfaces/protocols/ccsds_tmtf_protocol.py True 0 0x1ACFFC1D True
-```
-
-Source code for [ccsds_tmtf_protocol.py](https://github.com/OpenC3/cosmos-enterprise-plugins/blob/main/openc3-cosmos-ccsds-protocols-python/openc3_ccsds_protocols/ccsds_tmtf_protocol.py)
-
-</TabItem>
-
-</Tabs>
-
-For a full example, please see the [openc3-cosmos-ccsds-protocols](https://github.com/OpenC3/cosmos-enterprise-plugins/tree/main/openc3-cosmos-ccsds-protocols) in the COSMOS Enterprise Plugins.
+For a full example, please see [openc3-cosmos-gems-interface](https://repos.openc3.com/OpenC3/openc3-cosmos-gems-interface).
 
 ### Preidentified Protocol
 
@@ -430,12 +326,12 @@ The Preidentified Protocol delineates packets using the COSMOS header. This Prot
 | Parameter    | Description                                                                                                                                                                                                                    | Required | Default                 |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------- | ----------------------- |
 | Sync Pattern | Hex string representing a byte pattern that will be searched for in the raw data. This pattern represents a packet delimiter and all data found AFTER the sync pattern will be returned. The sync pattern itself is discarded. | No       | nil (no sync pattern)   |
-| Max Length   | The maximum allowed value in the length field                                                                                                                                                                                  | No       | nil (no maximum length) |
+| Max Length   | The maximum allowed value in the length field. Strongly recommended, see [Maximum Buffer Size](#maximum-buffer-size).                                                                                                          | No       | nil (no maximum length) |
 
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
 
-```python
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   PROTOCOL READ openc3/interfaces/protocols/preidentified_protocol.py
 ```
@@ -445,7 +341,7 @@ Source code for [preidentified_protocol.py](https://github.com/OpenC3/cosmos/blo
 </TabItem>
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   PROTOCOL READ PreidentifiedProtocol
 ```
@@ -474,7 +370,7 @@ The Command Response Protocol waits for a response for any commands with a defin
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
 
-```python
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   PROTOCOL READ openc3/interfaces/protocols/cmd_response_protocol.py 5.0 0.1 True
 ```
@@ -484,7 +380,7 @@ Source code for [cmd_response_protocol.py](https://github.com/OpenC3/cosmos/blob
 </TabItem>
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   PROTOCOL READ CmdResponseProtocol 5.0 0.1 true
 ```
@@ -498,7 +394,7 @@ Source code for [cmd_response_protocol.rb](https://github.com/OpenC3/cosmos/blob
 
 The Command Response Protocol utilizes the [RESPONSE](../configuration/command#response) keyword in the command definition to determine which telemetry packet should be expected when the given command is sent. This will block the command until the response is received.
 
-```ruby
+```cosmos
 COMMAND SCPI_PS GET_STATUS BIG_ENDIAN "Gets status"
   ACCESSOR TemplateAccessor
   TEMPLATE ":MEAS:VOLT? (@1:2)"
@@ -507,7 +403,7 @@ COMMAND SCPI_PS GET_STATUS BIG_ENDIAN "Gets status"
 
 The Response packet (STATUS) should be defined to contain the response data.
 
-```ruby
+```cosmos
 TELEMETRY SCPI_PS STATUS BIG_ENDIAN "Status"
   ACCESSOR TemplateAccessor
   TEMPLATE "<MEAS_VOLTAGE_1>,<MEAS_VOLTAGE_2>"
@@ -519,14 +415,14 @@ TELEMETRY SCPI_PS STATUS BIG_ENDIAN "Status"
     FORMAT_STRING %0.3f
 ```
 
-For a full example, please see the [openc3-cosmos-scpi-power-supply](https://github.com/OpenC3/cosmos-enterprise-plugins/tree/main/openc3-cosmos-scpi-power-supply) in the COSMOS Enterprise Plugins.
+For a full example, please see [openc3-cosmos-scpi-power-supply](https://repos.openc3.com/OpenC3/openc3-cosmos-scpi-power-supply).
 
 ### CRC Protocol
 
 The CRC protocol can add CRCs to outgoing commands and verify CRCs on incoming telemetry packets. Note: You either have to give all the parameters for Poly, Seed, Xor, Reflect or just use the defaults. You can't mix and match setting some and not others.
 
-:::warning CRC Protocol Ordering
-The CRC Protocol must run after packet delineation protocols (e.g. Length, Terminated) for both reads and writes. On reads, the delineation protocol must assemble a complete packet before the CRC can be verified — otherwise the CRC protocol may operate on partial or multiple packets. On writes, the delineation protocol must fill in fields like the length before the CRC is calculated — otherwise the CRC will be computed over incorrect data. Because read and write protocols execute in opposite orders, this typically requires defining the CRC protocol twice — once for WRITE before the delineation protocol, and once for READ after it. See [Protocol Run Order](#protocol-run-order) for a full example.
+:::warning[CRC Protocol Ordering]
+The CRC Protocol must run after packet delineation protocols (e.g. Length, Terminated) for both reads and writes. On reads, the delineation protocol must assemble a complete packet before the CRC can be verified — otherwise the CRC protocol may operate on partial or multiple packets. On writes, the delineation protocol must fill in fields like the length before the CRC is calculated — otherwise the CRC will be computed over incorrect data. Because read and write protocols execute in opposite orders, this typically requires defining the CRC protocol twice — once for WRITE before the delineation protocol, and once for READ after it. See "Protocol Run Order" for a full example.
 :::
 
 | Parameter       | Description                                                                                                 | Required | Default                                                                                    |
@@ -545,7 +441,7 @@ The CRC Protocol must run after packet delineation protocols (e.g. Length, Termi
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
 
-```python
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Handle a trailing 32 bit CRC on telemetry by stripping it off
   # In this example I changed the Reflect default to false so I had to explicitly specify all the values
@@ -557,7 +453,7 @@ Source code for [crc_protocol.py](https://github.com/OpenC3/cosmos/blob/main/ope
 </TabItem>
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Handle a trailing 32 bit CRC on telemetry by stripping it off
   # In this example I changed the Reflect default to false so I had to explicitly specify all the values
@@ -581,7 +477,7 @@ The Ignore Packet protocol drops specified command packets sent by COSMOS or dro
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
 
-```python
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Ignore the INST MECH packet
   PROTOCOL READ openc3/interfaces/protocols/ignore_packet_protocol.py INST MECH
@@ -592,7 +488,7 @@ Source code for [ignore_packet_protocol.py](https://github.com/OpenC3/cosmos/blo
 </TabItem>
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 INTERFACE INTERFACE_NAME <parameters>
   # Ignore the INST MECH packet
   PROTOCOL READ IgnorePacketProtocol INST MECH
@@ -603,11 +499,585 @@ Source code for [ignore_packet_protocol.rb](https://github.com/OpenC3/cosmos/blo
 </TabItem>
 </Tabs>
 
+## CCSDS Protocols (Enterprise)
+
+COSMOS Enterprise implements the CCSDS Space Data Link protocols as Interface Protocols in the [openc3-cosmos-ccsds-protocols](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols) plugin. To use them, install the `openc3-cosmos-ccsds-protocols` plugin in [Admin - Plugins](../tools/admin#plugins). The plugin repository and the source code links below require COSMOS Enterprise credentials.
+
+Every protocol ships in both Ruby and Python with identical class names and parameters. In Ruby use the class name (e.g. `CcsdsTmtfProtocol`) and in Python use the filename (e.g. `ccsds_tmtf_protocol.py`) on the `PROTOCOL` line.
+
+| Protocol                                              | CCSDS Standard                | Purpose                                                       | Direction     |
+| ----------------------------------------------------- | ----------------------------- | ------------------------------------------------------------- | ------------- |
+| [CCSDS TCTF](#ccsds-tctf-protocol-enterprise)         | 232.0-B-3                     | TC Transfer Frame (command uplink framing)                    | WRITE (+READ) |
+| [CCSDS CLTU](#ccsds-cltu-protocol-enterprise)         | 231.0-B-4                     | CLTU wrap (BCH codeblocks) around TC frames                   | WRITE         |
+| [CCSDS TMTF](#ccsds-tmtf-protocol-enterprise)         | 132.0-B-2                     | TM Transfer Frame (telemetry downlink deframing)              | READ (+WRITE) |
+| [CCSDS USLP](#ccsds-uslp-protocol-enterprise)         | 732.1-B-3                     | Unified Space Data Link Protocol (uplink and downlink)        | READ / WRITE  |
+| [CCSDS AOS](#ccsds-aos-protocol-enterprise)           | 732.0-B-4                     | AOS Transfer Frame (high-rate return link)                    | READ / WRITE  |
+| [CCSDS COP-1 FOP](#ccsds-cop-1-protocols-enterprise)  | 232.1-B-2                     | COP-1 FOP-1 (reliable AD service, ground sender)              | READ_WRITE    |
+| [CCSDS COP-1 FARM](#ccsds-cop-1-protocols-enterprise) | 232.1-B-2                     | COP-1 FARM-1 (spacecraft-side simulator)                      | READ_WRITE    |
+| [SDLS](#ccsds-sdls-enterprise)                        | 355.0-B-2                     | Space Data Link Security engine used by the framing protocols | Any framing   |
+| [SLE Interfaces](#ccsds-sle-interfaces-enterprise)    | 911.1 / 911.2 / 912.1 / 913.1 | SLE user: RAF / RCF return, FCLTU forward (Python only)       | Interface     |
+
+Every parameter which can be written as a string is positional and can be given on a `PROTOCOL` line. Use `nil` (Ruby) or `None` (Python) to select the default for a parameter you want to skip over. The one exception is the SDLS engine which is an object and must be passed programmatically (see [SDLS](#ccsds-sdls-enterprise)).
+
+The classic ground station setup wraps a TCP/IP interface with TM deframing on READ and TC + CLTU framing on WRITE:
+
+<Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```cosmos
+INTERFACE INST_INT tcpip_client_interface.py host.docker.internal 8080 8080 10.0 None None
+  PROTOCOL READ ccsds_tmtf_protocol.py 100
+  PROTOCOL WRITE ccsds_cltu_protocol.py
+  PROTOCOL WRITE ccsds_tctf_protocol.py True False 1 100
+```
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```cosmos
+INTERFACE INST_INT tcpip_client_interface.rb host.docker.internal 8080 8080 10.0 nil nil
+  PROTOCOL READ CcsdsTmtfProtocol 100
+  PROTOCOL WRITE CcsdsCltuProtocol
+  PROTOCOL WRITE CcsdsTctfProtocol true false 1 100
+```
+
+</TabItem>
+</Tabs>
+
+Since write protocols execute in reverse order, CLTU is declared before TCTF so the TCTF protocol builds the transfer frame first and the CLTU protocol then wraps it.
+
+### CCSDS TCTF Protocol (Enterprise)
+
+The CCSDS TCTF Protocol builds TC Transfer Frames (CCSDS 232.0-B-3) on the command uplink. It can also deframe TC frames on read (for example in a spacecraft simulator), returning `VCID`, `SEQ_NUM`, `BYPASS`, `CTRL_CMD_FLAG` and (if a MAP ID is configured) `MAP_ID` and `SEQUENCE_FLAGS` in the packet extra. Type-BC control frames can be built per command by setting `BYPASS` and `CTRL_CMD_FLAG` in the command extra.
+
+| Parameter        | Description                                                                                | Required | Default |
+| ---------------- | ------------------------------------------------------------------------------------------ | -------- | ------- |
+| Randomization    | Whether to randomize the transfer frame                                                    | No       | true    |
+| Error Control    | Whether to add the Frame Error Control Field (16 bit CRC)                                  | No       | false   |
+| Bypass           | Bypass flag where 0 is Type-A and 1 is Type-B (bypass frame acceptance checks)             | No       | 1       |
+| SCID             | Spacecraft Identifier (10 bits)                                                            | No       | 0       |
+| VCID             | Virtual Channel Identifier (6 bits)                                                        | No       | 0       |
+| Allow Empty Data | See [Packet Delineation Protocols](#packet-delineation-protocols)                          | No       | nil     |
+| MAP ID           | Multiplexer Access Point ID (0-63). Enables the 1 byte Segment Header and MAP multiplexing | No       | nil     |
+
+<Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```cosmos
+INTERFACE INTERFACE_NAME <params>
+  # TC uplink framing (SCID 100, VC 0, randomized, with FECF)
+  PROTOCOL WRITE ccsds_tctf_protocol.py True True 1 100 0
+  # Same, plus the MAP service on MAP ID 3
+  # PROTOCOL WRITE ccsds_tctf_protocol.py True True 1 100 0 None 3
+```
+
+Source code for [ccsds_tctf_protocol.py](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_tctf_protocol.py)
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```cosmos
+INTERFACE INTERFACE_NAME <params>
+  # TC uplink framing (SCID 100, VC 0, randomized, with FECF)
+  PROTOCOL WRITE CcsdsTctfProtocol true true 1 100 0
+  # Same, plus the MAP service on MAP ID 3
+  # PROTOCOL WRITE CcsdsTctfProtocol true true 1 100 0 nil 3
+```
+
+Source code for [ccsds_tctf_protocol.rb](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_tctf_protocol.rb)
+
+</TabItem>
+</Tabs>
+
+TC frames carry no sync marker so a desynchronized read stream cannot reliably re-anchor. A Frame Length too small to hold the configured fields is treated as a lost frame boundary: the byte is dropped and deframing retries. The CLTU protocol does not decode on read, so if you need true resynchronization decode the CLTUs externally (or use another delimiter that supports READ) ahead of it. Frames are assumed to carry a single MAP SDU (no MAP packet blocking or segmentation beyond the Segment Header sequence flags).
+
+### CCSDS CLTU Protocol (Enterprise)
+
+The CCSDS CLTU Protocol wraps an already-built TC Transfer Frame in a Communications Link Transmission Unit (CCSDS 231.0-B-4): a start sequence, the frame split into BCH(63,56) codeblocks (7 data bytes + 1 parity byte each), and a tail sequence. It must be declared **before** the [CCSDS TCTF Protocol](#ccsds-tctf-protocol-enterprise) on the WRITE chain so that, with write protocols running in reverse order, it wraps the finished frame. The defaults are the CCSDS standard values so it is normally used with no parameters. The CLTU is used for the forward link only; there is no CLTU decoding on read.
+
+| Parameter        | Description                                                       | Required | Default            |
+| ---------------- | ----------------------------------------------------------------- | -------- | ------------------ |
+| Header           | Start sequence before the BCH encoded data                        | No       | 0xEB90             |
+| Footer           | Tail sequence after the BCH encoded data                          | No       | 0xC5C5C5C5C5C5C579 |
+| Fill Byte        | BCH encoding fill byte                                            | No       | 0x55               |
+| Allow Empty Data | See [Packet Delineation Protocols](#packet-delineation-protocols) | No       | nil                |
+
+<Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```cosmos
+INTERFACE INTERFACE_NAME <params>
+  PROTOCOL WRITE ccsds_cltu_protocol.py
+  PROTOCOL WRITE ccsds_tctf_protocol.py
+```
+
+Source code for [ccsds_cltu_protocol.py](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_cltu_protocol.py)
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```cosmos
+INTERFACE INTERFACE_NAME <params>
+  PROTOCOL WRITE CcsdsCltuProtocol
+  PROTOCOL WRITE CcsdsTctfProtocol
+```
+
+Source code for [ccsds_cltu_protocol.rb](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_cltu_protocol.rb)
+
+</TabItem>
+</Tabs>
+
+### CCSDS TMTF Protocol (Enterprise)
+
+The CCSDS TMTF Protocol deframes TM Transfer Frames (CCSDS 132.0-B-2) on the telemetry downlink, extracting packets which span frames using the First Header Pointer. It adds `VCID`, `MC_FRM_CNT` and `VC_FRM_CNT` to the packet extra which will be included in the Decom data. If the frame has a Transfer Frame Secondary Header it is returned in `SECONDARY_HEADER` and if OCF is enabled the Operational Control Field is returned in `OCF` (used by [COP-1](#ccsds-cop-1-protocols-enterprise)). It can also build TM frames on write (for example in a spacecraft simulator) including the MC/VC frame counts, idle fill, and optional OCF, FECF and randomization.
+
+| Parameter             | Description                                                                                                                                                                                  | Required | Default                  |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------------------------ |
+| SCID                  | Spacecraft Identifier (10 bits)                                                                                                                                                              | Yes      |                          |
+| Frame Length          | Length of the transfer frame in bytes (not including the sync pattern)                                                                                                                       | No       | 2048                     |
+| Randomization         | Whether the transfer frame was randomized                                                                                                                                                    | No       | true                     |
+| Discard Leading Bytes | The number of bytes to discard from the binary data after reading. Note that this applies to bytes including the sync pattern if the sync pattern is being used.                             | No       | 0 (do not discard bytes) |
+| Sync Pattern          | Hex string representing a byte pattern that will be searched for in the raw data. This pattern represents a packet delimiter and all data found including the sync pattern will be returned. | No       | 0x1ACFFC1D               |
+| Fill Fields           | Whether to fill in the sync pattern on outgoing frames                                                                                                                                       | No       | true                     |
+| Error Control         | Whether the frame has a Frame Error Control Field (16 bit CRC)                                                                                                                               | No       | false                    |
+| Allow Empty Data      | See [Packet Delineation Protocols](#packet-delineation-protocols)                                                                                                                            | No       | nil                      |
+| VCID                  | Virtual Channel Identifier (0-7) used when writing frames                                                                                                                                    | No       | 0                        |
+| Secondary Header      | Transfer Frame Secondary Header data to emit when writing frames (max 63 bytes)                                                                                                              | No       | nil                      |
+| Lenient               | Whether to downgrade non-fatal header mismatches (Sync Flag, Packet Order, Segment Length ID) to warnings                                                                                    | No       | false                    |
+| OCF                   | Whether the frame has the 4 byte Operational Control Field (CLCW)                                                                                                                            | No       | false                    |
+
+<Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```cosmos
+INTERFACE INTERFACE_NAME <params>
+  # TM downlink deframing (SCID 100, 1115 byte frames, randomized)
+  PROTOCOL READ ccsds_tmtf_protocol.py 100 1115 True
+  # Same, but tolerate non-standard header bits
+  # PROTOCOL READ ccsds_tmtf_protocol.py 100 1115 True 0 0x1ACFFC1D True False None 0 None True
+```
+
+Source code for [ccsds_tmtf_protocol.py](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_tmtf_protocol.py)
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```cosmos
+INTERFACE INTERFACE_NAME <params>
+  # TM downlink deframing (SCID 100, 1115 byte frames, randomized)
+  PROTOCOL READ CcsdsTmtfProtocol 100 1115 true
+  # Same, but tolerate non-standard header bits
+  # PROTOCOL READ CcsdsTmtfProtocol 100 1115 true 0 0x1ACFFC1D true false nil 0 nil true
+```
+
+Source code for [ccsds_tmtf_protocol.rb](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_tmtf_protocol.rb)
+
+</TabItem>
+</Tabs>
+
+The Operational Control Field is treated as a CLCW (Type-1 report). A non-CLCW OCF (Type-2 / PLCW variants) is passed through as raw bytes but not interpreted.
+
+Without a sync pattern there is nothing to resynchronize on, so a frame that fails its FECF or header checks is discarded whole and parsing continues at the next frame boundary. A gap in the Virtual Channel Frame Count means frames were lost, so any packet partially reassembled on that Virtual Channel is discarded rather than completed with unrelated bytes.
+
+### CCSDS USLP Protocol (Enterprise)
+
+The CCSDS USLP Protocol implements the Unified Space Data Link Protocol (CCSDS 732.1-B-3). USLP uses a single Transfer Frame format for both the forward (command) and return (telemetry) links so the same protocol serves a READ or a WRITE chain. On read it returns `VCID`, `MAP_ID`, `VC_FRM_CNT` and, when present, `INSERT_ZONE` and `OCF` in the packet extra.
+
+```
+| Primary Header | [Insert Zone] | [Security Header] | TFDF | [Security Trailer] | [OCF] | [FECF] |
+```
+
+| Parameter          | Description                                                                                                                                               | Required | Default    |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ---------- |
+| SCID               | Spacecraft Identifier (16 bits)                                                                                                                           | Yes      |            |
+| Frame Length       | Fixed frame length in bytes (not including the sync pattern). Leave nil for variable length frames which are delimited by reading the Frame Length field. | No       | nil        |
+| Max Frame Length   | Largest frame accepted on read when using the Frame Length field. Set this to bound how long a corrupt length stalls the reader.                          | No       | 65536      |
+| Randomization      | Whether the transfer frame is randomized                                                                                                                  | No       | false      |
+| Randomization Mode | Randomizer to use: TM or TC                                                                                                                               | No       | TM         |
+| Sync Pattern       | Hex string sync pattern. Set to nil to disable (e.g. when wrapped by CLTU).                                                                               | No       | 0x1ACFFC1D |
+| Error Control      | Whether the frame has a Frame Error Control Field (16 bit CRC)                                                                                            | No       | false      |
+| Insert Zone Length | Length of the Insert Zone in bytes                                                                                                                        | No       | 0          |
+| OCF                | Whether the frame has the 4 byte Operational Control Field (CLCW)                                                                                         | No       | false      |
+| VC Count Length    | Number of bytes in the VC Frame Count (0-7)                                                                                                               | No       | 1          |
+| Source or Dest     | Source or Destination Identifier flag                                                                                                                     | No       | 0          |
+| VCID               | Virtual Channel Identifier                                                                                                                                | No       | 0          |
+| MAP ID             | Multiplexer Access Point ID                                                                                                                               | No       | 0          |
+| Bypass             | Bypass / Sequence Control flag where 0 is sequence controlled (Type-A) and 1 is expedited (Type-B)                                                        | No       | 1          |
+| Allow Empty Data   | See [Packet Delineation Protocols](#packet-delineation-protocols)                                                                                         | No       | nil        |
+
+<Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```cosmos
+INTERFACE INTERFACE_NAME tcpip_client_interface.py host.docker.internal 8080 8080 10.0 None None
+  PROTOCOL READ ccsds_uslp_protocol.py 100
+  PROTOCOL WRITE ccsds_uslp_protocol.py 100
+```
+
+Source code for [ccsds_uslp_protocol.py](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_uslp_protocol.py)
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```cosmos
+INTERFACE INTERFACE_NAME tcpip_client_interface.rb host.docker.internal 8080 8080 10.0 nil nil
+  PROTOCOL READ CcsdsUslpProtocol 100
+  PROTOCOL WRITE CcsdsUslpProtocol 100
+```
+
+Source code for [ccsds_uslp_protocol.rb](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_uslp_protocol.rb)
+
+</TabItem>
+</Tabs>
+
+The non-truncated Primary Header is supported along with TFDZ Construction Rules 000 (packets spanning frames, used with a fixed Frame Length) and 111 (no segmentation, used with variable length frames). Only Idle Data frames (VCID 63) are discarded on read but cannot be written. The truncated Primary Header, other TFDZ construction rules, and MAP multiplexing beyond a single MAP ID are not implemented.
+
+On read, a frame whose VC Frame Count length disagrees with the configured VC Count Length is rejected, and a VC Frame Count discontinuity discards any partial packet held for that Virtual Channel. Without a sync pattern there is nothing to resynchronize on, so a frame that fails its CRC or header checks is discarded whole.
+
+### CCSDS AOS Protocol (Enterprise)
+
+The CCSDS AOS Protocol implements the AOS ("Version-2") Transfer Frame (CCSDS 732.0-B-4) used for high-rate return links. Like USLP the frame format is direction independent, so the same protocol serves a READ or a WRITE chain. AOS frames have no length field so the Frame Length is required. On read it returns `VCID`, `REPLAY`, `VC_FRM_CNT` and, when present, `INSERT_ZONE` and `OCF` in the packet extra. The Insert Zone and OCF are returned on every frame including Only Idle Data frames, so an AOS downlink can carry a CLCW for [COP-1](#ccsds-cop-1-protocols-enterprise) even when no telemetry is queued.
+
+```
+| Primary Header (6 or 8) | [Insert Zone] | Data Field (M_PDU) | [OCF 4] | [FECF 2] |
+```
+
+| Parameter          | Description                                                                                                       | Required | Default    |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------- | -------- | ---------- |
+| SCID               | Spacecraft Identifier (8 bits)                                                                                    | Yes      |            |
+| Frame Length       | Fixed frame length in bytes (not including the sync pattern)                                                      | Yes      |            |
+| Randomization      | Whether the transfer frame is randomized                                                                          | No       | false      |
+| Sync Pattern       | Hex string sync pattern. Set to nil to disable.                                                                   | No       | 0x1ACFFC1D |
+| Error Control      | Whether the frame has a Frame Error Control Field (16 bit CRC)                                                    | No       | false      |
+| FHEC               | Whether the primary header has the Frame Header Error Control field (Reed-Solomon (10,6) code)                    | No       | false      |
+| Insert Zone Length | Length of the Insert Zone in bytes                                                                                | No       | 0          |
+| OCF                | Whether the frame has the 4 byte Operational Control Field (CLCW)                                                 | No       | false      |
+| VCID               | Virtual Channel Identifier used when writing frames. 63 writes Only Idle Data frames.                             | No       | 0          |
+| Replay Flag        | Replay Flag used when writing frames                                                                              | No       | 0          |
+| VC Count Cycle     | Virtual Channel Frame Count Cycle used when writing frames                                                        | No       | 0          |
+| Allow Empty Data   | See [Packet Delineation Protocols](#packet-delineation-protocols)                                                 | No       | nil        |
+
+The Frame Length must exceed the overhead implied by the other parameters (primary header, M_PDU header, Insert Zone, OCF, FECF and any SDLS header and trailer) or the protocol raises an error on startup.
+
+<Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```cosmos
+INTERFACE INTERFACE_NAME <params>
+  # AOS return link: 1024 byte frames, randomized, FECF + FHEC + OCF, VC 1
+  PROTOCOL READ ccsds_aos_protocol.py 0xAB 1024 True 0x1ACFFC1D True True 0 True 1
+```
+
+Source code for [ccsds_aos_protocol.py](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_aos_protocol.py)
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```cosmos
+INTERFACE INTERFACE_NAME <params>
+  # AOS return link: 1024 byte frames, randomized, FECF + FHEC + OCF, VC 1
+  PROTOCOL READ CcsdsAosProtocol 0xAB 1024 true 0x1ACFFC1D true true 0 true 1
+```
+
+Source code for [ccsds_aos_protocol.rb](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_aos_protocol.rb)
+
+</TabItem>
+</Tabs>
+
+The M_PDU (packet) service is implemented with the First Header Pointer, and packets may span frames in both directions: on write a packet that does not fit in one frame is split across as many frames as needed, and on read it is reassembled per Virtual Channel. The optional FHEC is generated on write and, on read, corrects up to two symbol errors in the primary header before the FECF is verified. Only Idle Data frames (VCID 63) are discarded on read. The B_PDU (bitstream) and VCA_SDU (Virtual Channel Access) services are not implemented.
+
+### CCSDS COP-1 Protocols (Enterprise)
+
+The Communications Operation Procedure-1 (CCSDS 232.1-B-2) provides a reliable, retransmitting data link service on top of the TC or USLP transfer frames. It has two halves:
+
+- **FOP-1** (`CcsdsCop1FopProtocol`) - the ground sender. It stamps each Type-AD frame's sequence number N(S), buffers it, retransmits on a timeout or when requested by the CLCW, and consumes the CLCW carried in the downlink Operational Control Field.
+- **FARM-1** (`CcsdsCop1FarmProtocol`) - the spacecraft receiver, for building a COP-1 aware simulator. It accepts in-sequence frames, discards duplicates and gaps, handles the Type-BC Unlock / Set V(R) control commands, and generates the CLCW.
+
+Both work with either TC or USLP framing (Frame Type parameter). Because the CLCW arrives in the downlink frame's OCF, you must enable OCF on the return link [TMTF](#ccsds-tmtf-protocol-enterprise) or [USLP](#ccsds-uslp-protocol-enterprise) protocol. The frame geometry parameters (Frame Length, Insert Zone Length, and the security lengths) must match the framing protocol on the same interface. On a secured link pass the same SDLS engine to both and the security geometry is taken from the engine.
+
+FARM-1 validates each frame completely (FECF, Transfer Frame Version, SCID, VCID and, with an SDLS engine, authentication) **before** running FARM-1 acceptance. Acknowledging a frame the deframer then drops would advance V(R) past data that never arrived, which COP-1 cannot recover from since the sender sees it acknowledged and never retransmits.
+
+**FOP-1 Parameters**
+
+| Parameter               | Description                                                       | Required | Default |
+| ----------------------- | ----------------------------------------------------------------- | -------- | ------- |
+| SCID                    | Spacecraft Identifier                                             | Yes      |         |
+| Frame Type              | TC or USLP                                                        | No       | USLP    |
+| VCID                    | Virtual Channel Identifier                                        | No       | 0       |
+| Randomization           | Whether the transfer frame is randomized                          | No       | false   |
+| Error Control           | Whether the frame has a Frame Error Control Field                 | No       | false   |
+| Sync Pattern            | Hex string sync pattern                                           | No       | nil     |
+| VC Count Length         | Number of bytes in the USLP VC Frame Count                        | No       | 1       |
+| OCF                     | Whether the frame has an Operational Control Field                | No       | false   |
+| MAP ID                  | Multiplexer Access Point ID                                       | No       | 0       |
+| Source or Dest          | USLP Source or Destination Identifier flag                        | No       | 0       |
+| Sliding Window          | FOP sliding window width (K)                                      | No       | 1       |
+| Transmission Limit      | Maximum number of transmissions of a frame                        | No       | 1       |
+| Timeout Type            | Action on T1 timer expiry when the transmission limit is reached  | No       | 0       |
+| T1 Initial              | Retransmission timer in seconds                                   | No       | 5.0     |
+| Frame Length            | Fixed frame length in bytes                                       | No       | nil     |
+| Insert Zone Length      | Length of the USLP Insert Zone in bytes                           | No       | 0       |
+| Security Header Length  | Length of the SDLS Security Header in bytes                       | No       | 0       |
+| Security Trailer Length | Length of the SDLS Security Trailer in bytes                      | No       | 0       |
+| Allow Empty Data        | See [Packet Delineation Protocols](#packet-delineation-protocols) | No       | nil     |
+
+**FARM-1 Parameters**
+
+| Parameter               | Description                                                       | Required | Default    |
+| ----------------------- | ----------------------------------------------------------------- | -------- | ---------- |
+| SCID                    | Spacecraft Identifier                                             | Yes      |            |
+| Frame Length            | Fixed frame length in bytes (not including the sync pattern)      | Yes      |            |
+| Sync Pattern            | Hex string sync pattern                                           | No       | 0x1ACFFC1D |
+| Randomization           | Whether the transfer frame is randomized                          | No       | false      |
+| Error Control           | Whether the frame has a Frame Error Control Field                 | No       | false      |
+| VC Count Length         | Number of bytes in the USLP VC Frame Count                        | No       | 1          |
+| OCF                     | Must be true since FARM reports the CLCW in the OCF               | No       | true       |
+| VCID                    | Virtual Channel Identifier                                        | No       | 0          |
+| MAP ID                  | Multiplexer Access Point ID                                       | No       | 0          |
+| Source or Dest          | USLP Source or Destination Identifier flag                        | No       | 0          |
+| Positive Window         | FARM positive window width (W)                                    | No       | 64         |
+| Negative Window         | FARM negative window width                                        | No       | 64         |
+| Insert Zone Length      | Length of the USLP Insert Zone in bytes                           | No       | 0          |
+| Security Header Length  | Length of the SDLS Security Header in bytes                       | No       | 0          |
+| Security Trailer Length | Length of the SDLS Security Trailer in bytes                      | No       | 0          |
+| Allow Empty Data        | See [Packet Delineation Protocols](#packet-delineation-protocols) | No       | nil        |
+
+:::warning[COP-1 Protocol Order]
+FOP must run after the framing protocol in both directions: it edits a built transfer frame on write, and needs the OCF from the deframer on read. Since read protocols run in declaration order and write protocols run in reverse order, declare the framing protocol as a separate READ line **before** the FOP protocol and a separate WRITE line **after** it. A physical layer protocol such as CLTU is declared on its own WRITE line ahead of the FOP line, which places it after FOP in the write chain.
+:::
+
+<Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```cosmos
+INTERFACE INTERFACE_NAME tcpip_client_interface.py host.docker.internal 8080 8080 10.0 None None
+  # Return link (telemetry) - OCF enabled so the CLCW is surfaced to FOP
+  PROTOCOL READ ccsds_uslp_protocol.py 100 None None False TM None False 0 True
+  PROTOCOL READ_WRITE ccsds_cop1_fop_protocol.py 100 USLP
+  # Forward link (commanding) - builds the transfer frame that FOP then stamps
+  PROTOCOL WRITE ccsds_uslp_protocol.py 100
+```
+
+Source code for [ccsds_cop1_fop_protocol.py](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_cop1_fop_protocol.py) and [ccsds_cop1_farm_protocol.py](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_cop1_farm_protocol.py)
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```cosmos
+INTERFACE INTERFACE_NAME tcpip_client_interface.rb host.docker.internal 8080 8080 10.0 nil nil
+  # Return link (telemetry) - OCF enabled so the CLCW is surfaced to FOP
+  PROTOCOL READ CcsdsUslpProtocol 100 nil nil false TM nil false 0 true
+  PROTOCOL READ_WRITE CcsdsCop1FopProtocol 100 USLP
+  # Forward link (commanding) - builds the transfer frame that FOP then stamps
+  PROTOCOL WRITE CcsdsUslpProtocol 100
+```
+
+Source code for [ccsds_cop1_fop_protocol.rb](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_cop1_fop_protocol.rb) and [ccsds_cop1_farm_protocol.rb](https://repos.openc3.com/OpenC3/openc3-cosmos-ccsds-protocols/src/branch/main/lib/ccsds_cop1_farm_protocol.rb)
+
+</TabItem>
+</Tabs>
+
+For a spacecraft simulator interface, declare the FARM protocol ahead of the USLP protocol so it runs before the deframer on read and after the framer on write:
+
+```cosmos
+  PROTOCOL READ_WRITE CcsdsCop1FarmProtocol 100 1024
+  PROTOCOL READ_WRITE CcsdsUslpProtocol 100 1024 nil false TM 0x1ACFFC1D false 0 true
+```
+
+Operators drive FOP-1 with directives sent via [interface_protocol_cmd](../guides/scripting-api#interface_protocol_cmd) or the `cop1_api` Script Runner helpers included in the plugin:
+
+<Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+from cop1_api import *
+cop1_initiate_ad('CMD_INT', mode='unlock')  # bring up reliable AD service
+cmd('TGT COMMAND')                          # framed and sent reliably (retransmitted if lost)
+cop1_set_transmission_limit('CMD_INT', 5)
+cop1_terminate('CMD_INT')
+```
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```ruby
+require 'cop1_api'
+cop1_initiate_ad('CMD_INT', mode: :unlock)  # bring up reliable AD service
+cmd('TGT COMMAND')                          # framed and sent reliably (retransmitted if lost)
+cop1_set_transmission_limit('CMD_INT', 5)
+cop1_terminate('CMD_INT')
+```
+
+</TabItem>
+</Tabs>
+
+The available directives are `COP1_INITIATE_AD_WITHOUT_CLCW`, `COP1_INITIATE_AD_WITH_CLCW`, `COP1_INITIATE_AD_WITH_UNLOCK`, `COP1_INITIATE_AD_WITH_SET_VR`, `COP1_TERMINATE`, `COP1_RESUME`, `COP1_SET_VS`, `COP1_SET_SLIDING_WINDOW`, `COP1_SET_T1`, `COP1_SET_TRANSMISSION_LIMIT`, `COP1_SET_TIMEOUT_TYPE` and `COP1_STATUS`. Per-command AD vs BD (bypass) selection is done by setting `COP1_TYPE` to `AD` or `BD` in the command extra.
+
+The full FOP-1 state machine and FARM-1 (Open / Wait / Lockout, Unlock / Set V(R)) are implemented. COP-P (the Proximity-1 variant) is not implemented and the FARM protocol currently targets fixed length, sync delimited frames.
+
+### CCSDS SDLS (Enterprise)
+
+The Space Data Link Security Protocol (CCSDS 355.0-B-2) adds a Security Header before the Transfer Frame Data Field and a Security Trailer after it, providing authentication, encryption, or authenticated encryption per a Security Association (SA). It is implemented as an engine (`Sdls` + `SecurityAssociation`) which is passed to the TCTF, TMTF, USLP, AOS and COP-1 protocols via the keyword-only `sdls` parameter. The frame's primary header is authenticated as additional data and only the Transfer Frame Data Field is encrypted.
+
+| Service                  | Algorithms                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------------- |
+| Authenticated encryption | AES-GCM (the CCSDS baseline for TM / AOS / USLP: 256 bit key, 96 bit IV, 128 bit tag) |
+| Authentication only      | AES-CMAC (the CCSDS baseline for TC), HMAC-SHA-256, GMAC                              |
+| Encryption only          | AES-CTR                                                                               |
+
+Since the SDLS engine is an object it cannot be written on a `PROTOCOL` line. Build the Security Association(s) and engine in a small [custom interface](interfaces#custom-interfaces) and pass the engine to the framing protocol. Keys should be stored in [COSMOS Secrets](../guides/secrets) rather than hard coded.
+
+<Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+from sdls import Sdls
+from security_association import SecurityAssociation
+
+# Baseline SAs
+sa = SecurityAssociation.aes_gcm(spi=1, key=key_bytes)   # AES-256-GCM (TM / AOS / USLP)
+sa = SecurityAssociation.aes_cmac(spi=2, key=key_bytes)  # AES-CMAC (TC)
+
+# Non-baseline services use the full constructor, e.g. HMAC-SHA-256 authentication
+sa = SecurityAssociation(
+    spi=3,
+    service_type=SecurityAssociation.AUTHENTICATION,
+    algorithm=SecurityAssociation.HMAC_SHA256,
+    key=key_bytes, length_sn=4, length_mac=16, sequence_window=64)
+
+# Counter mode IVs must not restart at zero (see below)
+sa = SecurityAssociation.aes_gcm(spi=1, key=key_bytes, counter_store=my_store)
+sa = SecurityAssociation.aes_gcm(spi=1, key=key_bytes, iv_mode=SecurityAssociation.RANDOM_IV)
+
+sdls = Sdls(sa)  # or Sdls([sa1, sa2], apply_spi=1) for multiple SAs
+# Then instantiate the framing protocol with sdls=sdls and add it to the interface
+```
+
+</TabItem>
+<TabItem value="ruby" label="Ruby">
+
+```ruby
+require 'sdls'
+require 'security_association'
+
+# Baseline SAs
+sa = OpenC3::SecurityAssociation.aes_gcm(spi: 1, key: key_bytes)   # AES-256-GCM (TM / AOS / USLP)
+sa = OpenC3::SecurityAssociation.aes_cmac(spi: 2, key: key_bytes)  # AES-CMAC (TC)
+
+# Non-baseline services use the full keyword constructor, e.g. HMAC-SHA-256 authentication
+sa = OpenC3::SecurityAssociation.new(spi: 3,
+  service_type: OpenC3::SecurityAssociation::AUTHENTICATION,
+  algorithm:    OpenC3::SecurityAssociation::HMAC_SHA256,
+  key: key_bytes, length_sn: 4, length_mac: 16, sequence_window: 64)
+
+# Counter mode IVs must not restart at zero (see below)
+sa = OpenC3::SecurityAssociation.aes_gcm(spi: 1, key: key_bytes, counter_store: my_store)
+sa = OpenC3::SecurityAssociation.aes_gcm(spi: 1, key: key_bytes,
+                                         iv_mode: OpenC3::SecurityAssociation::RANDOM_IV)
+
+sdls = OpenC3::Sdls.new(sa) # or Sdls.new([sa1, sa2], apply_spi: 1) for multiple SAs
+# Then instantiate the framing protocol with sdls: sdls and add it to the interface
+```
+
+</TabItem>
+</Tabs>
+
+The SPI in each frame's Security Header selects the SA at the receiver. A monotonic IV / sequence counter provides anti-replay protection and tampered or replayed frames are rejected.
+
+:::warning[Counter State Must Outlive the Process]
+A counter mode IV must never repeat under the same key. AES-GCM leaks its authentication subkey on IV reuse (allowing frame forgery) and AES-CTR leaks plaintext. A `SecurityAssociation` starts its send counter at zero, so a restarted process re-emits IV 0 unless you do one of the following:
+
+1. **Persist the counters** - pass `counter_store`, any object implementing `load_counters(spi)` and `save_counters(spi, send_counter, receive_counter)`. The SA loads on construction and saves on every counter change.
+2. **Use a random IV** - set `iv_mode` to random to draw a cryptographically random IV per frame. This requires a Sequence Number field to carry the anti-replay counter; the `aes_gcm` factory adds a 4 byte one automatically in this mode.
+3. **Rekey every boot** - acceptable only if the key is genuinely fresh each time.
+
+When the counter space is exhausted the SA raises `CounterExhaustedError` rather than wrapping, and must be rekeyed.
+:::
+
+The **receive** counter also needs a trusted baseline after a restart, otherwise authenticated frames are rejected. A `counter_store` restores it automatically (recommended), `sa.resynchronize(counter)` sets it from an operator action, and `allow_resync` adopts the first authenticated frame's counter (convenient for simulators but accepts a replay of a pre-restart frame). `sequence_window` bounds how far ahead a subsequent counter may jump (0 disables the bound).
+
+Additional SDLS details:
+
+- **Channel binding** - pass `gvcids` (e.g. `[{'scid': 42, 'vcid': 0}]`) so a valid SA on one Virtual Channel cannot be replayed onto another. TC and USLP also support binding to a `map_id`. A mismatch raises `ChannelMismatchError`.
+- **Authentication bit mask** - each framing protocol supplies a baseline mask of the header bits covered by the MAC, excluding the fields a sender fills in after the MAC is computed. TM excludes the Master and Virtual Channel Frame Counts, AOS excludes the Virtual Channel Frame Count, its cycle in the Signaling Field and the FHEC, while TC and USLP exclude only their spare bits (USLP's VC Frame Count stays authenticated). The SCID and VCID are always authenticated. Set the SA's `auth_mask` to replace the protocol baseline entirely.
+- **Encryption only** - AES-CTR provides confidentiality only. It has no MAC, so frame contents can be modified undetected, and it has no replay protection. Prefer AES-GCM unless an external authentication layer covers the frame.
+- **Type-C frames** - TC control command frames carry COP-1 directives and are never secured (CCSDS 232.0-B-4 6.3.4.1).
+- **COP-1 + SDLS** - COP-1 stamps the frame sequence number after the MAC is computed, so those bytes must be excluded from the authenticated region. Build the SA's mask with `SecurityAssociation.uslp_auth_mask(vc_count_length: 1, length_iv: 12)` (USLP) or `SecurityAssociation.tc_auth_mask(length_sn: 4)` (TC), and pass the same engine to both the framing protocol and the COP-1 protocol.
+
+The SDLS Extended Procedures (CCSDS 355.1-B: key management / OTAR, SA management, monitoring & control) are not implemented. The Pad Length field is honored on receive but always sent as 0 since none of the supported algorithms require padding.
+
+### CCSDS SLE Interfaces (Enterprise)
+
+The Space Link Extension services are used for agency cross-support (NASA DSN, ESA ESTRACK, SSC, KSAT) to move transfer frames (downlink) and CLTUs (uplink) between a ground station (the SLE provider) and a mission control center (the SLE user). The plugin implements the SLE **user** side as two Python-only COSMOS interfaces which compose with the framing protocols above:
+
+- `sle_return_interface.py` - **RAF** Return All Frames (CCSDS 911.1) and **RCF** Return Channel Frames (CCSDS 911.2)
+- `sle_forward_interface.py` - **FCLTU** Forward CLTU (CCSDS 912.1)
+
+Transport is ISP1 (CCSDS 913.1) with protected simple authentication (auth levels `none`, `bind` or `all`). ISP1 has no transport confidentiality so the association should be run over a VPN.
+
+```cosmos
+# Downlink: SLE RAF -> TM deframer -> packets
+INTERFACE TM_INT sle_return_interface.py <host> <port> <service_instance_id> RAF
+  PROTOCOL READ ccsds_tmtf_protocol.py 100
+
+# Downlink filtered to one virtual channel with RCF (gvcid = "scid,version,vcid")
+INTERFACE TM_INT sle_return_interface.py <host> <port> <service_instance_id> RCF <initiator_id> <responder_id> default <password> <peer_password> none 4 "0xAB,0,1"
+  PROTOCOL READ ccsds_tmtf_protocol.py 100
+
+# Uplink: TC frame + CLTU encoders -> SLE FCLTU
+INTERFACE CMD_INT sle_forward_interface.py <host> <port> <service_instance_id>
+  PROTOCOL WRITE ccsds_cltu_protocol.py
+  PROTOCOL WRITE ccsds_tctf_protocol.py True False 1 100
+```
+
+**SLE Return Interface Parameters**
+
+| Parameter      | Description                                                                                              | Required | Default |
+| -------------- | -------------------------------------------------------------------------------------------------------- | -------- | ------- |
+| Hostname       | SLE provider host                                                                                        | Yes      |         |
+| Port           | SLE provider port                                                                                        | Yes      |         |
+| Inst ID        | Provider-issued service instance identifier, e.g. `sagr=1.spack=1.rsl-fg=1.raf=onlc1`                    | Yes      |         |
+| Service        | RAF or RCF                                                                                               | No       | RAF     |
+| Initiator ID   | Initiator (user) identifier                                                                              | No       | ""      |
+| Responder ID   | Responder (provider) identifier. Required when Peer Password is set.                                     | No       | ""      |
+| Responder Port | Responder port identifier                                                                                | No       | default |
+| Password       | User password as a hex string                                                                            | No       | None    |
+| Peer Password  | Provider password as a hex string. Enables verification of the provider's credentials.                   | No       | None    |
+| Auth Level     | none, bind or all                                                                                        | No       | none    |
+| Version        | SLE service version                                                                                      | No       | 4       |
+| GVCID          | Global Virtual Channel ID as `"scid,version,vcid"` (omit vcid for the master channel). Required for RCF. | No       | None    |
+
+**SLE Forward Interface Parameters**
+
+| Parameter             | Description                                                                                          | Required | Default |
+| --------------------- | ---------------------------------------------------------------------------------------------------- | -------- | ------- |
+| Hostname              | SLE provider host                                                                                    | Yes      |         |
+| Port                  | SLE provider port                                                                                    | Yes      |         |
+| Inst ID               | Provider-issued service instance identifier                                                          | Yes      |         |
+| Initiator ID          | Initiator (user) identifier                                                                          | No       | ""      |
+| Responder ID          | Responder (provider) identifier. Required when Peer Password is set.                                 | No       | ""      |
+| Responder Port        | Responder port identifier                                                                            | No       | default |
+| Password              | User password as a hex string                                                                        | No       | None    |
+| Peer Password         | Provider password as a hex string. Enables verification of the provider's credentials.               | No       | None    |
+| Auth Level            | none, bind or all                                                                                    | No       | none    |
+| Version               | SLE service version (4 also selects the v4 PDU definitions)                                          | No       | 5       |
+| Transfer Data Timeout | Seconds to wait for the provider to acknowledge each CLTU. 0 sends without waiting (fire and forget) | No       | 10      |
+
+With a positive Transfer Data Timeout, each CLTU write blocks until the provider returns the matching TRANSFER-DATA result and raises if the provider rejected it, so a refused CLTU is never counted as radiated. With a timeout of 0 the CLTU is sent fire and forget, so provider acceptance is not confirmed. The association is kept alive with ISP1 heartbeats and COSMOS reconnects if the provider goes silent.
+
+:::warning[SLE Replay Protection]
+Provider credentials are verified but the provider's time and random number are not checked against an acceptance window, so a captured provider credential remains replayable. Treat provider authentication as proof the peer knows the password, not as a live session guarantee.
+:::
+
+The ROCF and FSP services, SLE service management, the provider (ground station) side, a Ruby implementation, and the CSTS framework are not implemented.
+
+If additional features of these protocols are needed for your mission, please reach out to support@openc3.com.
+
 ## Encryption Protocols
 
 COSMOS supports implementing encryption at the protocol layer using OpenSSL. This allows you to encrypt and decrypt data transparently as it flows through the interface. Encryption protocols are typically placed at the beginning of the protocol chain (for reads) so they can decrypt data before other protocols process it.
 
-:::info Encryption Order
+:::info[Encryption Order]
 For reading, the encryption protocol should be first so it decrypts the raw data before other protocols process it. For writing, protocols execute in reverse order, so the encryption protocol (listed first) will encrypt the data last, just before it's sent.
 :::
 
@@ -616,6 +1086,74 @@ For reading, the encryption protocol should be first so it decrypts the raw data
 Below is an example of a custom encryption protocol using OpenSSL's AES-256-GCM cipher. This protocol encrypts outgoing data and decrypts incoming data.
 
 <Tabs groupId="script-language">
+<TabItem value="python" label="Python">
+
+```python
+# encryption_protocol.py
+# Place in targets/TARGET_NAME/lib/encryption_protocol.py
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import os
+from openc3.interfaces.protocols.protocol import Protocol
+from openc3.system.system import System
+from openc3.utilities.logger import Logger
+
+class EncryptionProtocol(Protocol):
+    # key_secret_name: Name of the secret containing the encryption key
+    # iv_secret_name: Name of the secret containing the initialization vector (optional)
+    # allow_empty_data: See Protocol.__init__
+    def __init__(self, key_secret_name, iv_secret_name=None, allow_empty_data=None):
+        super().__init__(allow_empty_data)
+        self.key_secret_name = key_secret_name
+        self.iv_secret_name = iv_secret_name
+        self.key = None
+        self.iv = None
+        # AESGCM instance created in connect_reset after key is loaded
+        self.aesgcm = None
+
+    def connect_reset(self):
+        # Retrieve the encryption key from COSMOS secrets
+        secrets = System.secrets
+        self.key = secrets.get(self.key_secret_name, scope=self.interface.scope)
+        # IV can be from secrets or generated per message
+        if self.iv_secret_name:
+            self.iv = secrets.get(self.iv_secret_name, scope=self.interface.scope)
+        # Create the AESGCM instance with the key (reused for encrypt/decrypt)
+        self.aesgcm = AESGCM(self.key)
+
+    def read_data(self, data, extra=None):
+        if len(data) == 0:
+            return super().read_data(data, extra)
+
+        try:
+            # Extract IV and ciphertext from the data
+            # Format: [12-byte IV][ciphertext with auth tag]
+            iv = data[0:12]
+            ciphertext = data[12:]
+
+            plaintext = self.aesgcm.decrypt(iv, ciphertext, None)
+            return (plaintext, extra)
+        except Exception as e:
+            Logger.error(f"Decryption failed: {e}")
+            return "DISCONNECT"
+
+    def write_data(self, data, extra=None):
+        if len(data) == 0:
+            return super().write_data(data, extra)
+
+        # Generate a random IV for each message (recommended for GCM)
+        iv = self.iv if self.iv else os.urandom(12)
+
+        # encrypt() returns ciphertext with auth tag appended
+        ciphertext = self.aesgcm.encrypt(iv, data, None)
+
+        # Prepend IV to ciphertext
+        # Format: [12-byte IV][ciphertext with auth tag]
+        encrypted_data = iv + ciphertext
+        return (encrypted_data, extra)
+```
+
+</TabItem>
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
@@ -700,81 +1238,13 @@ end
 ```
 
 </TabItem>
-<TabItem value="python" label="Python">
-
-```python
-# encryption_protocol.py
-# Place in targets/TARGET_NAME/lib/encryption_protocol.py
-
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-import os
-from openc3.interfaces.protocols.protocol import Protocol
-from openc3.system.system import System
-from openc3.utilities.logger import Logger
-
-class EncryptionProtocol(Protocol):
-    # key_secret_name: Name of the secret containing the encryption key
-    # iv_secret_name: Name of the secret containing the initialization vector (optional)
-    # allow_empty_data: See Protocol.__init__
-    def __init__(self, key_secret_name, iv_secret_name=None, allow_empty_data=None):
-        super().__init__(allow_empty_data)
-        self.key_secret_name = key_secret_name
-        self.iv_secret_name = iv_secret_name
-        self.key = None
-        self.iv = None
-        # AESGCM instance created in connect_reset after key is loaded
-        self.aesgcm = None
-
-    def connect_reset(self):
-        # Retrieve the encryption key from COSMOS secrets
-        secrets = System.secrets
-        self.key = secrets.get(self.key_secret_name, scope=self.interface.scope)
-        # IV can be from secrets or generated per message
-        if self.iv_secret_name:
-            self.iv = secrets.get(self.iv_secret_name, scope=self.interface.scope)
-        # Create the AESGCM instance with the key (reused for encrypt/decrypt)
-        self.aesgcm = AESGCM(self.key)
-
-    def read_data(self, data, extra=None):
-        if len(data) == 0:
-            return super().read_data(data, extra)
-
-        try:
-            # Extract IV and ciphertext from the data
-            # Format: [12-byte IV][ciphertext with auth tag]
-            iv = data[0:12]
-            ciphertext = data[12:]
-
-            plaintext = self.aesgcm.decrypt(iv, ciphertext, None)
-            return (plaintext, extra)
-        except Exception as e:
-            Logger.error(f"Decryption failed: {e}")
-            return "DISCONNECT"
-
-    def write_data(self, data, extra=None):
-        if len(data) == 0:
-            return super().write_data(data, extra)
-
-        # Generate a random IV for each message (recommended for GCM)
-        iv = self.iv if self.iv else os.urandom(12)
-
-        # encrypt() returns ciphertext with auth tag appended
-        ciphertext = self.aesgcm.encrypt(iv, data, None)
-
-        # Prepend IV to ciphertext
-        # Format: [12-byte IV][ciphertext with auth tag]
-        encrypted_data = iv + ciphertext
-        return (encrypted_data, extra)
-```
-
-</TabItem>
 </Tabs>
 
 ### Using the Encryption Protocol
 
 To use the encryption protocol, first store your encryption key as a secret in COSMOS Admin under the Secrets tab. Then reference it in your plugin.txt:
 
-```ruby
+```cosmos
 INTERFACE ENCRYPTED_INT tcpip_client_interface.rb myhost.com 12345 12345 10.0 nil LENGTH 0 16 0 1 BIG_ENDIAN 0 nil true
   # The encryption protocol should be first for reading (decrypts before other protocols)
   # For writing, it will be last (encrypts after other protocols build the packet)
@@ -793,7 +1263,7 @@ OpenSSL supports many encryption algorithms. Common choices include:
 | aes-256-cbc | AES-256 in CBC mode                            | 32 bytes | 16 bytes |
 | aes-128-cbc | AES-128 in CBC mode                            | 16 bytes | 16 bytes |
 
-:::warning Use Authenticated Encryption
+:::warning[Use Authenticated Encryption]
 We recommend using authenticated encryption modes like GCM (Galois/Counter Mode) which provide both confidentiality and integrity. Non-authenticated modes like CBC are vulnerable to certain attacks if not combined with a separate MAC (Message Authentication Code).
 :::
 
@@ -808,17 +1278,17 @@ We recommend using authenticated encryption modes like GCM (Galois/Counter Mode)
 
 Creating a custom protocol is easy and should be the default solution for customizing COSMOS Interfaces (rather than creating a new Interface class). However, creating custom Interfaces is still useful for defaulting parameters to values that always are fixed for your target and for including the necessary Protocols. The COSMOS Interfaces take a lot of parameters that can be confusing to your end users. Thus you may want to create a custom Interface just to hard coded these values and cut the available parameters down to something like the hostname and port to connect to.
 
-:::info Stored Telemetry
+:::info[Stored Telemetry]
 Custom protocols that handle non-realtime data (e.g. recorded files, back-orbit data, or store-and-forward playback) should set `packet.stored = true` in the `read_packet()` method. Stored packets are fully processed through the COSMOS pipeline (identification, decommutation, logging) but do **not** update the Current Value Table (CVT). This prevents historical data from overwriting real-time values in displays like Packet Viewer and Telemetry Viewer. See [Stored Packets](../guides/packet-types#stored-packets) for more details. The [Preidentified Protocol](#preidentified-protocol) is one example that encodes and decodes the stored flag in its packet header.
 :::
 
 All custom Protocols should derive from the Protocol class [openc3/interfaces/protocols/protocol.rb](https://github.com/OpenC3/cosmos/blob/main/openc3/lib/openc3/interfaces/protocols/protocol.rb) (Ruby) and [openc3/interfaces/protocols/protocol.py](https://github.com/OpenC3/cosmos/blob/main/openc3/python/openc3/interfaces/protocols/protocol.py) (Python). This class defines the 9 methods that are relevant to writing your own protocol. The base class implementation for each method is included below as well as a discussion as to how the methods should be overridden and used in your own Protocols.
 
-:::info Ruby Protocol APIs
+:::info[Ruby Protocol APIs]
 Protocols should not `require 'openc3/script'` since they are part of a COSMOS interface. They should use the COSMOS library code directly like [System](https://github.com/OpenC3/cosmos/blob/main/openc3/lib/openc3/system/system.rb), [Packet](https://github.com/OpenC3/cosmos/blob/main/openc3/lib/openc3/packets/packet.rb), [Bucket](https://github.com/OpenC3/cosmos/blob/main/openc3/lib/openc3/utilities/bucket.rb), [BinaryAccessor](https://github.com/OpenC3/cosmos/blob/main/openc3/lib/openc3/accessors/binary_accessor.rb), etc. When in doubt, consult the existing COSMOS [protocol](https://github.com/OpenC3/cosmos/tree/main/openc3/lib/openc3/interfaces/protocols) classes.
 :::
 
-:::info Python Protocol APIs
+:::info[Python Protocol APIs]
 Protocols should not `from openc3.script import *` since they are part of a COSMOS interface. They should use the COSMOS library code directly like [System](https://github.com/OpenC3/cosmos/blob/main/openc3/python/openc3/system/system.py), [Packet](https://github.com/OpenC3/cosmos/blob/main/openc3/python/openc3/packets/packet.py), [Bucket](https://github.com/OpenC3/cosmos/blob/main/openc3/python/openc3/utilities/bucket.py), [BinaryAccessor](https://github.com/OpenC3/cosmos/blob/main/openc3/python/openc3/accessors/binary_accessor.py), etc. When in doubt, consult the existing COSMOS [protocol](https://github.com/OpenC3/cosmos/tree/main/openc3/python/openc3/interfaces/protocols) classes.
 :::
 
@@ -826,7 +1296,7 @@ To really understand how Protocols work, you first must understand the logic wit
 
 Let's first discuss the read method.
 
-:::info Ruby Symbols, Python Strings
+:::info[Ruby Symbols, Python Strings]
 In the following discussions an all caps word is a symbol in Ruby and a string in Python. So a reference to STOP means :STOP in Ruby and "STOP" in Python.
 :::
 
@@ -862,10 +1332,12 @@ def __init__(self, allow_empty_data=None):
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
-# @param allow_empty_data [true/false] Whether STOP should be returned on empty data
-def initialize(allow_empty_data = false)
+# @param allow_empty_data [true/false/nil] Whether or not this protocol will allow an empty string
+# to be passed down to later Protocols (instead of returning :STOP). Can be true, false, or nil, where
+# nil is interpreted as true unless the Protocol is the last Protocol of the chain.
+def initialize(allow_empty_data = nil)
   @interface = nil
-  @allow_empty_data = ConfigParser.handle_true_false(allow_empty_data)
+  @allow_empty_data = ConfigParser.handle_true_false_nil(allow_empty_data)
   reset()
 end
 ```
@@ -886,7 +1358,15 @@ Base class implementation:
 
 ```python
 def reset(self):
-    pass
+    self.read_data_input_time = None
+    self.read_data_input = b""
+    self.read_data_output_time = None
+    self.read_data_output = b""
+    self.write_data_input_time = None
+    self.write_data_input = b""
+    self.write_data_output_time = None
+    self.write_data_output = b""
+    self.extra = None
 ```
 
 </TabItem>
@@ -894,13 +1374,22 @@ def reset(self):
 
 ```ruby
 def reset
+  @read_data_input_time = nil
+  @read_data_input = ''
+  @read_data_output_time = nil
+  @read_data_output = ''
+  @write_data_input_time = nil
+  @write_data_input = ''
+  @write_data_output_time = nil
+  @write_data_output = ''
+  @extra = nil
 end
 ```
 
 </TabItem>
 </Tabs>
 
-As you can see, the base class reset implementation doesn't do anything.
+The base class reset implementation only clears the protocol's own state: the extra field and the data captured for the read_details / write_details methods. Subclasses which define reset must call super to keep this state cleared.
 
 ### connect_reset
 
@@ -974,7 +1463,7 @@ def read_data(self, data, extra=None):
             if self.interface and self.interface.read_protocols[-1] == self:
                 # Last read interface in chain with auto self.allow_empty_data
                 return ("STOP", extra)
-        elif self.allow_empty_data:
+        elif not self.allow_empty_data:
             # Don't self.allow_empty_data means STOP
             return ("STOP", extra)
     return (data, extra)
@@ -984,7 +1473,7 @@ def read_data(self, data, extra=None):
 <TabItem value="ruby" label="Ruby">
 
 ```ruby
-def read_data(data)
+def read_data(data, extra = nil)
   if (data.length <= 0)
     if @allow_empty_data.nil?
       if @interface and @interface.read_protocols[-1] == self # Last read interface in chain with auto @allow_empty_data
@@ -994,7 +1483,7 @@ def read_data(data)
       return :STOP
     end
   end
-  data
+  return data, extra
 end
 ```
 

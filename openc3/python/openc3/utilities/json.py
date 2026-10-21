@@ -17,7 +17,7 @@ class JsonEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, datetime.datetime):
             return o.strftime("%Y-%m-%d %H:%M:%S.%f")
-        if isinstance(o, (bytes, bytearray)):
+        if isinstance(o, bytes | bytearray):
             return {
                 "json_class": "String",
                 "raw": list(o),
@@ -30,6 +30,10 @@ class JsonDecoder(json.JSONDecoder):
         json.JSONDecoder.__init__(self, object_hook=self.object_hook, *args, **kwargs)  # noqa: B026
 
     def object_hook(self, dct):
-        if dct.get("json_class") == "String":
+        json_class = dct.get("json_class")
+        if json_class == "String":
             return bytes(dct["raw"])
+        # Ruby encodes NaN and Infinity as {"json_class": "Float", "raw": "NaN"}
+        if json_class == "Float" and dct.get("raw") in ("NaN", "Infinity", "-Infinity"):
+            return float(dct["raw"])
         return dct

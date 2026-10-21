@@ -55,8 +55,7 @@ module OpenC3
       while true
         break if @cancel_thread
 
-        # Read each topic separately to support multiple redis shards
-        # This is needed with Redis cluster because the topics will likely be on different shards and we don't use {} in the topic names
+        # Read each topic separately to support multiple redis db_shards
         individual_topics.each do |individual_topic|
           break if @cancel_thread
           # 500ms timeout - To support completing within 1 second with two topics (DEFAULT and NOSCOPE)
@@ -98,12 +97,15 @@ module OpenC3
     def shutdown
       # Make sure all the existing logs are properly closed down
       threads = []
-      @tlws.each do |topic, tlw|
+      @tlws.each do |_topic, tlw|
         threads.concat(tlw.shutdown)
       end
       # Wait for all the logging threads to move files to buckets
       threads.flatten.compact.each do |thread|
         thread.join
+      end
+      @tlws.each do |_topic, tlw|
+        tlw.cleanup
       end
       super()
     end

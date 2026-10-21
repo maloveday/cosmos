@@ -1,5 +1,5 @@
 /*
-# Copyright 2025, OpenC3, Inc.
+# Copyright 2026 OpenC3, Inc.
 # All Rights Reserved.
 #
 # This program is distributed in the hope that it will be useful,
@@ -28,7 +28,7 @@ export default {
     description: String,
     keywords: Array,
     img_path: String, // Set for local plugins
-    image_url: String, // Set for app store plugins
+    image_url: String, // Set for OpenC3 Store plugins
     licenses: Array,
     // rating: Number,
     // downloads: Number,
@@ -39,6 +39,12 @@ export default {
     checksum: String,
     versions: Array,
     current_version_id: Number,
+    access: String,
+    entitled: Boolean,
+    installAllowed: {
+      type: Boolean,
+      default: true,
+    },
   },
   data: function () {
     return {
@@ -71,7 +77,19 @@ export default {
         checksum: this.checksum,
         versions: this.versions,
         current_version_id: this.current_version_id,
+        access: this.access,
+        entitled: this.entitled,
+        installAllowed: this.installAllowed,
       }
+    },
+    canInstall: function () {
+      return this.entitled && this.installAllowed
+    },
+    installTooltip: function () {
+      if (!this.installAllowed) {
+        return 'Only admin users can install plugins.'
+      }
+      return this.accessTooltip
     },
     imageContentsWithMimeType: function () {
       if (this.imageContents) {
@@ -82,9 +100,12 @@ export default {
           'image/gif': [0x47, 0x49, 0x46, 0x38],
           'image/webp': [0x52, 0x49, 0x46, 0x46],
         }
-        const fileHead = new TextEncoder()
-          .encode(globalThis.atob(this.imageContents.slice(0, 6))) // only atob as much as we need
-          .slice(1) // second call to slice on the decoded data because base64 bytes aren't 1:1
+        // Decode only the first 8 base64 chars (6 bytes) and read the raw byte
+        // values; TextEncoder would UTF-8 encode bytes >= 0x80 into two bytes
+        const fileHead = Array.from(
+          globalThis.atob(this.imageContents.slice(0, 8)),
+          (char) => char.charCodeAt(0),
+        )
         const found = Object.entries(magicNumbers).find(([_, magicNumber]) => {
           return magicNumber.every((byte, i) => byte === fileHead[i])
         })
@@ -115,6 +136,19 @@ export default {
     },
     isPluginInstalled: function () {
       return !!this.name // Plugins only have a title, not a name, from the store
+    },
+    accessTooltip: function () {
+      if (this.entitled) {
+        return ''
+      }
+      if (localStorage.getItem('pluginStore.isApiKeySet') !== 'true') {
+        return 'Please add your OpenC3 Store API key using the settings cog icon.'
+      }
+      if (this.access === 'enterprise') {
+        return 'A COSMOS Enterprise license is required for this plugin.'
+      } else {
+        return 'Please contact sales@openc3.com for access to this plugin.'
+      }
     },
   },
   created: async function () {

@@ -42,10 +42,11 @@ module OpenC3
   class InterfaceCmdHandlerThread
     include InterfaceDecomCommon
 
-    def initialize(interface, tlm, logger: nil, metric: nil, scope:)
+    def initialize(interface, tlm, logger: nil, metric: nil, db_shard: 0, scope:)
       @interface = interface
       @tlm = tlm
       @scope = scope
+      @db_shard = db_shard.to_i
       scope_model = ScopeModel.get_model(name: @scope)
       if scope_model
         @critical_commanding = scope_model.critical_commanding
@@ -81,7 +82,7 @@ module OpenC3
     end
 
     def run
-      InterfaceTopic.receive_commands(@interface, scope: @scope) do |topic, msg_id, msg_hash, _redis|
+      InterfaceTopic.receive_commands(@interface, scope: @scope, db_shard: @db_shard) do |topic, msg_id, msg_hash, _redis|
         OpenC3.with_context(msg_hash) do
           release_critical = false
           critical_model = nil
@@ -105,7 +106,7 @@ module OpenC3
             @metric.set(name: 'interface_directive_total', value: @directive_count, type: 'counter') if @metric
             if msg_hash['shutdown']
               @logger.info "#{@interface.name}: Shutdown requested"
-              InterfaceTopic.clear_topics(InterfaceTopic.topics(@interface, scope: @scope))
+              InterfaceTopic.clear_topics(InterfaceTopic.topics(@interface, scope: @scope), db_shard: @db_shard)
               return
             end
             if msg_hash['connect']
@@ -179,7 +180,12 @@ module OpenC3
               next 'SUCCESS'
             end
             if msg_hash.key?('inject_tlm')
-              handle_inject_tlm(msg_hash['inject_tlm'])
+              begin
+                handle_inject_tlm(msg_hash['inject_tlm'])
+              rescue => e
+                @logger.error "#{@interface.name}: inject_tlm: #{e.formatted}"
+                next e.message
+              end
               next 'SUCCESS'
             end
             if msg_hash.key?('release_critical')
@@ -189,7 +195,7 @@ module OpenC3
                 msg_hash = critical_model.cmd_hash
                 release_critical = true
               else
-                next "Critical command #{msg_hash['release_critical']} not found"
+                next "Critical command '#{msg_hash['release_critical']}' not found (interface command processing)"
               end
             end
             if msg_hash.key?('target_control')
@@ -215,7 +221,12 @@ module OpenC3
               next 'SUCCESS'
             end
             if msg_hash.key?('interface_details')
-              next @interface.details.as_json.to_json(allow_nan: true)
+              begin
+                next @interface.details.as_json.to_json(allow_nan: true)
+              rescue => e
+                @logger.error "#{@interface.name}: interface_details: #{e.formatted}"
+                next e.message
+              end
             end
           end
 
@@ -258,7 +269,10 @@ module OpenC3
                 raise "Invalid command received:\n #{msg_hash}"
               end
 
-              if @interface.cmd_target_enabled[command.target_name]
+              # An unidentified buffer is sent as UNKNOWN on behalf of the target it was sent to
+              enabled_target_name = command.target_name
+              enabled_target_name = target_name if enabled_target_name == 'UNKNOWN' and target_name
+              if @interface.cmd_target_enabled[enabled_target_name]
                 orig_command = System.commands.packet(command.target_name, command.packet_name)
                 orig_command.received_count = TargetModel.increment_command_count(command.target_name, command.packet_name, 1, scope: @scope)
                 command.received_count = orig_command.received_count
@@ -266,6 +280,11 @@ module OpenC3
               else
                 next nil # Don't ack disabled targets
               end
+            rescue RangeError => e
+              # Command parameter out of range is a user error, not a bug,
+              # so only log the message and not the full stack trace
+              @logger.error "#{@interface.name}: #{e.message}"
+              next e.message
             rescue => e
               @logger.error "#{@interface.name}: #{msg_hash}"
               @logger.error "#{@interface.name}: #{e.formatted}"
@@ -275,6 +294,9 @@ module OpenC3
             command.extra ||= {}
             command.extra['cmd_string'] = msg_hash['cmd_string']
             command.extra['username'] = msg_hash['username']
+            command.extra['interface_name'] = @interface.name
+            # Original author of a queued command (set when released from a queue)
+            command.extra['queue_username'] = msg_hash['queue_username'] if msg_hash['queue_username']
             # Add approver info if this was a critical command that was approved
             if critical_model
               command.extra['approver'] = critical_model.approver
@@ -374,10 +396,11 @@ module OpenC3
   end
 
   class RouterTlmHandlerThread
-    def initialize(router, tlm, logger: nil, metric: nil, scope:)
+    def initialize(router, tlm, logger: nil, metric: nil, db_shard: 0, scope:)
       @router = router
       @tlm = tlm
       @scope = scope
+      @db_shard = db_shard.to_i
       @logger = logger
       @logger = Logger unless @logger
       @metric = metric
@@ -407,7 +430,7 @@ module OpenC3
     end
 
     def run
-      RouterTopic.receive_telemetry(@router, scope: @scope) do |topic, msg_id, msg_hash, _redis|
+      RouterTopic.receive_telemetry(@router, scope: @scope, db_shard: @db_shard) do |topic, msg_id, msg_hash, _redis|
         msgid_seconds_from_epoch = msg_id.split('-')[0].to_i / 1000.0
         delta = Time.now.to_f - msgid_seconds_from_epoch
         @metric.set(name: 'router_topic_delta_seconds', value: delta, type: 'gauge', unit: 'seconds', help: 'Delta time between data written to stream and router tlm start') if @metric
@@ -419,7 +442,7 @@ module OpenC3
 
           if msg_hash['shutdown']
             @logger.info "#{@router.name}: Shutdown requested"
-            RouterTopic.clear_topics(RouterTopic.topics(@router, scope: @scope))
+            RouterTopic.clear_topics(RouterTopic.topics(@router, scope: @scope), db_shard: @db_shard)
             return
           end
           if msg_hash['connect']
@@ -493,7 +516,12 @@ module OpenC3
             next 'SUCCESS'
           end
           if msg_hash.key?('router_details')
-            next @router.details.as_json.to_json(allow_nan: true)
+            begin
+              next @router.details.as_json.to_json(allow_nan: true)
+            rescue => e
+              @logger.error "#{@router.name}: router_details: #{e.formatted}"
+              next e.message
+            end
           end
           next 'SUCCESS'
         end
@@ -530,6 +558,11 @@ module OpenC3
 
   class InterfaceMicroservice < Microservice
     UNKNOWN_BYTES_TO_PRINT = 16
+
+    # Interfaces never use descriptions so don't keep them in memory
+    def load_descriptions?
+      false
+    end
 
     def initialize(name)
       @mutex = Mutex.new
@@ -585,9 +618,9 @@ module OpenC3
       @connection_failed_messages = []
       @connection_lost_messages = []
       if @interface_or_router == 'INTERFACE'
-        @handler_thread = InterfaceCmdHandlerThread.new(@interface, self, logger: @logger, metric: @metric, scope: @scope)
+        @handler_thread = InterfaceCmdHandlerThread.new(@interface, self, logger: @logger, metric: @metric, db_shard: @db_shard, scope: @scope)
       else
-        @handler_thread = RouterTlmHandlerThread.new(@interface, self, logger: @logger, metric: @metric, scope: @scope)
+        @handler_thread = RouterTlmHandlerThread.new(@interface, self, logger: @logger, metric: @metric, db_shard: @db_shard, scope: @scope)
       end
       @handler_thread.start
     end
@@ -595,7 +628,34 @@ module OpenC3
     # Called to connect the interface/router. It takes optional parameters to
     # rebuilt the interface/router. Once we set the state to 'ATTEMPTING' the
     # run method handles the actual connection.
+    # Connecting an interface/router which is already CONNECTED is a no-op.
+    # Without this the existing (working) connection would be torn down and
+    # rebuilt which can take up to the read_timeout to detect. Callers who want
+    # to force a reconnect should disconnect first or pass new parameters.
     def attempting(*params)
+      if params.empty? and @interface.state == 'CONNECTED' and @interface.connected?
+        @logger.info "#{@interface.name}: Connect ignored, already connected"
+        return @interface
+      end
+
+      # A user requested (re)connect starts fresh so backtraces are logged again
+      clear_connection_messages()
+      attempt_connection(*params)
+    end
+
+    # Forget which errors have already had their backtrace logged
+    def clear_connection_messages
+      @connection_failed_messages.clear
+      @connection_lost_messages.clear
+    end
+
+    # Sets the state to 'ATTEMPTING', first rebuilding the interface/router if
+    # parameters are given, so the run method performs the actual connection.
+    # Unlike attempting() this always transitions. The reconnect path in
+    # disconnect() requires that, since @interface.disconnect may have raised or
+    # left connected? true, which would make attempting() ignore the request and
+    # leave the interface stuck in 'CONNECTED' with no way back to a connection.
+    def attempt_connection(*params)
       unless params.empty?
         @interface.disconnect()
         # Build New Interface, this can fail if passed bad parameters
@@ -699,16 +759,19 @@ module OpenC3
         # Try to do clean disconnect because we're going down
         disconnect(false)
       end
-      if @interface_or_router == 'INTERFACE'
-        InterfaceStatusModel.set(@interface.as_json(), queued: true, scope: @scope)
-      else
-        RouterStatusModel.set(@interface.as_json(), queued: true, scope: @scope)
+      unless @cancel_thread
+        if @interface_or_router == 'INTERFACE'
+          InterfaceStatusModel.set(@interface.as_json(), queued: true, scope: @scope)
+        else
+          RouterStatusModel.set(@interface.as_json(), queued: true, scope: @scope)
+        end
       end
       @logger.info "#{@interface.name}: Stopped packet reading"
     end
 
     def handle_packet(packet)
-      InterfaceStatusModel.set(@interface.as_json(), queued: true, scope: @scope)
+      # Skip status update if stop() has been called to avoid re-creating the status model
+      InterfaceStatusModel.set(@interface.as_json(), queued: true, scope: @scope) unless @cancel_thread
       packet.received_time = Time.now.sys unless packet.received_time
 
       if packet.stored
@@ -777,10 +840,11 @@ module OpenC3
         if RuntimeError === connect_error and (connect_error.message =~ /canceled/ or connect_error.message =~ /timeout/)
           # Do not write an exception file for these extremely common cases
         else
-          @logger.error "#{@interface.name}: #{connect_error.formatted}"
-          unless @connection_failed_messages.include?(connect_error.message)
-            OpenC3.write_exception_file(connect_error)
-            @connection_failed_messages << connect_error.message
+          # Only log the backtrace the first time we see each distinct error
+          key = [connect_error.class, connect_error.message]
+          unless @connection_failed_messages.include?(key)
+            @logger.error "#{@interface.name}: #{connect_error.formatted}"
+            @connection_failed_messages << key
           end
         end
       end
@@ -798,10 +862,11 @@ module OpenC3
         when Errno::ECONNABORTED, Errno::ECONNRESET, Errno::ETIMEDOUT, Errno::EBADF, Errno::ENOTSOCK, IOError
           # Do not write an exception file for these extremely common cases
         else
-          @logger.error "#{@interface.name}: #{err.formatted}"
-          unless @connection_lost_messages.include?(err.message)
-            OpenC3.write_exception_file(err)
-            @connection_lost_messages << err.message
+          # Only log the backtrace the first time we see each distinct error
+          key = [err.class, err.message]
+          unless @connection_lost_messages.include?(key)
+            @logger.error "#{@interface.name}: #{err.formatted}"
+            @connection_lost_messages << key
           end
         end
       else
@@ -812,6 +877,13 @@ module OpenC3
 
     def connect
       @logger.info "#{@interface.name}: Connect #{@interface.connection_string}"
+      # Interface connect implementations typically overwrite their stream / socket
+      # so cleanly close any existing connection rather than leaking it
+      begin
+        @interface.disconnect if @interface.connected?
+      rescue => e
+        @logger.error "Disconnect: #{@interface.name}: #{e.formatted}"
+      end
       begin
         @interface.connect
         @interface.post_connect
@@ -833,35 +905,49 @@ module OpenC3
     end
 
     def disconnect(allow_reconnect = true)
-      return if @interface.state == 'DISCONNECTED' && !@interface.connected?
+      reconnect = false
 
-      # Synchronize the calls to @interface.disconnect since it takes an unknown
-      # amount of time. If two calls to disconnect stack up, the if statement
-      # should avoid multiple calls to disconnect.
+      # Two threads reach here for a single connection loss: the cmd handler
+      # thread servicing a disconnect directive, and the run thread coming back
+      # out of read (or out of the connection maintenance sleep). The redundant
+      # check below and the state change that records the disconnect must be in
+      # the same critical section, otherwise the second thread reads the state
+      # before the first has updated it and disconnects the interface twice.
       @mutex.synchronize do
+        # A disconnect has already been performed so there is nothing left to do
+        return if @interface.state == 'DISCONNECTED' && !@interface.connected?
+
+        # Call disconnect without consulting connected? so any resources the
+        # interface is still holding are cleaned up. It takes an unknown amount
+        # of time which is the other reason for the mutex.
         begin
-          @interface.disconnect if @interface.connected?
+          @interface.disconnect
         rescue => e
           @logger.error "Disconnect: #{@interface.name}: #{e.formatted}"
         end
+
+        # If the interface is set to auto_reconnect then delay so the thread
+        # can come back around and allow the interface a chance to reconnect.
+        # Skip reconnect if stop() has been called to avoid re-creating the status model
+        reconnect = allow_reconnect && @interface.auto_reconnect && @interface.state != 'DISCONNECTED' && !@cancel_thread
+        if reconnect
+          attempt_connection()
+        else
+          @interface.state = 'DISCONNECTED'
+          unless @cancel_thread
+            if @interface_or_router == 'INTERFACE'
+              InterfaceStatusModel.set(@interface.as_json(), queued: true, scope: @scope)
+            else
+              RouterStatusModel.set(@interface.as_json(), queued: true, scope: @scope)
+            end
+          end
+        end
       end
 
-      # If the interface is set to auto_reconnect then delay so the thread
-      # can come back around and allow the interface a chance to reconnect.
-      if allow_reconnect and @interface.auto_reconnect and @interface.state != 'DISCONNECTED'
-        attempting()
-        if !@cancel_thread
-          # @logger.debug "reconnect delay: #{@interface.reconnect_delay}"
-          @interface_thread_sleeper.sleep(@interface.reconnect_delay)
-        end
-      else
-        @interface.state = 'DISCONNECTED'
-        if @interface_or_router == 'INTERFACE'
-          InterfaceStatusModel.set(@interface.as_json(), queued: true, scope: @scope)
-        else
-          RouterStatusModel.set(@interface.as_json(), queued: true, scope: @scope)
-        end
-      end
+      # Sleep outside the mutex so stop() and connect() are not blocked for the
+      # whole reconnect delay
+      # @logger.debug "reconnect delay: #{@interface.reconnect_delay}"
+      @interface_thread_sleeper.sleep(@interface.reconnect_delay) if reconnect && !@cancel_thread
     end
 
     # Disconnect from the interface and stop the thread
@@ -874,7 +960,12 @@ module OpenC3
         @handler_thread.stop if @handler_thread
         @interface_thread_sleeper.cancel if @interface_thread_sleeper
         if @interface
-          @interface.disconnect
+          begin
+            @interface.disconnect
+          rescue => e
+            # Still clean up the status and stream logs if disconnect fails
+            @logger.error "#{@interface.name}: Disconnect failed during stop: #{e.formatted}"
+          end
           if @interface_or_router == 'INTERFACE'
             valid_interface = InterfaceStatusModel.get_model(name: @interface.name, scope: @scope)
           else
@@ -888,6 +979,14 @@ module OpenC3
     def shutdown(_sig = nil)
       @logger.info "#{@interface ? @interface.name : @name}: shutdown requested"
       stop()
+      if @interface and @interface.stream_log_pair
+        threads = @interface.stream_log_pair.shutdown
+        # Wait for all the logging threads to move files to buckets
+        threads.flatten.compact.each do |thread|
+          thread.join
+        end
+        @interface.stream_log_pair.cleanup
+      end
       super()
     end
 

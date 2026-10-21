@@ -277,7 +277,13 @@ RSpec.describe QueuesController, type: :controller do
       json = JSON.parse(response.body, allow_nan: true, create_additions: true)
       expect(json["status"]).to eql("success")
       expect(json["message"]).to eql("Command added to queue")
-      expect(queue_model).to have_received(:insert_command).with(nil, { username: "anonymous", value: "TEST COMMAND", timestamp: anything })
+      expect(queue_model).to have_received(:insert_command).with(
+        id: nil,
+        username: "anonymous",
+        command: "TEST COMMAND",
+        validate: nil,
+        timeout: nil
+      )
     end
 
     it "inserts a command at id and returns status code 200" do
@@ -291,7 +297,13 @@ RSpec.describe QueuesController, type: :controller do
       json = JSON.parse(response.body, allow_nan: true, create_additions: true)
       expect(json["status"]).to eql("success")
       expect(json["message"]).to eql("Command added to queue")
-      expect(queue_model).to have_received(:insert_command).with(id.to_f, { username: "anonymous", value: "TEST COMMAND", timestamp: anything })
+      expect(queue_model).to have_received(:insert_command).with(
+        id: id.to_f,
+        username: "anonymous",
+        command: "TEST COMMAND",
+        validate: nil,
+        timeout: nil
+      )
     end
 
     it "returns 404 when the queue is not found" do
@@ -312,7 +324,7 @@ RSpec.describe QueuesController, type: :controller do
       expect(response).to have_http_status(400)
       json = JSON.parse(response.body, allow_nan: true, create_additions: true)
       expect(json["status"]).to eql("error")
-      expect(json["message"]).to eql("command is required")
+      expect(json["message"]).to eql("target_name/cmd_name or command is required")
     end
 
     it "returns 500 when an unexpected error occurs" do
@@ -451,7 +463,7 @@ RSpec.describe QueuesController, type: :controller do
       expect(response).to have_http_status(400)
       json = JSON.parse(response.body, allow_nan: true, create_additions: true)
       expect(json["status"]).to eql("error")
-      expect(json["message"]).to eql("command is required")
+      expect(json["message"]).to eql("target_name/cmd_name or command is required")
     end
 
     it "returns 400 when id is missing" do
@@ -548,6 +560,7 @@ RSpec.describe QueuesController, type: :controller do
           queue: false,
           validate: true,
           timeout: nil,
+          queue_username: "user1",
           scope: "DEFAULT",
           token: anything
         }
@@ -577,6 +590,7 @@ RSpec.describe QueuesController, type: :controller do
           queue: false,
           validate: true,
           timeout: nil,
+          queue_username: "user2",
           scope: "DEFAULT",
           token: anything
         }
@@ -643,6 +657,7 @@ RSpec.describe QueuesController, type: :controller do
           queue: false,
           validate: true,
           timeout: nil,
+          queue_username: "user3",
           scope: "DEFAULT",
           token: anything
         }
@@ -671,6 +686,7 @@ RSpec.describe QueuesController, type: :controller do
           queue: false,
           validate: true,
           timeout: 0,
+          queue_username: "user4",
           scope: "DEFAULT",
           token: anything
         }
@@ -748,7 +764,7 @@ RSpec.describe QueuesController, type: :controller do
 
       controller.send(:change_state, { name: "NONEXISTENT", scope: "DEFAULT" }, "HOLD")
 
-      expect(controller).to have_received(:render).with(json: { status: 'error', message: 'queue not found' }, status: 404)
+      expect(controller).to have_received(:render).with(json: { status: 'error', message: 'queue not found' }, status: :not_found)
     end
 
     it "handles unexpected errors" do
@@ -759,7 +775,7 @@ RSpec.describe QueuesController, type: :controller do
 
       expect(controller).to have_received(:render).with(
         json: { status: 'error', message: 'Unexpected error', type: 'StandardError', backtrace: anything },
-        status: 500
+        status: :internal_server_error
       )
     end
   end

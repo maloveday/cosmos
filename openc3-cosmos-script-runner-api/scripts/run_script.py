@@ -9,25 +9,30 @@
 # This file may also be used under the terms of a commercial license
 # if purchased from OpenC3, Inc.
 
+import contextlib
 import json
 import os
+import shutil
 import sys
 import time
 import traceback
 from datetime import datetime, timezone
 
-from openc3.environment import OPENC3_CONFIG_BUCKET
-from openc3.models.script_status_model import ScriptStatusModel
-from openc3.script import get_overrides
-from openc3.utilities.bucket import Bucket
-from openc3.utilities.extract import convert_to_value
-from openc3.utilities.logger import Logger
-from openc3.utilities.running_script import (
+
+working_dir = os.getcwd()
+
+from openc3.environment import OPENC3_CONFIG_BUCKET  # noqa: E402
+from openc3.models.script_status_model import ScriptStatusModel  # noqa: E402
+from openc3.script import get_overrides  # noqa: E402
+from openc3.utilities.bucket import Bucket  # noqa: E402
+from openc3.utilities.extract import convert_to_value  # noqa: E402
+from openc3.utilities.logger import Logger  # noqa: E402
+from openc3.utilities.running_script import (  # noqa: E402
     RunningScript,
     running_script_anycable_publish,
 )
-from openc3.utilities.store import EphemeralStore, Store
-from openc3.utilities.store_queued import StoreQueued
+from openc3.utilities.store import EphemeralStore, Store  # noqa: E402
+from openc3.utilities.store_queued import EphemeralStoreQueued, StoreQueued  # noqa: E402
 
 
 def run_script_log(script_id, message, color="BLACK", message_log=True):
@@ -63,6 +68,10 @@ for key in [
     "OPENC3_SERVICE_PASSWORD",
     # This actually contains the password via redis://openc3:XXXXXXXX@openc3-redis:6379
     "ANYCABLE_REDIS_URL",
+    "KC_DB_USERNAME",
+    "KC_DB_PASSWORD",
+    "KEYCLOAK_ADMIN",
+    "KEYCLOAK_ADMIN_PASSWORD",
 ]:
     os.environ.pop(key, None)
 
@@ -100,6 +109,13 @@ try:
             )
         run_script_log(script_id, message, "YELLOW")
 
+    # Subscribe to the pub sub channel for this script BEFORE starting the thread
+    # to avoid a race condition where the thread crashes (e.g. SyntaxError) and
+    # publishes "shutdown" before the main thread subscribes, losing the message.
+    redis = Store.instance().build_redis()
+    p = redis.pubsub(ignore_subscribe_messages=True)
+    p.subscribe(f"script-api:cmd-running-script-channel:{script_id}")
+
     # Start the script in another thread
     running_script.run()
 
@@ -115,10 +131,6 @@ try:
         },
     )
 
-    # Subscribe to the pub sub channel for this script
-    redis = Store.instance().build_redis()
-    p = redis.pubsub(ignore_subscribe_messages=True)
-    p.subscribe(f"script-api:cmd-running-script-channel:{script_id}")
     for msg in p.listen():
         parsed_cmd = json.loads(msg["data"])
         if parsed_cmd != "shutdown" or (isinstance(parsed_cmd, dict) and not parsed_cmd.get("method")):
@@ -147,12 +159,14 @@ try:
                             | "message_box"
                             | "vertical_message_box"
                             | "combo_box"
+                            | "check_box"
                             | "prompt"
                             | "prompt_for_hazardous"
                             | "prompt_for_critical_cmd"
                             | "metadata_input"
                             | "open_file_dialog"
                             | "open_files_dialog"
+                            | "open_bucket_dialog"
                         ):
                             if running_script.prompt_id is not None:
                                 if "prompt_id" in parsed_cmd and running_script.prompt_id == parsed_cmd["prompt_id"]:
@@ -164,9 +178,21 @@ try:
                                             script_id,
                                             f"Multiple input: {running_script.user_input}",
                                         )
+                                    elif parsed_cmd["method"] == "open_bucket_dialog":
+                                        answer = parsed_cmd["answer"]
+                                        if isinstance(answer, str):
+                                            answer = json.loads(answer)
+                                        running_script.user_input = answer
+                                        run_script_log(
+                                            script_id,
+                                            f"Bucket file: {running_script.user_input}",
+                                        )
                                     elif "open_file" in parsed_cmd["method"]:
                                         running_script.user_input = parsed_cmd["answer"]
-                                        run_script_log(script_id, f"File(s): {running_script.user_input}")
+                                        run_script_log(
+                                            script_id,
+                                            f"File(s): {running_script.user_input}",
+                                        )
                                     else:
                                         running_script.user_input = str(parsed_cmd["answer"])
                                         if parsed_cmd["method"] == "ask":
@@ -206,7 +232,8 @@ try:
                             running_script.debug(parsed_cmd["args"])  # debug() logs the output of the command
                         case "executewhilepaused":
                             run_script_log(
-                                script_id, f"INFO: executewhilepaused: {parsed_cmd['args']}"
+                                script_id,
+                                f"INFO: executewhilepaused: {parsed_cmd['args']}",
                             )  # Log what we were passed
                             running_script.execute_while_paused(*parsed_cmd["args"])
                         case _:
@@ -216,7 +243,11 @@ try:
                                 "RED",
                             )
                 else:
-                    run_script_log(script_id, f"ERROR: Script command not handled: {msg['data']}", "RED")
+                    run_script_log(
+                        script_id,
+                        f"ERROR: Script command not handled: {msg['data']}",
+                        "RED",
+                    )
 except Exception:
     tb = traceback.format_exc()
     run_script_log(script_id, tb, "RED")
@@ -256,6 +287,16 @@ finally:
                 "scope": scope,
             },
         )
+
+        # Flush the queued replay-stream writes before the process exits. The
+        # complete (and any crash) events above are published after the
+        # StoreQueued.shutdown above, so without this their replay-stream writes
+        # could be lost and a late-subscribing client would never see the script
+        # finish.
+        # best-effort; the live broadcast already went out
+        with contextlib.suppress(Exception):
+            EphemeralStoreQueued.instance().shutdown()
     finally:
         if running_script:
             running_script.stop_message_log()
+        shutil.rmtree(working_dir)

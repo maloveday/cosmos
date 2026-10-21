@@ -20,7 +20,7 @@ The Binary Accessor serializes data into a binary format when writing to the buf
 
 #### Commands
 
-```ruby
+```cosmos
 COMMAND INST COLLECT BIG_ENDIAN "Starts a collect"
   ACCESSOR BinaryAccessor # Typically not explicitly defined because it is the default
   PARAMETER TYPE       64  16  UINT MIN MAX 0 "Collect type"
@@ -30,7 +30,7 @@ COMMAND INST COLLECT BIG_ENDIAN "Starts a collect"
 
 #### Telemetry
 
-```ruby
+```cosmos
 TELEMETRY INST HEALTH_STATUS BIG_ENDIAN "Health and status"
   ACCESSOR BinaryAccessor # Typically not explicitly defined because it is the default
   APPEND_ITEM CMD_ACPT_CNT   32 UINT  "Command accept count"
@@ -48,7 +48,7 @@ For a full example see the [COSMOS Demo](https://github.com/OpenC3/cosmos/tree/m
 
 Using the CBOR Accessor for [command definitions](command) requires the use of [TEMPLATE_FILE](command#template_file) and [KEY](command#key) to allow the user to set values in the CBOR data. Note that the KEY values use [JSONPath](https://en.wikipedia.org/wiki/JSONPath).
 
-```ruby
+```cosmos
 COMMAND CBOR CBORCMD BIG_ENDIAN "CBOR Accessor Command"
   ACCESSOR CborAccessor
   TEMPLATE_FILE _cbor_template.bin
@@ -82,7 +82,7 @@ end
 
 Using the CBOR Accessor for [telemetry definitions](telemetry) only _requires_ the use of [KEY](command#key) to pull values from the CBOR data. Note that the KEY values use [JSONPath](https://en.wikipedia.org/wiki/JSONPath). However, it is highly recommended to implement the [TEMPLATE_FILE](telemetry#template_file) keyword to allow the [`inject_tlm`](/docs/guides/scripting-api#inject_tlm) method to work.
 
-```ruby
+```cosmos
 TELEMETRY CBOR CBORTLM BIG_ENDIAN "CBOR Accessor Telemetry"
   ACCESSOR CborAccessor
   TEMPLATE_FILE _cbor_template.bin
@@ -90,7 +90,7 @@ TELEMETRY CBOR CBORTLM BIG_ENDIAN "CBOR Accessor Telemetry"
     KEY $.id_item
   APPEND_ITEM ITEM1 16 UINT "Int Item 2"
     KEY $.item1
-    GENERIC_READ_CONVERSION_START UINT 16
+    GENERIC_READ_CONVERSION_START
       value * 2
     GENERIC_READ_CONVERSION_END
     UNITS CELSIUS C
@@ -113,7 +113,7 @@ The Form Accessor is typically used with the [HTTP Client](interfaces#http-clien
 
 Using the Form Accessor for [command definitions](command) requires the use of [KEY](command#key) to allow the user to set values in the HTTP form. Note that the KEY values use [XPath](https://en.wikipedia.org/wiki/XPath).
 
-```ruby
+```cosmos
 COMMAND FORM FORMCMD BIG_ENDIAN "Form Accessor Command"
   ACCESSOR FormAccessor
   APPEND_ID_PARAMETER ID_ITEM 32 INT 2 2 2 "Int Item"
@@ -127,7 +127,7 @@ COMMAND FORM FORMCMD BIG_ENDIAN "Form Accessor Command"
 
 Using the Form Accessor for [telemetry definitions](telemetry) only requires the use of [KEY](command#key) to pull values from the HTTP response data. Note that the KEY values use [XPath](https://en.wikipedia.org/wiki/XPath).
 
-```ruby
+```cosmos
 TELEMETRY FORM FORMTLM BIG_ENDIAN "Form Accessor Telemetry"
   ACCESSOR FormAccessor
   APPEND_ID_ITEM ID_ITEM 32 INT 1 "Int Item"
@@ -148,7 +148,7 @@ HTML Accessor is not typically used for commands but it would be similar to Tele
 
 #### Telemetry
 
-```ruby
+```cosmos
 TELEMETRY HTML RESPONSE BIG_ENDIAN "Search results"
   # Typically you use the HtmlAccessor to parse out the page that is returned
   # HtmlAccessor is passed to HttpAccessor and used internally
@@ -193,7 +193,7 @@ When used with the HTTP Server Interface, HTTP Accessor utilizes the following c
 | HTTP_PACKET     | telemetry packet to store the request                                                   |
 | HTTP_HEADER_XXX | sets a value in the response headers (XXX => value, or KEY => value), see example below |
 
-```ruby
+```cosmos
 COMMAND HTML SEARCH BIG_ENDIAN "Searches Rubygems.org"
   # Note FormAccessor is the default argument for HttpAccessor so it is typically not specified
   ACCESSOR HttpAccessor
@@ -207,6 +207,7 @@ COMMAND HTML SEARCH BIG_ENDIAN "Searches Rubygems.org"
     GENERIC_READ_CONVERSION_START
       value.split.join('+')
     GENERIC_READ_CONVERSION_END
+    CONVERTED_DATA 0 STRING
   # This sets header Content-Type=text/html
   # Note that TYPE is not used since the KEY is specified
   PARAMETER HTTP_HEADER_TYPE 0 0 DERIVED nil nil "text/html"
@@ -223,7 +224,7 @@ HTTP Accessor utilizes the following telemetry items:
 | HTTP_HEADERS | hash of the response headers                                                                                          |
 | HTTP_REQUEST | optional hash which returns all the request parameters, see [HTTP Client Interface](interfaces#http-client-interface) |
 
-```ruby
+```cosmos
 TELEMETRY HTML RESPONSE BIG_ENDIAN "Search results"
   # Typically you use the HtmlAccessor to parse out the page that is returned
   ACCESSOR HttpAccessor HtmlAccessor
@@ -249,7 +250,7 @@ For a full example see the [COSMOS Demo](https://github.com/OpenC3/cosmos/tree/m
 
 Using the JSON Accessor for [command definitions](command) requires the use of [TEMPLATE](command#template) and [KEY](command#key) to allow the user to set values in the JSON data. Note that the KEY values use [JSONPath](https://en.wikipedia.org/wiki/JSONPath).
 
-```ruby
+```cosmos
 COMMAND JSON JSONCMD BIG_ENDIAN "JSON Accessor Command"
   ACCESSOR JsonAccessor
   TEMPLATE '{"id_item":1, "item1":101, "more": { "item2":12, "item3":3.14, "item4":"Example", "item5":[4, 3, 2, 1] } }'
@@ -273,7 +274,7 @@ COMMAND JSON JSONCMD BIG_ENDIAN "JSON Accessor Command"
 
 Using the JSON Accessor for [telemetry definitions](telemetry) only _requires_ the use of [KEY](telemetry#key) to pull values from the JSON data. Note that the KEY values use [JSONPath](https://en.wikipedia.org/wiki/JSONPath). However, it is highly recommended to implement the [TEMPLATE](telemetry#template) keyword to allow the [`inject_tlm`](/docs/guides/scripting-api#inject_tlm) method to work.
 
-```ruby
+```cosmos
 TELEMETRY JSON JSONTLM BIG_ENDIAN "JSON Accessor Telemetry"
   ACCESSOR JsonAccessor
   TEMPLATE '{"id_item":1, "item1":101, "more": { "item2":12, "item3":3.14, "item4":"Example", "item5":[4, 3, 2, 1] } }'
@@ -281,7 +282,7 @@ TELEMETRY JSON JSONTLM BIG_ENDIAN "JSON Accessor Telemetry"
     KEY $.id_item
   APPEND_ITEM ITEM1 16 UINT "Int Item 2"
     KEY $.item1
-    GENERIC_READ_CONVERSION_START UINT 16
+    GENERIC_READ_CONVERSION_START
       value * 2
     GENERIC_READ_CONVERSION_END
     UNITS CELSIUS C
@@ -300,13 +301,13 @@ TELEMETRY JSON JSONTLM BIG_ENDIAN "JSON Accessor Telemetry"
 
 The Template Accessor is commonly used with string based command / response protocols such as the [Command Response Protocol](protocols#command-response-protocol).
 
-For a full example see [openc3-cosmos-scpi-power-supply](https://github.com/OpenC3/cosmos-enterprise-plugins/tree/main/openc3-cosmos-scpi-power-supply) in the COSMOS Enterprise Plugins.
+For a full example, please see [openc3-cosmos-scpi-power-supply](https://repos.openc3.com/OpenC3/openc3-cosmos-scpi-power-supply).
 
 #### Commands
 
 Using the Template Accessor for [command definitions](command) requires the use of [TEMPLATE](command#template) to define a string template with optional parameters that are populated using the command parameters.
 
-```ruby
+```cosmos
 # Some commands don't have any parameters and the template is sent as-is
 COMMAND SCPI_PS RESET BIG_ENDIAN "Reset the power supply state"
   ACCESSOR TemplateAccessor
@@ -326,7 +327,7 @@ COMMAND SCPI_PS VOLTAGE BIG_ENDIAN "Sets the voltage of a power supply channel"
 
 Using the Template Accessor for [telemetry definitions](telemetry) requires the use of [TEMPLATE](telemetry#template) to define a template where telemetry values are pulled from the string buffer.
 
-```ruby
+```cosmos
 TELEMETRY SCPI_PS STATUS BIG_ENDIAN "Power supply status"
   ACCESSOR TemplateAccessor
   # The raw string from the target is something like "1.234,2.345"
@@ -346,7 +347,7 @@ For a full example see the [COSMOS Demo](https://github.com/OpenC3/cosmos/tree/m
 
 Using the XML Accessor for [command definitions](command) requires the use of [TEMPLATE](command#template) and [KEY](command#key) to allow the user to set values in the XML data. Note that the KEY values use [XPath](https://en.wikipedia.org/wiki/XPath).
 
-```ruby
+```cosmos
 COMMAND XML XMLCMD BIG_ENDIAN "XML Accessor Command"
   ACCESSOR XmlAccessor
   TEMPLATE '<html><head><script src="3"></script><noscript>101</noscript></head><body><img src="12"/><div><ul><li>3.14</li><li>Example</li></ul></div><div></div></body></html>'
@@ -368,7 +369,7 @@ COMMAND XML XMLCMD BIG_ENDIAN "XML Accessor Command"
 
 Using the XML Accessor for [telemetry definitions](telemetry) only _requires_ the use of [KEY](command#key) to pull values from the XML data. Note that the KEY values use [XPath](https://en.wikipedia.org/wiki/XPath). However, it is highly recommended to implement the [TEMPLATE](telemetry#template) keyword to allow the [`inject_tlm`](/docs/guides/scripting-api#inject_tlm) method to work.
 
-```ruby
+```cosmos
 TELEMETRY XML XMLTLM BIG_ENDIAN "XML Accessor Telemetry"
   ACCESSOR XmlAccessor
   TEMPLATE '<html><head><script src="3"></script><noscript>101</noscript></head><body><img src="12"/><div><ul><li>3.14</li><li>Example</li></ul></div><div></div></body></html>'
@@ -376,7 +377,7 @@ TELEMETRY XML XMLTLM BIG_ENDIAN "XML Accessor Telemetry"
     KEY "/html/head/script/@src"
   APPEND_ITEM ITEM1 16 UINT "Int Item 2"
     KEY "/html/head/noscript/text()"
-    GENERIC_READ_CONVERSION_START UINT 16
+    GENERIC_READ_CONVERSION_START
       value * 2
     GENERIC_READ_CONVERSION_END
     UNITS CELSIUS C
@@ -393,13 +394,13 @@ TELEMETRY XML XMLTLM BIG_ENDIAN "XML Accessor Telemetry"
 
 The GemsAsciiAccessor inherits from [TemplateAccessor](accessors#template-accessor) to escape the following characters in outgoing commands: "&" => "&a", "|" => "&b", "," => "&c", and ";" => "&d" and reverse them in telemetry. See the [GEMS Spec](https://www.omg.org/spec/GEMS/1.3/PDF) for more information.
 
-For a full example, please see the [openc3-cosmos-gems-interface](https://github.com/OpenC3/cosmos-enterprise-plugins/tree/main/openc3-cosmos-gems-interface) in the COSMOS Enterprise Plugins.
+For a full example, please see [openc3-cosmos-gems-interface](https://repos.openc3.com/OpenC3/openc3-cosmos-gems-interface).
 
 ### Prometheus (Enterprise)
 
 The PrometheusAccessor is used to read from a Prometheus endpoint and can automatically parse the results into a packet. The PrometheusAccessor is currently only implemented in Ruby.
 
-For a full example, please see the [openc3-cosmos-prometheus-metrics](https://github.com/OpenC3/cosmos-enterprise-plugins/tree/main/openc3-cosmos-prometheus-metrics) in the COSMOS Enterprise Plugins.
+For a full example, please see [openc3-cosmos-prometheus-metrics](https://repos.openc3.com/OpenC3/openc3-cosmos-prometheus-metrics).
 
 ### Protocol Buffer (Enterprise)
 
@@ -437,7 +438,7 @@ Using the ProtoAccessor for [command definitions](command) requires the use of [
 <Tabs groupId="script-language">
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 # Class names use the full Ruby module path
 COMMAND PROTO CREATE_USER BIG_ENDIAN "Create a User"
   META GRPC_METHOD /example.photoservice.ExamplePhotoService/CreateUser
@@ -455,7 +456,7 @@ COMMAND PROTO CREATE_USER BIG_ENDIAN "Create a User"
 </TabItem>
 <TabItem value="python" label="Python">
 
-```ruby
+```cosmos
 # Class names use the Python class name directly
 COMMAND PROTO CREATE_USER BIG_ENDIAN "Create a User"
   META GRPC_METHOD /example.photoservice.ExamplePhotoService/CreateUser
@@ -478,7 +479,7 @@ Nested protobuf messages are flattened using dot-notation in the KEY. For exampl
 <Tabs groupId="script-language">
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 COMMAND PROTO UPDATE_USER BIG_ENDIAN "Update a User"
   META GRPC_METHOD /example.photoservice.ExamplePhotoService/UpdateUser
   ACCESSOR proto_accessor.rb example_photo_pb.rb Example::Photoservice::UpdateUserRequest
@@ -502,7 +503,7 @@ COMMAND PROTO UPDATE_USER BIG_ENDIAN "Update a User"
 </TabItem>
 <TabItem value="python" label="Python">
 
-```ruby
+```cosmos
 COMMAND PROTO UPDATE_USER BIG_ENDIAN "Update a User"
   META GRPC_METHOD /example.photoservice.ExamplePhotoService/UpdateUser
   ACCESSOR proto_accessor.py example_photo_pb2.py UpdateUserRequest
@@ -531,7 +532,7 @@ When a gRPC method returns `google.protobuf.Empty`, omit the `RESPONSE` line:
 <Tabs groupId="script-language">
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 COMMAND PROTO DELETE_PHOTO BIG_ENDIAN "Delete a Photo"
   META GRPC_METHOD /example.photoservice.ExamplePhotoService/DeletePhoto
   ACCESSOR proto_accessor.rb example_photo_pb.rb Example::Photoservice::DeletePhotoRequest
@@ -543,7 +544,7 @@ COMMAND PROTO DELETE_PHOTO BIG_ENDIAN "Delete a Photo"
 </TabItem>
 <TabItem value="python" label="Python">
 
-```ruby
+```cosmos
 COMMAND PROTO DELETE_PHOTO BIG_ENDIAN "Delete a Photo"
   META GRPC_METHOD /example.photoservice.ExamplePhotoService/DeletePhoto
   ACCESSOR proto_accessor.py example_photo_pb2.py DeletePhotoRequest
@@ -562,7 +563,7 @@ Using the ProtoAccessor for [telemetry definitions](telemetry) requires the use 
 <Tabs groupId="script-language">
 <TabItem value="ruby" label="Ruby">
 
-```ruby
+```cosmos
 # Simple message with scalar fields
 TELEMETRY PROTO USER BIG_ENDIAN "User Telemetry"
   ACCESSOR proto_accessor.rb example_photo_pb.rb Example::Photoservice::User
@@ -575,7 +576,7 @@ TELEMETRY PROTO USER BIG_ENDIAN "User Telemetry"
     KEY email
 ```
 
-```ruby
+```cosmos
 # Message with nested Timestamp (flattened to seconds and nanos)
 TELEMETRY PROTO PHOTO BIG_ENDIAN "Photo Telemetry"
   ACCESSOR proto_accessor.rb example_photo_pb.rb Example::Photoservice::Photo
@@ -590,7 +591,7 @@ TELEMETRY PROTO PHOTO BIG_ENDIAN "Photo Telemetry"
     KEY created_at.nanos
 ```
 
-```ruby
+```cosmos
 # Message with repeated (array) fields
 TELEMETRY PROTO LIST_PHOTOS_RESPONSE BIG_ENDIAN "List of Photos"
   ACCESSOR proto_accessor.rb example_photo_pb.rb Example::Photoservice::ListPhotosResponse
@@ -604,7 +605,7 @@ TELEMETRY PROTO LIST_PHOTOS_RESPONSE BIG_ENDIAN "List of Photos"
 </TabItem>
 <TabItem value="python" label="Python">
 
-```ruby
+```cosmos
 # Simple message with scalar fields
 TELEMETRY PROTO USER BIG_ENDIAN "User Telemetry"
   ACCESSOR proto_accessor.py example_photo_pb2.py User
@@ -617,7 +618,7 @@ TELEMETRY PROTO USER BIG_ENDIAN "User Telemetry"
     KEY email
 ```
 
-```ruby
+```cosmos
 # Message with nested Timestamp (flattened to seconds and nanos)
 TELEMETRY PROTO PHOTO BIG_ENDIAN "Photo Telemetry"
   ACCESSOR proto_accessor.py example_photo_pb2.py Photo
@@ -632,7 +633,7 @@ TELEMETRY PROTO PHOTO BIG_ENDIAN "Photo Telemetry"
     KEY created_at.nanos
 ```
 
-```ruby
+```cosmos
 # Message with repeated (array) fields
 TELEMETRY PROTO LIST_PHOTOS_RESPONSE BIG_ENDIAN "List of Photos"
   ACCESSOR proto_accessor.py example_photo_pb2.py ListPhotosResponse
@@ -646,4 +647,4 @@ TELEMETRY PROTO LIST_PHOTOS_RESPONSE BIG_ENDIAN "List of Photos"
 </TabItem>
 </Tabs>
 
-For a full example, please see the [openc3-cosmos-proto-target](https://github.com/OpenC3/cosmos-enterprise-plugins/tree/main/openc3-cosmos-proto-target) in the COSMOS Enterprise Plugins.
+For a full example, please see [openc3-cosmos-proto-target](https://repos.openc3.com/OpenC3/openc3-cosmos-proto-target).

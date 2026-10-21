@@ -12,7 +12,6 @@
 # All Rights Reserved
 */
 
-// @ts-check
 import { test, expect } from './../fixture'
 
 test.use({
@@ -112,6 +111,21 @@ test('sets a classification banner', async ({ page, utils }) => {
       `--classification-text:\\s?"${bannerText}"; --classification-font-color:\\s?${bannerTextColor.toLowerCase()}; --classification-background-color:\\s?#${bannerBackgroundColor}; --classification-height-top:\\s?${bannerHeight}px; --classification-height-bottom:\\s?0px;`,
     ),
   )
+  // The saved height must repopulate the form, not reset to the 20px default
+  await expect(
+    page
+      .locator('[data-test=classification-banner-top-height]')
+      .locator('input'),
+  ).toHaveValue(bannerHeight)
+  // Saving an unrelated change must not clobber the stored height
+  await page.locator('[data-test="classification-banner-font-color"]').click()
+  await page.locator('.v-list-item-title:has-text("Green")').click()
+  await page.locator('[data-test=save-classification-banner]').click()
+  await page.reload()
+  await expect(page.locator('#app')).toHaveAttribute(
+    'style',
+    new RegExp(`--classification-height-top:\\s?${bannerHeight}px;`),
+  )
   // Disable the classification banner
   await page.uncheck('text=Display top banner')
   await page.locator('[data-test=save-classification-banner]').click()
@@ -128,7 +142,9 @@ test('changes the source url', async ({ page, utils }) => {
     .locator('input')
     .fill('https://openc3.com')
   await page.locator('[data-test=save-source-url]').click()
-  await expect(page.getByText('Source code URL').first()).toBeVisible()
+  // Wait for the save to actually persist before reloading; reloading while the
+  // set_setting request is still in flight aborts it and the value is lost.
+  await expect(page.getByText('Saved!').first()).toBeVisible()
   await page.reload()
   await expect(page.locator('footer a')).toHaveAttribute(
     'href',
@@ -142,6 +158,9 @@ test('changes the rubygems url', async ({ page, utils }) => {
     .locator('input')
     .fill('https://myrubygems.com')
   await page.locator('[data-test=save-rubygems-url]').click()
+  // Wait for the save to actually persist before reloading; reloading while the
+  // set_setting request is still in flight aborts it and the value is lost.
+  await expect(page.getByText('Saved!').first()).toBeVisible()
   await page.reload()
   await expect(page.getByText('Rubygems URL').first()).toBeVisible()
   await expect(
@@ -155,6 +174,9 @@ test('changes the pypi url', async ({ page, utils }) => {
     .locator('input')
     .fill('https://mypypi.com')
   await page.locator('[data-test=save-pypi-url]').click()
+  // Wait for the save to actually persist before reloading; reloading while the
+  // set_setting request is still in flight aborts it and the value is lost.
+  await expect(page.getByText('Saved!').first()).toBeVisible()
   await page.reload()
   await expect(page.getByText('Pypi URL').first()).toBeVisible()
   await expect(
@@ -176,6 +198,10 @@ test('changes scripting settings', async ({ page, utils }) => {
   // Enable Vim mode
   await page.getByRole('checkbox', { name: 'Vim mode' }).check()
   await page.locator('[data-test=save-editor-settings]').click()
+
+  // Wait for the save to actually persist before reloading; reloading while the
+  // set_setting request is still in flight aborts it and the value is lost.
+  await expect(page.getByText('Saved!').first()).toBeVisible()
 
   // Verify Ruby setting
   await page.reload()

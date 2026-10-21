@@ -11,7 +11,11 @@ Our roadmap is captured via Github [Milestones](https://github.com/OpenC3/cosmos
 
 ## Monthly Releases
 
-We are dedicated to monthly releases that update dependencies and close CVEs. This ensures that COSMOS stays current with the latest security patches and library updates.
+We are dedicated to monthly releases that incorporate bug fixes, add new features, update dependencies, and close CVEs. This ensures that COSMOS stays current with the latest security patches and library updates while continuously delivering new functionality.
+
+## Long Term Support (LTS)
+
+COSMOS is a continuously developed product, and we encourage all customers to stay up to date with our releases as noted above. However, we understand that migration between major releases requires planning and testing. Therefore, we continue to publish patch releases on the previous major version to address significant bugs and CVEs. Previous major releases do not receive new features. If you need extended support or new development on a previous major release, please contact us at [sales@openc3.com](mailto:sales@openc3.com).
 
 ## Language and Runtime Support
 
@@ -20,7 +24,7 @@ Our Ruby and Python client APIs support the currently supported versions of each
 - **Ruby**: We support versions in normal maintenance and security maintenance as defined by the [Ruby Maintenance Branches](https://www.ruby-lang.org/en/downloads/branches/).
 - **Python**: We support versions in bugfix and security status as defined by the [Python Release Cycle](https://devguide.python.org/versions/).
 
-Our Docker containers are built on [Alpine Linux](https://alpinelinux.org/releases/) base images. The versions of Ruby and Python available in our containers are dependent on what is packaged in the Alpine releases. Our current Alpine version is [3.23](https://alpinelinux.org/posts/Alpine-3.23.0-released.html) which uses Ruby 3.4 and Python 3.12.
+Our Docker containers are built on [Debian](https://www.debian.org/releases/) slim base images. The version of Python available in our containers is dependent on what is packaged in the Debian release, while Ruby comes from the official `ruby` slim image. Our current Debian release is [trixie](https://www.debian.org/releases/trixie/) which uses Ruby 3.4 and Python 3.13.
 
 ## Github Issues
 

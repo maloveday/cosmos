@@ -63,7 +63,7 @@ module OpenC3
       while true
         break if @cancel_thread
 
-        Topic.read_topics(@topics) do |topic, msg_id, msg_hash, redis|
+        Topic.read_topics(@topics, db_shard: @db_shard) do |topic, msg_id, msg_hash, redis|
           break if @cancel_thread
           if topic == @microservice_topic
             microservice_cmd(topic, msg_id, msg_hash, redis)
@@ -125,14 +125,19 @@ module OpenC3
     def shutdown
       # Make sure all the existing logs are properly closed down
       threads = []
-      @plws.each do |target_name, plw_hash|
-        plw_hash.each do |type, plw|
+      @plws.each do |_target_name, plw_hash|
+        plw_hash.each do |_type, plw|
           threads.concat(plw.shutdown)
         end
       end
       # Wait for all the logging threads to move files to buckets
       threads.flatten.compact.each do |thread|
         thread.join
+      end
+      @plws.each do |_target_name, plw_hash|
+        plw_hash.each do |_type, plw|
+          plw.cleanup
+        end
       end
       super()
     end

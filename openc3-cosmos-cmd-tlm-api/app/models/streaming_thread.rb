@@ -25,10 +25,11 @@ OpenC3.require_file 'openc3/logs/packet_log_reader'
 OpenC3.require_file 'openc3/config/config_parser'
 
 class StreamingThread
-  def initialize(streaming_api, collection, max_batch_size = 100)
+  def initialize(streaming_api, collection, max_batch_size = 100, scope: nil)
     @streaming_api = streaming_api
     @collection = collection
     @max_batch_size = max_batch_size
+    @scope = scope
     @cancel_thread = false
     @thread = nil
   end
@@ -81,60 +82,81 @@ class StreamingThread
     @cancel_thread = true
   end
 
+  # Wait up to timeout seconds for the underlying Ruby thread to actually exit.
+  # Unlike alive?, which reports false as soon as stop has been requested, this
+  # reflects whether the thread has finished and released its resources.
+  # Returns true if the thread has finished.
+  def join(timeout)
+    return true unless @thread
+    return false if @thread == Thread.current
+    return !@thread.join([timeout, 0].max).nil?
+  end
+
   def redis_thread_body
     topics, offsets, item_objects_by_topic, packet_objects_by_topic = @collection.topics_offsets_and_objects
     results = []
     if topics.length > 0
-      # 500ms timeout to allow for thread to shutdown within 1 second
-      xread_result = OpenC3::Topic.read_topics(topics, offsets, 500) do |topic, msg_id, msg_hash, _|
-        stored = OpenC3::ConfigParser.handle_true_false(msg_hash["stored"])
-        next if stored # Ignore stored packets while realtime streaming
+      # Build db_shard groups from the objects' pre-computed db_shards
+      db_shard_groups = build_db_shard_groups(topics, offsets, item_objects_by_topic, packet_objects_by_topic)
 
+      # Read from each db_shard with proportionally shorter timeouts
+      timeout_per_db_shard = [500 / [db_shard_groups.length, 1].max, 100].max
+      any_result = false
+      db_shard_groups.each do |db_shard, group|
         break if @cancel_thread
-
-        # Get the item objects that need this topic
-        objects = item_objects_by_topic[topic]
-
-        # Update the offset for each object
-
-        break if @cancel_thread
-        if objects and objects.length > 0
-          objects.each do |object|
-            object.offset = msg_id
-          end
-          result_entry = handle_message(msg_hash, objects)
-          results << result_entry if result_entry
-        end
-        break if @cancel_thread
-
-        # Transmit if we have a full batch or more
-        if results.length >= @max_batch_size
-          @streaming_api.transmit_results(results)
-          results.clear
-        end
-
-        # Get the packet objects that need this topic
-        objects = packet_objects_by_topic[topic]
-
-        # Update the offset for each object
-        if objects
-          objects.each do |object|
-            object.offset = msg_id
+        xread_result = OpenC3::Topic.read_topics(group[:topics], group[:offsets], timeout_per_db_shard, @max_batch_size, db_shard: db_shard) do |topic, msg_id, msg_hash, _|
+          if skip_message?(topic, msg_hash)
+            # Still advance offsets past skipped messages, otherwise a run of them
+            # longer than the read count would be re-read forever
+            advance_offsets(topic, msg_id, item_objects_by_topic, packet_objects_by_topic)
+            next
           end
 
-          objects.each do |object|
-            break if @cancel_thread
-            result_entry = handle_message(msg_hash, [object])
+          break if @cancel_thread
+
+          # Get the item objects that need this topic
+          objects = item_objects_by_topic[topic]
+
+          break if @cancel_thread
+          if objects and objects.length > 0
+            objects.each do |object|
+              object.offset = msg_id
+            end
+            result_entry = handle_message(msg_hash, objects)
             results << result_entry if result_entry
-            # Transmit if we have a full batch or more
-            if results.length >= @max_batch_size
-              @streaming_api.transmit_results(results)
-              results.clear
+          end
+          break if @cancel_thread
+
+          # Transmit if we have a full batch or more
+          if results.length >= @max_batch_size
+            @streaming_api.transmit_results(results)
+            results.clear
+          end
+
+          # Get the packet objects that need this topic
+          objects = packet_objects_by_topic[topic]
+
+          # Update the offset for each object
+          if objects
+            objects.each do |object|
+              object.offset = msg_id
+            end
+
+            objects.each do |object|
+              break if @cancel_thread
+              result_entry = handle_message(msg_hash, [object])
+              results << result_entry if result_entry
+              # Transmit if we have a full batch or more
+              if results.length >= @max_batch_size
+                @streaming_api.transmit_results(results)
+                results.clear
+              end
             end
           end
-        end
 
-        break if @cancel_thread
+          break if @cancel_thread
+        end
+        any_result = true if xread_result and xread_result.length > 0
       end
 
       # Transmit less than a batch if we have that
@@ -142,10 +164,23 @@ class StreamingThread
       results.clear
 
       # Check for completed objects by wall clock time if we got nothing
-      check_for_completed_objects() if xread_result and xread_result.length == 0
+      check_for_completed_objects() unless any_result
     else
       @cancel_thread = true
     end
+  end
+
+  # Returns true if a streamed message should not be delivered
+  def skip_message?(_topic, msg_hash)
+    # Ignore stored packets while realtime streaming
+    OpenC3::ConfigParser.handle_true_false(msg_hash["stored"])
+  end
+
+  def advance_offsets(topic, msg_id, item_objects_by_topic, packet_objects_by_topic)
+    objects = item_objects_by_topic[topic]
+    objects.each { |object| object.offset = msg_id } if objects
+    objects = packet_objects_by_topic[topic]
+    objects.each { |object| object.offset = msg_id } if objects
   end
 
   def handle_message(msg_hash, objects)
@@ -227,6 +262,34 @@ class StreamingThread
       @collection.remove(object)
     end
     @cancel_thread = true if @collection.empty?
+  end
+
+  # Build db_shard groups from streaming objects' pre-computed db_shards.
+  # Each StreamingObject already knows its db_shard from initialization.
+  # Returns { db_shard => { topics: [], offsets: [] } } with fast path for all-db_shard-0.
+  def build_db_shard_groups(topics, offsets, item_objects_by_topic, packet_objects_by_topic)
+    # Build a topic-to-db_shard map from the objects
+    topic_db_shard = {}
+    item_objects_by_topic.each do |topic, objects|
+      topic_db_shard[topic] = objects[0].db_shard if objects && objects.length > 0
+    end
+    packet_objects_by_topic.each do |topic, objects|
+      topic_db_shard[topic] = objects[0].db_shard if objects && objects.length > 0
+    end
+
+    groups = {}
+    topics.each_with_index do |topic, idx|
+      db_shard = topic_db_shard[topic] || 0
+      groups[db_shard] ||= { topics: [], offsets: [] }
+      groups[db_shard][:topics] << topic
+      groups[db_shard][:offsets] << offsets[idx]
+    end
+
+    # Fast path: if everything is on db_shard 0, use the original arrays
+    if groups.length == 1 && groups.key?(0)
+      groups = { 0 => { topics: topics, offsets: offsets } }
+    end
+    groups
   end
 
   def handoff(collection)

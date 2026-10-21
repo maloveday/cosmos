@@ -77,26 +77,33 @@ module OpenC3
       end
     end
 
-    def self.setup_targets(target_names, base_dir, scope:)
+    # target_version can also be the actual hash used in the target_archives folder
+    # @param descriptions [Boolean] Whether to keep packet and item descriptions
+    def self.setup_targets(target_names, base_dir, target_version: 'current', scope:, descriptions: true)
       # Nothing to do if there are no targets
       return if target_names.nil? or target_names.length == 0
       if @@instance.nil?
-        FileUtils.mkdir_p("#{base_dir}/targets")
+        targets_path = "#{base_dir}/_targets"
+        FileUtils.mkdir_p(targets_path)
         bucket = Bucket.getClient()
         target_names.each do |target_name|
+          # Remove any prior extraction so re-running setup_targets (e.g. after
+          # reset_instance! during reingest) starts from a clean slate. Without
+          # this, Zip::File#extract fails on files left behind by a previous run.
+          FileUtils.rm_rf("#{targets_path}/#{target_name}")
+
           # Retrieve bucket/targets/target_name/<TARGET>_current.zip
-          zip_path = "#{base_dir}/targets/#{target_name}_current.zip"
+          zip_path = "#{targets_path}/#{target_name}_#{target_version}.zip"
           FileUtils.mkdir_p(File.dirname(zip_path))
-          bucket_key = "#{scope}/target_archives/#{target_name}/#{target_name}_current.zip"
+          bucket_key = "#{scope}/target_archives/#{target_name}/#{target_name}_#{target_version}.zip"
           Logger.info("Retrieving #{bucket_key} from targets bucket")
           bucket.get_object(bucket: ENV['OPENC3_CONFIG_BUCKET'], key: bucket_key, path: zip_path)
-          targets_path = "#{base_dir}/targets"
-          FileUtils.mkdir_p(targets_path)
           Zip::File.open(zip_path) do |zip_file|
             zip_file.each do |entry|
               zip_file.extract(entry.name, destination_directory: targets_path)
             end
           end
+          FileUtils.rm(zip_path) if File.exist?(zip_path)
 
           # Now add any modifications in targets_modified/TARGET/cmd_tlm
           # This adds support for remembering dynamically created packets
@@ -106,13 +113,24 @@ module OpenC3
           _, files = bucket.list_files(bucket: ENV['OPENC3_CONFIG_BUCKET'], path: bucket_path)
           files.each do |file|
             bucket_key = File.join(bucket_path, file['name'])
-            local_path = "#{base_dir}/targets/#{target_name}/cmd_tlm/#{file['name']}"
+            local_path = "#{targets_path}/#{target_name}/cmd_tlm/#{file['name']}"
             bucket.get_object(bucket: ENV['OPENC3_CONFIG_BUCKET'], key: bucket_key, path: local_path)
           end
         end
 
         # Build System from targets
-        System.instance(target_names, "#{base_dir}/targets")
+        System.instance(target_names, targets_path, descriptions: descriptions)
+      end
+    end
+
+    # Clears the System singleton so the next call to setup_targets or
+    # instance rebuilds it. Intended for admin flows (e.g. reingest) that
+    # need to load a specific target_version distinct from whatever is
+    # currently loaded. Callers must hold an external lock if they need to
+    # protect other threads from observing a nil @@instance briefly.
+    def self.reset_instance!
+      @@instance_mutex.synchronize do
+        @@instance = nil
       end
     end
 
@@ -120,14 +138,15 @@ module OpenC3
     #
     # @param target_names [Array of target_names]
     # @param target_config_dir Directory where target config folders are
+    # @param descriptions [Boolean] Whether to keep packet and item descriptions
     # @return [System] The System singleton
-    def self.instance(target_names = nil, target_config_dir = nil)
+    def self.instance(target_names = nil, target_config_dir = nil, descriptions: true)
       return @@instance if @@instance
       raise "System.instance parameters are required on first call" unless target_names and target_config_dir
 
       @@instance_mutex.synchronize do
         return @@instance if @@instance
-        @@instance ||= self.new(target_names, target_config_dir)
+        @@instance ||= self.new(target_names, target_config_dir, descriptions: descriptions)
         @@post_instance_callbacks.each do |callback|
           callback.call
         end
@@ -154,10 +173,11 @@ module OpenC3
     #
     # @param target_names [Array of target names]
     # @param target_config_dir Directory where target config folders are
-    def initialize(target_names, target_config_dir)
+    # @param descriptions [Boolean] Whether to keep packet and item descriptions
+    def initialize(target_names, target_config_dir, descriptions: true)
       OpenC3.add_to_search_path(target_config_dir, true) if target_config_dir
       @targets = {}
-      @packet_config = PacketConfig.new
+      @packet_config = PacketConfig.new(descriptions: descriptions)
       @commands = Commands.new(@packet_config)
       @telemetry = Telemetry.new(@packet_config)
       @limits = Limits.new(@packet_config)

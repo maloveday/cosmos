@@ -14,12 +14,13 @@ import json
 from openc3.models.cvt_model import CvtModel
 from openc3.topics.topic import Topic
 from openc3.utilities.json import JsonEncoder
+from openc3.utilities.store import Store
 from openc3.utilities.time import to_nsec_from_epoch
 
 
 class TelemetryDecomTopic(Topic):
     @classmethod
-    def write_packet(cls, packet, id=None, scope=None):
+    def write_packet(cls, packet, id=None, include_limits_states=True, scope=None):
         # OpenC3.in_span("write_packet") do
         # Need to build a JSON hash of the decommutated data
         # Support "downward typing"
@@ -28,23 +29,27 @@ class TelemetryDecomTopic(Topic):
         # If nothing - item does not exist - nil
         # __ as separators ITEM1, ITEM1__C, ITEM1__F
 
-        json_hash = CvtModel.build_json_from_packet(packet)
+        json_hash = CvtModel.build_json_from_packet(packet, include_limits_states=include_limits_states)
         # Serialize JSON once and reuse for both topic write and CVT set
         json_data = json.dumps(json_hash, cls=JsonEncoder)
         # Write to stream
         msg_hash = {
             "time": to_nsec_from_epoch(packet.packet_time),
             "received_time": to_nsec_from_epoch(packet.received_time),
-            "stored": str(packet.stored),
+            "stored": str(packet.stored).lower(),  # Match ruby behavior of "true"/"false"
             "target_name": packet.target_name,
             "packet_name": packet.packet_name,
             "received_count": packet.received_count,
             "json_data": json_data,
         }
+        if packet.extra:
+            msg_hash["extra"] = json.dumps(packet.extra, cls=JsonEncoder)
+        db_shard = Store.db_shard_for_target(packet.target_name, scope=scope)
         Topic.write_topic(
             f"{scope}__DECOM__{{{packet.target_name}}}__{packet.packet_name}",
             msg_hash,
             id,
+            db_shard=db_shard,
         )
 
         if not packet.stored:

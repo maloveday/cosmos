@@ -34,7 +34,7 @@ class Structure:
     ):
         if (default_endianness == "BIG_ENDIAN") or (default_endianness == "LITTLE_ENDIAN"):
             self.default_endianness = default_endianness
-            if buffer is not None and not isinstance(buffer, (bytes, bytearray)):
+            if buffer is not None and not isinstance(buffer, bytes | bytearray):
                 raise TypeError(f"wrong argument type {buffer.__class__.__name__} (expected bytes)")
             if buffer is None:
                 self._buffer = None
@@ -302,7 +302,7 @@ class Structure:
     def get_item(self, name):
         item = self.items.get(name.upper())
         if not item:
-            raise ValueError(f"Unknown item: {name}")
+            raise ValueError(f"Unknown item: {name} (get_item)")
         return item
 
     # self.param item [#name] Instance of StructureItem or one of its subclasses.
@@ -337,7 +337,7 @@ class Structure:
     def delete_item(self, name):
         item = self.items[name.upper()]
         if not item:
-            raise RuntimeError(f"Unknown item: {name}")
+            raise RuntimeError(f"Unknown item: {name} (delete_item)")
 
         # Find the item to delete in the sorted_items array
         item_index = None
@@ -447,7 +447,7 @@ class Structure:
                     string += f"{indent_string}{item.name}: {self.read_item(item, value_type, buffer)}\n"
                 else:
                     value = self.read_item(item, value_type, buffer)
-                    if isinstance(value, (str, bytes, bytearray)):
+                    if isinstance(value, str | bytes | bytearray):
                         string += f"{indent_string}{item.name}:\n"
                         string += formatted(value, 1, 16, " ", indent + 2)
                     else:
@@ -546,20 +546,34 @@ class Structure:
         if item.variable_bit_size:
             # Bit size is determined by length field
             length_value = self.read(item.variable_bit_size["length_item_name"], "CONVERTED")
-            if (item.data_type == "INT" or item.data_type == "UINT") and item.original_array_size is None:
-                match length_value:
-                    case 0:
-                        return 6
-                    case 1:
-                        return 14
-                    case 2:
-                        return 30
-                    case _:
-                        return 62
+            if length_value is not None:
+                if (item.data_type == "INT" or item.data_type == "UINT") and item.original_array_size is None:
+                    match length_value:
+                        case 0:
+                            return 6
+                        case 1:
+                            return 14
+                        case 2:
+                            return 30
+                        case _:
+                            return 62
+                else:
+                    total_bit_size = (
+                        length_value * item.variable_bit_size["length_bits_per_count"]
+                    ) + item.variable_bit_size["length_value_bit_offset"]
+                    available_bit_size = (len(self._buffer) * 8) - item.bit_offset
+                    if total_bit_size < 0 or (
+                        not self.short_buffer_allowed
+                        and (available_bit_size < 0 or total_bit_size > available_bit_size)
+                    ):
+                        raise ValueError(
+                            f"Variable bit size {total_bit_size} for item {item.name} exceeds the {max(available_bit_size, 0)} bits available in the buffer"
+                        )
+                    return total_bit_size
             else:
-                return (length_value * item.variable_bit_size["length_bits_per_count"]) + item.variable_bit_size[
-                    "length_value_bit_offset"
-                ]
+                raise RuntimeError(
+                    f"Length value {item.variable_bit_size['length_item_name']} for item {item.name} is None"
+                )
         elif item.original_bit_size <= 0:
             # Bit size is full packet length - bits before item + negative bits saved at end
             return (len(self._buffer) * 8) - item.bit_offset + item.original_bit_size
@@ -596,7 +610,7 @@ class Structure:
                         adjustment += new_bit_size - item.original_bit_size
 
     def internal_buffer_equals(self, buffer):
-        if not isinstance(buffer, (bytes, bytearray)):
+        if not isinstance(buffer, bytes | bytearray):
             raise TypeError(f"Buffer class is {buffer.__class__.__name__} but must be bytearray")
 
         self._buffer = bytearray(buffer[:])

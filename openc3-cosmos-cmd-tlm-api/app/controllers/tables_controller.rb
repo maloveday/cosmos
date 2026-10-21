@@ -16,6 +16,7 @@
 # if purchased from OpenC3, Inc.
 
 require 'base64'
+require 'openc3/utilities/config_overlay'
 
 class TablesController < ApplicationController
   def index
@@ -37,7 +38,7 @@ class TablesController < ApplicationController
       render json: results
     rescue Table::NotFound => e
       log_error(e)
-      render json: { status: 'error', message: e.message }, status: 404
+      render json: { status: 'error', message: e.message }, status: :not_found
     end
   end
 
@@ -50,7 +51,7 @@ class TablesController < ApplicationController
       render json: { filename: file.filename, contents: file.contents }
     rescue Table::NotFound => e
       log_error(e)
-      render json: { status: 'error', message: e.message }, status: 404
+      render json: { status: 'error', message: e.message }, status: :not_found
     end
   end
 
@@ -58,12 +59,16 @@ class TablesController < ApplicationController
     return unless authorization('system')
     scope, binary, definition, table_name = sanitize_params([:scope, :binary, :definition, :table_name], require_params: false, allow_forward_slash: true)
     return unless scope
+    save = to_bool(params[:save])
+    # report writes the csv next to the binary under the same TARGET/<area>
+    # prefix, so gating on the binary covers the write target.
+    return if save and !authorize_overlay_write(binary)
     begin
-      file = Table.report(scope, binary, definition, table_name)
+      file = Table.report(scope, binary, definition, table_name, save: save)
       render json: { filename: file.filename, contents: file.contents }
     rescue Table::NotFound => e
       log_error(e)
-      render json: { status: 'error', message: e.message }, status: 404
+      render json: { status: 'error', message: e.message }, status: :not_found
     end
   end
 
@@ -102,7 +107,7 @@ class TablesController < ApplicationController
       render json: Table.load(scope, binary, definition)
     rescue Table::NotFound => e
       log_error(e)
-      render json: { status: 'error', message: e.message }, status: 404
+      render json: { status: 'error', message: e.message }, status: :not_found
     end
   end
 
@@ -110,12 +115,13 @@ class TablesController < ApplicationController
     return unless authorization('system')
     scope, binary, definition = sanitize_params([:scope, :binary, :definition], require_params: false, allow_forward_slash: true)
     return unless scope
+    return unless authorize_overlay_write(binary)
     begin
       Table.save(scope, binary, definition, params[:tables])
       head :ok
     rescue Table::NotFound => e
       log_error(e)
-      render json: { status: 'error', message: e.message }, status: 404
+      render json: { status: 'error', message: e.message }, status: :not_found
     end
   end
 
@@ -123,12 +129,13 @@ class TablesController < ApplicationController
     return unless authorization('system')
     scope, name, new_name = sanitize_params([:scope, :name, :new_name], require_params: true, allow_forward_slash: true)
     return unless scope
+    return unless authorize_overlay_write(new_name)
     begin
       Table.save_as(scope, name, new_name)
       head :ok
     rescue Table::NotFound => e
       log_error(e)
-      render json: { status: 'error', message: e.message }, status: 404
+      render json: { status: 'error', message: e.message }, status: :not_found
     end
   end
 
@@ -136,12 +143,16 @@ class TablesController < ApplicationController
     return unless authorization('system')
     scope, definition = sanitize_params([:scope, :definition], require_params: false, allow_forward_slash: true)
     return unless scope
+    # No overlay gate: Table.generate only accepts definitions under
+    # TARGET/tables/config and always writes the binary to TARGET/tables/bin,
+    # which is not a code area. Gating on the definition path would make every
+    # generate admin-only now that tables/config is itself a code area.
     begin
       filename = Table.generate(scope, definition)
       render json: { filename: filename }
     rescue Table::NotFound => e
       log_error(e)
-      render json: { status: 'error', message: e.message }, status: 404
+      render json: { status: 'error', message: e.message }, status: :not_found
     end
   end
 
@@ -150,7 +161,7 @@ class TablesController < ApplicationController
     scope, name = sanitize_params([:scope, :name], require_params: true, allow_forward_slash: true)
     return unless scope
     Table.lock(scope, name, username())
-    render status: 200
+    render status: :ok
   end
 
   def unlock
@@ -159,13 +170,14 @@ class TablesController < ApplicationController
     return unless scope
     locked_by = Table.locked?(scope, name)
     Table.unlock(scope, name) if username() == locked_by
-    render status: 200
+    render status: :ok
   end
 
   def destroy
     return unless authorization('system')
     scope, name = sanitize_params([:scope, :name], require_params: true, allow_forward_slash: true)
     return unless scope
+    return unless authorize_overlay_write(name)
     # destroy returns no indication of success or failure so just assume it worked
     Table.destroy(scope, name)
     OpenC3::Logger.info(
@@ -174,5 +186,40 @@ class TablesController < ApplicationController
       user: username()
     )
     head :ok
+  end
+
+  private
+
+  # Single choke point gating every Table writer whose target the caller picks
+  # (save, save_as, report save, destroy) that funnels through
+  # TargetFile.create/destroy into the targets_modified overlay. The code areas
+  # (targets_modified/<TARGET>/cmd_tlm/... and <TARGET>/tables/config/...) hold
+  # definitions whose GENERIC_*_CONVERSION blocks are evaluated as code, so
+  # writing them requires admin even though general Table Manager operations
+  # only require 'system' (which under Enterprise RBAC every role down to Viewer
+  # holds). This mirrors storage_controller#non_admin_config_overlay_write?,
+  # which gates the other writer (the presigned S3 upload). `name` is the
+  # overlay-relative path written under targets_modified/ (e.g.
+  # "<TARGET>/tables/config/..."). Returns true if allowed; otherwise renders
+  # the 401/403 and returns false.
+  def authorize_overlay_write(name)
+    return true unless code_overlay?(name)
+    return false unless authorization('admin')
+    true
+  end
+
+  # True if the overlay-relative name targets a code area. Canonical-name
+  # handling lives in OpenC3::ConfigOverlay so every overlay writer fails closed
+  # on the same inputs.
+  def code_overlay?(name)
+    OpenC3::ConfigOverlay.code_overlay?(name)
+  end
+
+  # Params arrive as strings from JSON and as strings from multipart forms, so
+  # 'false' and '0' must not read as true.
+  def to_bool(value)
+    return false if value.nil?
+    return value if value == true or value == false
+    !['false', '0', ''].include?(value.to_s.strip.downcase)
   end
 end

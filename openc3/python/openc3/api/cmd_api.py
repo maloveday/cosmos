@@ -33,6 +33,7 @@ from openc3.topics.topic import Topic
 from openc3.utilities.authorization import authorize
 from openc3.utilities.cmd_log import _build_cmd_output_string
 from openc3.utilities.extract import extract_fields_from_cmd_text
+from openc3.utilities.store import Store
 
 
 WHITELIST.extend(
@@ -261,7 +262,8 @@ def get_cmd_buffer(*args, scope=OPENC3_SCOPE, manual=False):
     )
     TargetModel.packet(target_name, command_name, type="CMD", scope=scope)
     topic = f"{scope}__COMMAND__{{{target_name}}}__{command_name}"
-    msg_id, message = Topic.get_newest_message(topic)
+    db_shard = Store.db_shard_for_target(target_name, scope=scope)
+    msg_id, message = Topic.get_newest_message(topic, db_shard=db_shard)
     if msg_id:
         # Decode the keys for user convenience
         return {k.decode(): v for (k, v) in message.items()}
@@ -607,6 +609,7 @@ def _cmd_implementation(
         scope=scope,
         manual=manual,
     )
+    queue_username = kwargs.get("queue_username")
     if not user:
         user = {}
         user["username"] = os.environ.get("OPENC3_MICROSERVICE_NAME")
@@ -686,6 +689,11 @@ def _cmd_implementation(
         "log_message": str(log_message),
         "obfuscated_items": json.dumps(packet.get("obfuscated_items", [])),
     }
+    # Record the original queuing user (author) separately from 'username' (the
+    # user or process that actually executed the command). Command History shows
+    # 'username' as "Executed By" and queue_username as "Queued By".
+    if queue_username:
+        command["queue_username"] = queue_username
 
     # Users have to explicitly opt into a default queue by setting the OPENC3_DEFAULT_QUEUE
     # At which point ALL commands will go to that queue unless they specifically opt out with queue=False

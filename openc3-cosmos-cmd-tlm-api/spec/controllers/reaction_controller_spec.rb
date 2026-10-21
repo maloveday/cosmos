@@ -28,6 +28,16 @@ RSpec.describe ReactionController, type: :controller do
     model.create
     model = OpenC3::TriggerGroupModel.new(name: "TEST", scope: "TEST")
     model.create
+    setup_system()
+    # Seed INST into both scopes so item operands reference telemetry that actually
+    # exists. TriggerModel validates items against the trigger's own scope, and the
+    # "two reactions on different scopes" spec builds a trigger in TEST as well.
+    dir = File.join(__dir__, "..", "..", "..", "openc3", "spec", "install", "config", "targets")
+    ["DEFAULT", "TEST"].each do |scope|
+      target = OpenC3::TargetModel.new(folder_name: "INST", name: "INST", scope: scope)
+      target.create
+      target.update_store(OpenC3::System.new(["INST"], dir))
+    end
   end
 
   def generate_trigger(
@@ -99,6 +109,122 @@ RSpec.describe ReactionController, type: :controller do
     end
   end
 
+  describe "POST create preserves action fields" do
+    it "preserves the severity value on a notify action" do
+      generate_trigger
+      hash = generate_reaction_hash(
+        actions: [{"type" => "notify", "value" => "Something happened", "severity" => "WARN"}]
+      )
+      post :create, params: hash.merge({"scope" => "DEFAULT"})
+      expect(response).to have_http_status(:created)
+      created = JSON.parse(response.body, allow_nan: true, create_additions: true)
+      expect(created["actions"].length).to eql(1)
+      expect(created["actions"][0]["type"]).to eql("notify")
+      expect(created["actions"][0]["value"]).to eql("Something happened")
+      expect(created["actions"][0]["severity"]).to eql("WARN")
+
+      get :show, params: {scope: "DEFAULT", name: created["name"]}
+      expect(response).to have_http_status(:ok)
+      shown = JSON.parse(response.body, allow_nan: true, create_additions: true)
+      expect(shown["actions"][0]["severity"]).to eql("WARN")
+    end
+
+    it "preserves multiple action fields across action types" do
+      generate_trigger
+      hash = generate_reaction_hash(
+        actions: [
+          {"type" => "command", "value" => "INST ABORT"},
+          {"type" => "notify", "value" => "Alert", "severity" => "FATAL"},
+        ]
+      )
+      post :create, params: hash.merge({"scope" => "DEFAULT"})
+      expect(response).to have_http_status(:created)
+      created = JSON.parse(response.body, allow_nan: true, create_additions: true)
+      expect(created["actions"].length).to eql(2)
+      expect(created["actions"][0]["type"]).to eql("command")
+      expect(created["actions"][0]["value"]).to eql("INST ABORT")
+      expect(created["actions"][1]["type"]).to eql("notify")
+      expect(created["actions"][1]["value"]).to eql("Alert")
+      expect(created["actions"][1]["severity"]).to eql("FATAL")
+    end
+
+    it "preserves the environment on a script action" do
+      generate_trigger
+      hash = generate_reaction_hash(
+        actions: [{"type" => "script", "value" => "INST/procedures/checks.rb",
+                   "environment" => [{"key" => "USER", "value" => "JASON"}]}]
+      )
+      post :create, params: hash.merge({"scope" => "DEFAULT"})
+      expect(response).to have_http_status(:created)
+      created = JSON.parse(response.body, allow_nan: true, create_additions: true)
+      expect(created["actions"][0]["environment"]).to eql([{"key" => "USER", "value" => "JASON"}])
+
+      get :show, params: {scope: "DEFAULT", name: created["name"]}
+      expect(response).to have_http_status(:ok)
+      shown = JSON.parse(response.body, allow_nan: true, create_additions: true)
+      expect(shown["actions"][0]["environment"]).to eql([{"key" => "USER", "value" => "JASON"}])
+    end
+
+    it "preserves the alert flag on a notify action" do
+      generate_trigger
+      hash = generate_reaction_hash(
+        actions: [{"type" => "notify", "value" => "Popup", "severity" => "INFO", "alert" => true}]
+      )
+      post :create, params: hash.merge({"scope" => "DEFAULT"})
+      expect(response).to have_http_status(:created)
+      created = JSON.parse(response.body, allow_nan: true, create_additions: true)
+      # Controller specs stringify params so just verify the field survives permit
+      expect(created["actions"][0]["alert"].to_s).to eql("true")
+    end
+  end
+
+  describe "PUT update preserves action fields" do
+    it "preserves the severity value on a notify action" do
+      generate_trigger
+      hash = generate_reaction_hash
+      post :create, params: hash.merge({"scope" => "DEFAULT"})
+      expect(response).to have_http_status(:created)
+      created = JSON.parse(response.body, allow_nan: true, create_additions: true)
+      reaction_name = created["name"]
+
+      put :update, params: {
+        scope: "DEFAULT",
+        name: reaction_name,
+        snooze: 300,
+        triggers: [{"name" => "TRIG1", "group" => GROUP}],
+        trigger_level: "EDGE",
+        actions: [{"type" => "notify", "value" => "Updated alert", "severity" => "ERROR"}],
+      }
+      expect(response).to have_http_status(:ok)
+      updated = JSON.parse(response.body, allow_nan: true, create_additions: true)
+      expect(updated["actions"].length).to eql(1)
+      expect(updated["actions"][0]["type"]).to eql("notify")
+      expect(updated["actions"][0]["value"]).to eql("Updated alert")
+      expect(updated["actions"][0]["severity"]).to eql("ERROR")
+    end
+
+    it "preserves the environment on a script action" do
+      generate_trigger
+      hash = generate_reaction_hash
+      post :create, params: hash.merge({"scope" => "DEFAULT"})
+      expect(response).to have_http_status(:created)
+      created = JSON.parse(response.body, allow_nan: true, create_additions: true)
+
+      put :update, params: {
+        scope: "DEFAULT",
+        name: created["name"],
+        snooze: 300,
+        triggers: [{"name" => "TRIG1", "group" => GROUP}],
+        trigger_level: "EDGE",
+        actions: [{"type" => "script", "value" => "INST/procedures/checks.rb",
+                   "environment" => [{"key" => "MODE", "value" => "TEST"}]}],
+      }
+      expect(response).to have_http_status(:ok)
+      updated = JSON.parse(response.body, allow_nan: true, create_additions: true)
+      expect(updated["actions"][0]["environment"]).to eql([{"key" => "MODE", "value" => "TEST"}])
+    end
+  end
+
   describe "Error handling for GET index" do
     before(:each) do
       allow(controller).to receive(:log_error)
@@ -114,7 +240,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["message"]).to eql("Database error")
       expect(json["type"]).to include("StandardError")
       expect(json).to have_key("backtrace")
-      expect(response).to have_http_status(500)
+      expect(response).to have_http_status(:internal_server_error)
     end
   end
 
@@ -132,7 +258,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["status"]).to eql("error")
       expect(json["message"]).to eql("Reaction not found")
       expect(json["type"]).to include("ReactionInputError")
-      expect(response).to have_http_status(404)
+      expect(response).to have_http_status(:not_found)
     end
 
     it "returns a 400 status code for ReactionError" do
@@ -144,7 +270,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["status"]).to eql("error")
       expect(json["message"]).to eql("Bad reaction format")
       expect(json["type"]).to include("ReactionError")
-      expect(response).to have_http_status(400)
+      expect(response).to have_http_status(:bad_request)
     end
 
     it "returns a 500 status code for StandardError" do
@@ -157,7 +283,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["message"]).to eql("Unexpected error")
       expect(json["type"]).to include("StandardError")
       expect(json).to have_key("backtrace")
-      expect(response).to have_http_status(500)
+      expect(response).to have_http_status(:internal_server_error)
     end
   end
 
@@ -197,7 +323,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["status"]).to eql("error")
       expect(json["message"]).not_to be_nil
       expect(json["type"]).to include("ReactionInputError")
-      expect(response).to have_http_status(400)
+      expect(response).to have_http_status(:bad_request)
     end
 
     it "returns a 418 status code for ReactionError" do
@@ -209,7 +335,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["status"]).to eql("error")
       expect(json["message"]).to eql("Test reaction error")
       expect(json["type"]).to include("ReactionError")
-      expect(response).to have_http_status(418)
+      expect(response).to have_http_status(:unprocessable_entity)
     end
 
     it "returns a 500 status code for StandardError" do
@@ -222,7 +348,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["message"]).to eql("Test standard error")
       expect(json["type"]).to include("StandardError")
       expect(json).to have_key("backtrace")
-      expect(response).to have_http_status(500)
+      expect(response).to have_http_status(:internal_server_error)
     end
   end
 
@@ -244,7 +370,7 @@ RSpec.describe ReactionController, type: :controller do
       json = JSON.parse(response.body, allow_nan: true, create_additions: true)
       expect(json["status"]).to eql("error")
       expect(json["message"]).to eql("not found")
-      expect(response).to have_http_status(404)
+      expect(response).to have_http_status(:not_found)
     end
 
     it "returns a 400 status code for ReactionInputError" do
@@ -276,7 +402,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["status"]).to eql("error")
       expect(json["message"]).to eql("Invalid trigger format")
       expect(json["type"]).to include("ReactionInputError")
-      expect(response).to have_http_status(400)
+      expect(response).to have_http_status(:bad_request)
     end
 
     it "returns a 418 status code for ReactionError" do
@@ -311,7 +437,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["status"]).to eql("error")
       expect(json["message"]).to eql("Failed to notify")
       expect(json["type"]).to include("ReactionError")
-      expect(response).to have_http_status(418)
+      expect(response).to have_http_status(:unprocessable_entity)
     end
 
     it "returns a 500 status code for StandardError" do
@@ -339,7 +465,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["message"]).to eql("Database failure")
       expect(json["type"]).to include("StandardError")
       expect(json).to have_key("backtrace")
-      expect(response).to have_http_status(500)
+      expect(response).to have_http_status(:internal_server_error)
     end
   end
 
@@ -354,7 +480,7 @@ RSpec.describe ReactionController, type: :controller do
       json = JSON.parse(response.body, allow_nan: true, create_additions: true)
       expect(json["status"]).to eql("error")
       expect(json["message"]).to eql("not found")
-      expect(response).to have_http_status(404)
+      expect(response).to have_http_status(:not_found)
     end
 
     it "returns a 500 status code for StandardError" do
@@ -378,7 +504,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["message"]).to eql("Notification failed")
       expect(json["type"]).to include("StandardError")
       expect(json).to have_key("backtrace")
-      expect(response).to have_http_status(500)
+      expect(response).to have_http_status(:internal_server_error)
     end
   end
 
@@ -393,7 +519,7 @@ RSpec.describe ReactionController, type: :controller do
       json = JSON.parse(response.body, allow_nan: true, create_additions: true)
       expect(json["status"]).to eql("error")
       expect(json["message"]).to eql("not found")
-      expect(response).to have_http_status(404)
+      expect(response).to have_http_status(:not_found)
     end
 
     it "returns a 500 status code for StandardError" do
@@ -417,7 +543,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["message"]).to eql("Notification failed")
       expect(json["type"]).to include("StandardError")
       expect(json).to have_key("backtrace")
-      expect(response).to have_http_status(500)
+      expect(response).to have_http_status(:internal_server_error)
     end
   end
 
@@ -432,7 +558,7 @@ RSpec.describe ReactionController, type: :controller do
       json = JSON.parse(response.body, allow_nan: true, create_additions: true)
       expect(json["status"]).to eql("error")
       expect(json["message"]).to eql("not found")
-      expect(response).to have_http_status(404)
+      expect(response).to have_http_status(:not_found)
     end
 
     it "returns a 500 status code for StandardError" do
@@ -456,7 +582,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["message"]).to eql("Execution failed")
       expect(json["type"]).to include("StandardError")
       expect(json).to have_key("backtrace")
-      expect(response).to have_http_status(500)
+      expect(response).to have_http_status(:internal_server_error)
     end
   end
 
@@ -483,7 +609,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["status"]).to eql("error")
       expect(json["message"]).to eql("Invalid reaction name")
       expect(json["type"]).to include("ReactionInputError")
-      expect(response).to have_http_status(404)
+      expect(response).to have_http_status(:not_found)
     end
 
     it "returns a 400 status code for ReactionError" do
@@ -495,7 +621,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["status"]).to eql("error")
       expect(json["message"]).to eql("Cannot delete active reaction")
       expect(json["type"]).to include("ReactionError")
-      expect(response).to have_http_status(400)
+      expect(response).to have_http_status(:bad_request)
     end
 
     it "returns a 500 status code for StandardError" do
@@ -508,7 +634,7 @@ RSpec.describe ReactionController, type: :controller do
       expect(json["message"]).to eql("Database failure")
       expect(json["type"]).to include("StandardError")
       expect(json).to have_key("backtrace")
-      expect(response).to have_http_status(500)
+      expect(response).to have_http_status(:internal_server_error)
     end
 
     it "returns a json hash of name and status code 200 if found" do

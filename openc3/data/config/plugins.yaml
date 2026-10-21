@@ -38,6 +38,7 @@ VARIABLE_STATE:
     VARIABLE log_retain_time 172800
     VARIABLE_STATE "24 hours" 86400
     VARIABLE_STATE "48 hours" 172800
+    VARIABLE_STATE 60 # Both description and value are set to 60
   parameters:
     - name: State Description
       required: false
@@ -78,7 +79,7 @@ INTERFACE:
         documentation for more details.
 ROUTER:
   modifiers:
-    <%= MetaConfigParser.load('interface_modifiers.yaml').to_meta_config_yaml(4) %>
+    <%= MetaConfigParser.load('interface_modifiers.yaml').reject { |keyword, _| keyword.start_with?('BRIDGE') }.to_meta_config_yaml(4) %>
   summary: Create router to receive commands and output telemetry packets from one or more interfaces
   description: Creates an router which receives command packets from
     their remote clients and sends them to associated interfaces. They receive telemetry

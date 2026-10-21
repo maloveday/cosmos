@@ -6,7 +6,7 @@ sidebar_custom_props:
   myEmoji: 📡
 ---
 
-<!-- Be sure to edit _telemetry.md because telemetry.md is a generated file -->
+{/* Be sure to edit _telemetry.md because telemetry.md is a generated file */}
 
 ## Telemetry Concepts
 
@@ -20,14 +20,14 @@ Telemetry definition files define the telemetry packets that can be received and
 
 When defining telemetry items you can choose from the following data types: INT, UINT, FLOAT, STRING, BLOCK. These correspond to integers, unsigned integers, floating point numbers, strings and binary blocks of data. Within COSMOS, the only difference between a STRING and BLOCK is when COSMOS reads a STRING type it stops reading when it encounters a null byte (0). This shows up when displaying the value in Packet Viewer or Tlm Viewer and in the output of Data Extractor. You should strive to store non-ASCII data inside BLOCK items and ASCII strings in STRING items. Additional data types of BOOL, ARRAY, OBJECT, and ANY are also available if you are using an Accessor that supports them. These are Booleans (true/false), arrays of unknown data type, objects with unknown contents, and a completely unknown data type with ANY.
 
-:::info Printing Data
+:::info[Printing Data]
 
 Most data types can be printed in a COSMOS script simply by doing <code>print(tlm("TGT PKT ITEM"))</code>. However, if the ITEM is a BLOCK data type and contains binary (non-ASCII) data then that won't work. COSMOS comes with a built-in method called <code>formatted</code> to help you view binary data. If ITEM is a BLOCK type containing binary try <code>puts tlm("TGT PKT ITEM").formatted</code> (Ruby) and <code>print(formatted(tlm("TGT PKT ITEM")))</code> (Python) which will print the bytes out as hex.
 :::
 
 ### Naming Convention
 
-Telemetry Packets and Items can be named however you want with very few exceptions. The following is not allowed in Packet or Item names: `__` (double underscore), `[[` or `]]` (double brackets), whitespace, and ending a name with underscore. While not much else is _explicitly_ restricted we've found the following guidelines to be helpful.
+Telemetry Packets and Items can be named however you want with very few exceptions. The following is not allowed in Packet or Item names: `__` (double underscore), `[[` or `]]` (double brackets), whitespace, and ending a name with underscore. Item names are also limited to a maximum of 127 characters because they are used as column headers when telemetry data is stored in the time series database (QuestDB). Note that all target, packet, item, and state names are automatically converted to uppercase (COSMOS is not case sensitive), so mixed case cannot be used to visually separate words. Use underscores or dashes instead, e.g. `LOW_POWER_MODE` rather than `LowPowerMode` which becomes the harder to read `LOWPOWERMODE`. While not much else is _explicitly_ restricted we've found the following guidelines to be helpful. Note that renaming or changing the type of an existing item affects the historical data already stored for it, see [Packet Structure Changes](/docs/guides/packet-structure-changes).
 
 - Use underscores
 
@@ -53,13 +53,13 @@ COSMOS specifies a variable sized item with a bit size of 0. When a packet is id
 
 COSMOS has a concept of a derived item which is a telemetry item that doesn't actually exist in the binary data. Derived items are typically computed based on other telemetry items. COSMOS derived items are very similar to real items except they use the special DERIVED data type. Here is how a derived item might look in a telemetry definition.
 
-```ruby
+```cosmos
 ITEM TEMP_AVERAGE 0 0 DERIVED "Average of TEMP1, TEMP2, TEMP3, TEMP4"
 ```
 
 Note the bit offset and bit size of 0 and the data type of DERIVED. For this reason DERIVED items should be declared using ITEM rather than APPEND_ITEM. They can be defined anywhere in the packet definition but are typically placed at the end. The ITEM definition must be followed by a CONVERSION keyword, e.g. [READ_CONVERSION](telemetry#read_conversion), to generate the value.
 
-:::info Derived Item Ordering
+:::info[Derived Item Ordering]
 When telemetry packets are serialized for API responses (e.g., when generating screens or listing items), derived items are always returned last regardless of where they are defined in the telemetry definition file.
 :::
 
@@ -77,6 +77,7 @@ The \_TIMEFORMATTED items returns the date and time in a YYYY/MM/DD HH:MM:SS.sss
 
 COSMOS provides a Unix time conversion class which returns a Ruby Time object or Python date object based on the number of seconds and (optionally) microseconds since the Unix epoch. Note: This returns a native object and not a float or string!
 
+{/* prettier-ignore */}
 <Tabs groupId="script-language">
 <TabItem value="python" label="Python">
 ```python
@@ -85,7 +86,7 @@ ITEM PACKET_TIME 0 0 DERIVED "Python time based on TIMESEC and TIMEUS"
 ```
 </TabItem>
 <TabItem value="ruby" label="Ruby">
-```ruby
+```cosmos
 ITEM PACKET_TIME 0 0 DERIVED "Ruby time based on TIMESEC and TIMEUS"
     READ_CONVERSION unix_time_conversion.rb TIMESEC TIMEUS
 ```
@@ -94,7 +95,7 @@ ITEM PACKET_TIME 0 0 DERIVED "Ruby time based on TIMESEC and TIMEUS"
 
 Defining PACKET_TIME allows the PACKET_TIMESECONDS and PACKET_TIMEFORMATTED to be calculated against an internal Packet time rather than the time COSMOS receives the packet.
 
-<div style={{"clear": 'both'}}></div>
+<div style={{ clear: "both" }}></div>
 
 # Telemetry Keywords
 
@@ -104,8 +105,7 @@ COSMOS_META
 
 **Example File: TARGET/cmd_tlm/tlm.txt**
 
-<!-- prettier-ignore -->
-```ruby
+```cosmos
 TELEMETRY TARGET HS BIG_ENDIAN "Health and Status for My Target"
   ITEM CCSDSVER 0 3 UINT "CCSDS PACKET VERSION NUMBER (SEE CCSDS 133.0-B-1)"
   ITEM CCSDSTYPE 3 1 UINT "CCSDS PACKET TYPE (COMMAND OR TELEMETRY)"
@@ -131,12 +131,14 @@ TELEMETRY TARGET HS BIG_ENDIAN "Health and Status for My Target"
     STATE NORMAL 0 GREEN
     STATE DIAG 1 YELLOW
   ITEM TIMESECONDS 0 0 DERIVED "DERIVED TIME SINCE EPOCH IN SECONDS"
-    GENERIC_READ_CONVERSION_START FLOAT 32
+    GENERIC_READ_CONVERSION_START
       ((packet.read('ccsdsday') * 86400.0) + (packet.read('ccsdsmsod') / 1000.0) + (packet.read('ccsdsusoms') / 1000000.0)  )
     GENERIC_READ_CONVERSION_END
+    CONVERTED_DATA 32 FLOAT
   ITEM TIMEFORMATTED 0 0 DERIVED "DERIVED TIME SINCE EPOCH AS A FORMATTED STRING"
-    GENERIC_READ_CONVERSION_START STRING 216
+    GENERIC_READ_CONVERSION_START
       time = Time.ccsds2mdy(packet.read('ccsdsday'), packet.read('ccsdsmsod'), packet.read('ccsdsusoms'))
       sprintf('%04u/%02u/%02u %02u:%02u:%02u.%06u', time[0], time[1], time[2], time[3], time[4], time[5], time[6])
     GENERIC_READ_CONVERSION_END
+    CONVERTED_DATA 216 STRING
 ```

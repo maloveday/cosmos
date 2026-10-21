@@ -8,7 +8,7 @@
 # See LICENSE.md for more details.
 
 # Modified by OpenC3, Inc.
-# All changes Copyright 2025, OpenC3, Inc.
+# All changes Copyright 2026, OpenC3, Inc.
 # All Rights Reserved
 #
 # This file may also be used under the terms of a commercial license
@@ -31,9 +31,9 @@
           <v-card-title>
             <v-row dense>
               <v-spacer />
-              <v-btn class="mr-3" color="primary" @click="getRunningScripts"
-                >Refresh</v-btn
-              >
+              <v-btn class="mr-3" color="primary" @click="getRunningScripts">
+                Refresh
+              </v-btn>
               <v-text-field
                 v-model="runningSearch"
                 class="pt-0 search"
@@ -55,7 +55,7 @@
             :items="runningScripts"
             :items-length="runningTotal"
             :loading="runningLoading"
-            :search="runningSearch"
+            disable-sort
             density="compact"
             data-test="running-scripts"
             :items-per-page="runningItemsPerPage"
@@ -70,14 +70,24 @@
                 color="primary"
                 density="comfortable"
                 @click="showScript(item)"
-                >{{ item.name }}</v-btn
               >
+                {{ item.name }}
+              </v-btn>
             </template>
             <template #item.connect="{ item }">
               <v-btn color="primary" @click="connectScript(item)">
                 <span>Connect</span>
                 <v-icon v-show="connectInNewTab" end> mdi-open-in-new </v-icon>
               </v-btn>
+            </template>
+            <template #item.user_full_name="{ item }">
+              {{ formatUserDisplay(item) }}
+            </template>
+            <template #item.start_time="{ item }">
+              {{ formatStartTime(item) }}
+            </template>
+            <template #item.duration="{ item }">
+              {{ formatDuration(item) }}
             </template>
             <template #item.stop="{ item }">
               <v-btn color="primary" @click="deleteScript(item)">
@@ -93,9 +103,9 @@
           <v-card-title>
             <v-row dense>
               <v-spacer />
-              <v-btn class="mr-3" color="primary" @click="getCompletedScripts"
-                >Refresh</v-btn
-              >
+              <v-btn class="mr-3" color="primary" @click="getCompletedScripts">
+                Refresh
+              </v-btn>
               <v-text-field
                 v-model="completedSearch"
                 class="pt-0 search"
@@ -116,7 +126,7 @@
             :items="completedScripts"
             :items-length="completedTotal"
             :loading="completedLoading"
-            :search="completedSearch"
+            disable-sort
             density="compact"
             data-test="completed-scripts"
             :items-per-page="completedItemsPerPage"
@@ -131,21 +141,32 @@
                 color="primary"
                 density="comfortable"
                 @click="showScript(item)"
-                >{{ item.name }}</v-btn
               >
+                {{ item.name }}
+              </v-btn>
+            </template>
+            <template #item.user_full_name="{ item }">
+              {{ formatUserDisplay(item) }}
+            </template>
+            <template #item.start_time="{ item }">
+              {{ formatStartTime(item) }}
+            </template>
+            <template #item.duration="{ item }">
+              {{ formatDuration(item) }}
             </template>
             <template #item.log="{ item }">
               <v-btn
                 color="primary"
                 density="comfortable"
                 icon="mdi-eye"
+                :disabled="!item.log"
                 @click="viewScriptLog(item, 'log')"
               />
               <v-btn
                 color="primary"
                 density="comfortable"
                 icon="mdi-file-download-outline"
-                :disabled="downloadScript"
+                :disabled="downloadScript || !item.log"
                 :loading="downloadScript && downloadScript.name === item.name"
                 @click="downloadScriptLog(item, 'log')"
               />
@@ -162,7 +183,7 @@
                   @click="viewScriptLog(item, 'report')"
                 />
                 <v-menu>
-                  <template #activator="{ props }">
+                  <template #activator="{ props: activatorProps }">
                     <v-btn
                       color="primary"
                       density="comfortable"
@@ -171,7 +192,7 @@
                       :loading="
                         downloadScript && downloadScript.name === item.name
                       "
-                      v-bind="props"
+                      v-bind="activatorProps"
                     />
                   </template>
                   <v-list>
@@ -206,396 +227,377 @@
   </div>
 </template>
 
-<script>
+<script setup>
+import { ref, watch, onMounted, onBeforeUnmount, inject } from 'vue'
+import { debounce } from 'lodash'
+import { useRouter } from 'vue-router'
 import { Api, OpenC3Api } from '@openc3/js-common/services'
 import { OutputDialog } from '@/components'
 import { TimeFilters } from '@/util'
 
-export default {
-  components: { OutputDialog },
-  mixins: [TimeFilters],
-  props: {
-    tabId: {
-      type: Number,
-      default: null,
-    },
-    curTab: {
-      type: Number,
-      default: null,
-    },
-    connectInNewTab: Boolean,
+const props = defineProps({
+  tabId: {
+    type: Number,
+    default: null,
   },
-  emits: ['disconnect', 'close'],
-  data() {
-    return {
-      api: null,
-      timeZone: 'local',
-      activeTab: 'completed',
-      downloadScript: null,
-      refreshTimer: null,
-      // Running scripts pagination data
-      runningSearch: '',
-      runningScripts: [],
-      runningTotal: 0,
-      runningLoading: false,
-      runningPage: 1,
-      runningItemsPerPage: 10,
-      runningHeaders: [
-        {
-          title: 'Connect',
-          key: 'connect',
-          sortable: false,
-          filterable: false,
-        },
-        { title: 'Id', key: 'name' },
-        { title: 'User', key: 'user_display' },
-        { title: 'Filename', key: 'filename' },
-        { title: 'Start Time', key: 'start_time_formatted' },
-        { title: 'Duration', key: 'duration' },
-        { title: 'State', key: 'state' },
-        {
-          title: 'Stop',
-          key: 'stop',
-          sortable: false,
-          filterable: false,
-        },
-      ],
-      // Completed scripts pagination data
-      completedSearch: '',
-      completedScripts: [],
-      completedTotal: 0,
-      completedLoading: false,
-      completedPage: 1,
-      completedItemsPerPage: 10,
-      completedHeaders: [
-        { title: 'Id', key: 'name' },
-        { title: 'User', key: 'user_display' },
-        { title: 'Filename', key: 'filename' },
-        { title: 'Start Time', key: 'start_time_formatted' },
-        { title: 'Duration', key: 'duration' },
-        { title: 'State', key: 'state' },
-        {
-          title: 'Log',
-          key: 'log',
-          sortable: false,
-          filterable: false,
-        },
-        {
-          title: 'Report',
-          key: 'report',
-          sortable: false,
-          filterable: false,
-        },
-      ],
-      showDialog: false,
-      dialogName: '',
-      dialogContent: '',
-      dialogFilename: '',
-    }
+  curTab: {
+    type: Number,
+    default: null,
   },
-  watch: {
-    activeTab(newTab) {
-      if (newTab === 'running') {
-        this.getRunningScripts()
-      } else if (newTab === 'completed') {
-        this.getCompletedScripts()
-      }
-    },
-  },
-  created() {
-    this.api = new OpenC3Api()
-    this.api
-      .get_setting('time_zone')
-      .then((response) => {
-        if (response) {
-          this.timeZone = response
-        }
-      })
-      .catch((error) => {
-        // Do nothing
-      })
+  connectInNewTab: Boolean,
+})
 
-    this.getRunningScripts()
-    this.getCompletedScripts()
+const emit = defineEmits(['disconnect', 'close'])
 
-    // Start a timer to refresh the running scripts list every 5 seconds
-    this.refreshTimer = setInterval(() => {
-      if (this.activeTab === 'running') {
-        this.getRunningScripts()
-      }
-    }, 5000)
-  },
-  beforeUnmount() {
-    // Clear the timer when component is unmounted
-    if (this.refreshTimer) {
-      clearInterval(this.refreshTimer)
-    }
-  },
-  methods: {
-    getRunningScripts: function () {
-      this.runningLoading = true
-      const offset = (this.runningPage - 1) * this.runningItemsPerPage
-      Api.get(
-        `/script-api/running-script?scope=DEFAULT&offset=${offset}&limit=${this.runningItemsPerPage}`,
+const router = useRouter()
+const notify = inject('notify')
+const dialog = inject('dialog')
+const { formatDateTimeHMS } = TimeFilters.methods
+
+const api = new OpenC3Api()
+const timeZone = ref('local')
+const activeTab = ref('completed')
+const downloadScript = ref(null)
+const refreshTimer = ref(null)
+
+// Running and completed scripts share identical pagination/search/fetch
+// behavior, differing only by endpoint and error message, so both are backed
+// by the same factory.
+function useScriptTable(endpoint, errorTitle) {
+  const search = ref('')
+  const scripts = ref([])
+  const total = ref(0)
+  const loading = ref(false)
+  const page = ref(1)
+  const itemsPerPage = ref(10)
+
+  async function fetchScripts() {
+    loading.value = true
+    const offset = (page.value - 1) * itemsPerPage.value
+    const searchParam = encodeURIComponent(search.value || '')
+    try {
+      const { data } = await Api.get(
+        `${endpoint}?scope=DEFAULT&offset=${offset}&limit=${itemsPerPage.value}&search=${searchParam}`,
       )
-        .then((response) => {
-          const scripts = response.data.items || []
-          const currentTime = new Date()
+      scripts.value = data.items || []
+      total.value = data.total || scripts.value.length
+    } catch (error) {
+      console.error(error)
+      notify.caution({ title: errorTitle, body: error.message })
+    } finally {
+      loading.value = false
+    }
+  }
 
-          // Calculate duration for each running script and format user info
-          scripts.forEach((script) => {
-            // Format user display as "full_name (username)"
-            script.user_display = `${script.user_full_name} (${script.username})`
+  async function setPage(newPage) {
+    page.value = newPage
+    await fetchScripts()
+  }
 
-            // Calculate duration
-            if (script.start_time) {
-              const startTime = new Date(script.start_time)
-              const durationMs = currentTime - startTime
-              script.start_time_formatted = this.formatDateTimeHMS(
-                startTime,
-                this.timeZone,
-              )
-              // Format duration
-              if (durationMs < 0) {
-                script.duration = 'N/A'
-              } else if (durationMs < 1000) {
-                script.duration = '< 1s'
-              } else if (durationMs < 60000) {
-                script.duration = `${Math.round(durationMs / 1000)}s`
-              } else if (durationMs < 3600000) {
-                const minutes = Math.floor(durationMs / 60000)
-                const seconds = Math.round((durationMs % 60000) / 1000)
-                script.duration = `${minutes}m ${seconds}s`
-              } else {
-                const hours = Math.floor(durationMs / 3600000)
-                const minutes = Math.floor((durationMs % 3600000) / 60000)
-                const seconds = Math.round((durationMs % 60000) / 1000)
-                script.duration = `${hours}h ${minutes}m ${seconds}s`
-              }
-            } else {
-              script.duration = 'N/A'
-            }
-          })
+  async function setItemsPerPage(newItemsPerPage) {
+    itemsPerPage.value = newItemsPerPage
+    page.value = 1
+    await fetchScripts()
+  }
 
-          this.runningScripts = scripts
-          this.runningTotal = response.data.total || scripts.length
-          this.runningLoading = false
-        })
-        .catch((error) => {
-          this.runningLoading = false
-          this.$notify.caution({
-            title: 'Error Loading Running Scripts',
-            body: error.message,
-          })
-        })
-    },
-    updateRunningPage: function (page) {
-      this.runningPage = page
-      this.getRunningScripts()
-    },
-    updateRunningItemsPerPage: function (itemsPerPage) {
-      this.runningItemsPerPage = itemsPerPage
-      this.runningPage = 1
-      this.getRunningScripts()
-    },
-    getCompletedScripts: function () {
-      this.completedLoading = true
-      const offset = (this.completedPage - 1) * this.completedItemsPerPage
-      Api.get(
-        `/script-api/completed-scripts?scope=DEFAULT&offset=${offset}&limit=${this.completedItemsPerPage}`,
-      )
-        .then((response) => {
-          const scripts = response.data.items || []
+  // Debounce search so we refetch from the server after the user stops typing.
+  // Reset to the first page since the filtered result set changes.
+  watch(
+    search,
+    debounce(() => {
+      page.value = 1
+      fetchScripts().catch(console.error)
+    }, 300),
+  )
 
-          // Calculate duration and format user info for each completed script
-          scripts.forEach((script) => {
-            // Format user display as "full_name (username)"
-            script.user_display = `${script.user_full_name} (${script.username})`
+  // Return refs (not reactive) so they can be destructured into named bindings
+  // without losing reactivity.
+  return {
+    search,
+    scripts,
+    total,
+    loading,
+    page,
+    itemsPerPage,
+    fetchScripts,
+    setPage,
+    setItemsPerPage,
+  }
+}
 
-            // Calculate duration
-            if (script.start_time && script.end_time) {
-              const startTime = new Date(script.start_time)
-              const endTime = new Date(script.end_time)
-              const durationMs = endTime - startTime
-              script.start_time_formatted = this.formatDateTimeHMS(
-                startTime,
-                this.timeZone,
-              )
+const {
+  search: runningSearch,
+  scripts: runningScripts,
+  total: runningTotal,
+  loading: runningLoading,
+  page: runningPage,
+  itemsPerPage: runningItemsPerPage,
+  fetchScripts: getRunningScripts,
+  setPage: updateRunningPage,
+  setItemsPerPage: updateRunningItemsPerPage,
+} = useScriptTable(
+  '/script-api/running-script',
+  'Error Loading Running Scripts',
+)
 
-              // Format duration
-              if (durationMs < 0) {
-                script.duration = 'N/A'
-              } else if (durationMs < 1000) {
-                script.duration = '< 1s'
-              } else if (durationMs < 60000) {
-                script.duration = `${Math.round(durationMs / 1000)}s`
-              } else if (durationMs < 3600000) {
-                const minutes = Math.floor(durationMs / 60000)
-                const seconds = Math.round((durationMs % 60000) / 1000)
-                script.duration = `${minutes}m ${seconds}s`
-              } else {
-                const hours = Math.floor(durationMs / 3600000)
-                const minutes = Math.floor((durationMs % 3600000) / 60000)
-                const seconds = Math.round((durationMs % 60000) / 1000)
-                script.duration = `${hours}h ${minutes}m ${seconds}s`
-              }
-            } else {
-              script.duration = 'N/A'
-            }
-          })
+const {
+  search: completedSearch,
+  scripts: completedScripts,
+  total: completedTotal,
+  loading: completedLoading,
+  page: completedPage,
+  itemsPerPage: completedItemsPerPage,
+  fetchScripts: getCompletedScripts,
+  setPage: updateCompletedPage,
+  setItemsPerPage: updateCompletedItemsPerPage,
+} = useScriptTable(
+  '/script-api/completed-scripts',
+  'Error Loading Completed Scripts',
+)
 
-          this.completedScripts = scripts
-          this.completedTotal = response.data.total || scripts.length
-          this.completedLoading = false
-        })
-        .catch((error) => {
-          this.completedLoading = false
-          this.$notify.caution({
-            title: 'Error Loading Completed Scripts',
-            body: error.message,
-          })
-        })
-    },
-    updateCompletedPage: function (page) {
-      this.completedPage = page
-      this.getCompletedScripts()
-    },
-    updateCompletedItemsPerPage: function (itemsPerPage) {
-      this.completedItemsPerPage = itemsPerPage
-      this.completedPage = 1
-      this.getCompletedScripts()
-    },
-    showScript: function (script) {
-      this.dialogContent = JSON.stringify(script, null, 2)
-      this.dialogName = 'Script: ' + script.name
-      this.dialogFilename = ''
-      this.showDialog = true
-    },
-    connectScript: function (script) {
-      // Must disconnect before connecting
-      this.$emit('disconnect')
-      const destination = {
-        name: 'ScriptRunner',
-        params: { id: script.name },
-      }
-      if (this.connectInNewTab) {
-        let { href } = this.$router.resolve(destination)
-        window.open(href, '_blank')
-      } else {
-        this.$router.push(destination)
-        this.$emit('close')
-      }
-    },
-    deleteScript: function (script) {
-      this.$dialog
-        .confirm(
-          `Are you sure you want to stop script: ${script.name} ${script.filename}?\n`,
-          {
-            okText: 'Stop',
-            cancelText: 'Cancel',
-          },
-        )
-        .then((dialog) => {
-          return Api.post(`/script-api/running-script/${script.name}/delete`)
-        })
-        .then((response) => {
-          this.$notify.normal({
-            body: `Stopped script: ${script.name} ${script.filename}`,
-          })
-          this.getRunningScripts()
-        })
-        .catch((error) => {
-          if (error !== true) {
-            this.$notify.caution({
-              body: `Failed to stop script: ${script.name} ${script.filename}`,
-            })
-          }
-        })
-    },
-    viewScriptLog: function (script, type) {
-      let logUrl = null
-      if (type === 'report') {
-        this.dialogName = 'Report'
-        logUrl = script.report
-      } else {
-        this.dialogName = 'Log'
-        logUrl = script.log
-      }
-      Api.get(
+// Columns shared by both tables; each table adds its own action columns.
+// Sorting is disabled table-wide (disable-sort) since the API doesn't support it.
+const coreHeaders = [
+  { title: 'Id', key: 'name' },
+  { title: 'User', key: 'user_full_name' },
+  { title: 'Filename', key: 'filename' },
+  { title: 'Start Time', key: 'start_time' },
+  { title: 'Duration', key: 'duration' },
+  { title: 'State', key: 'state' },
+]
+const runningHeaders = [
+  { title: 'Connect', key: 'connect', filterable: false },
+  ...coreHeaders,
+  { title: 'Stop', key: 'stop', filterable: false },
+]
+const completedHeaders = [
+  ...coreHeaders,
+  { title: 'Log', key: 'log', filterable: false },
+  { title: 'Report', key: 'report', filterable: false },
+]
+
+const showDialog = ref(false)
+const dialogName = ref('')
+const dialogContent = ref('')
+const dialogFilename = ref('')
+
+watch(activeTab, async (newTab) => {
+  if (newTab === 'running') {
+    await getRunningScripts()
+  } else if (newTab === 'completed') {
+    await getCompletedScripts()
+  }
+})
+
+onMounted(async () => {
+  try {
+    const response = await api.get_setting('time_zone')
+    if (response) {
+      timeZone.value = response
+    }
+  } catch (error) {
+    // Do nothing
+  }
+
+  await Promise.all([getRunningScripts(), getCompletedScripts()])
+
+  // Start a timer to refresh the running scripts list every 5 seconds
+  refreshTimer.value = setInterval(async () => {
+    if (activeTab.value === 'running') {
+      await getRunningScripts()
+    }
+  }, 5000)
+})
+
+onBeforeUnmount(() => {
+  // Clear the timer when component is unmounted
+  if (refreshTimer.value) {
+    clearInterval(refreshTimer.value)
+  }
+})
+
+// Display-only formatters used by the data table item slots. Keeping these out
+// of the fetch keeps the API response unmodified and lets start time react to
+// the time zone setting (which loads asynchronously after the first fetch).
+function formatUserDisplay(item) {
+  return `${item.user_full_name} (${item.username})`
+}
+
+function formatStartTime(item) {
+  if (!item.start_time) {
+    return 'N/A'
+  }
+  return formatDateTimeHMS(new Date(item.start_time), timeZone.value)
+}
+
+function formatDuration(item) {
+  if (!item.start_time) {
+    return 'N/A'
+  }
+  const startTime = new Date(item.start_time)
+  // Running scripts have no end_time, so measure against the current time
+  const endTime = item.end_time ? new Date(item.end_time) : new Date()
+  return formatDurationMs(endTime - startTime)
+}
+
+function formatDurationMs(durationMs) {
+  if (durationMs < 0) {
+    return 'N/A'
+  } else if (durationMs < 1000) {
+    return '< 1s'
+  } else if (durationMs < 60000) {
+    return `${Math.round(durationMs / 1000)}s`
+  } else if (durationMs < 3600000) {
+    const minutes = Math.floor(durationMs / 60000)
+    const seconds = Math.round((durationMs % 60000) / 1000)
+    return `${minutes}m ${seconds}s`
+  } else {
+    const hours = Math.floor(durationMs / 3600000)
+    const minutes = Math.floor((durationMs % 3600000) / 60000)
+    const seconds = Math.round((durationMs % 60000) / 1000)
+    return `${hours}h ${minutes}m ${seconds}s`
+  }
+}
+
+function showScript(script) {
+  dialogContent.value = JSON.stringify(script, null, 2)
+  dialogName.value = 'Script: ' + script.name
+  dialogFilename.value = ''
+  showDialog.value = true
+}
+
+function connectScript(script) {
+  // Must disconnect before connecting
+  emit('disconnect')
+  const destination = {
+    name: 'ScriptRunner',
+    params: { id: script.name },
+  }
+  if (props.connectInNewTab) {
+    const { href } = router.resolve(destination)
+    window.open(href, '_blank')
+  } else {
+    router.push(destination)
+    emit('close')
+  }
+}
+
+async function deleteScript(script) {
+  try {
+    await dialog.confirm(
+      `Are you sure you want to stop script: ${script.name} ${script.filename}?\n`,
+      {
+        okText: 'Stop',
+        cancelText: 'Cancel',
+      },
+    )
+    await Api.post(`/script-api/running-script/${script.name}/delete`)
+    notify.normal({
+      body: `Stopped script: ${script.name} ${script.filename}`,
+    })
+    await getRunningScripts()
+  } catch (error) {
+    if (error !== true) {
+      notify.caution({
+        body: `Failed to stop script: ${script.name} ${script.filename}`,
+      })
+    }
+  }
+}
+
+async function viewScriptLog(script, type) {
+  let logUrl = null
+  if (type === 'report') {
+    dialogName.value = 'Report'
+    logUrl = script.report
+  } else {
+    dialogName.value = 'Log'
+    logUrl = script.log
+  }
+  if (!logUrl) {
+    notify.caution({
+      title: `No ${dialogName.value.toLowerCase()} available`,
+      body: `Script ${script.name} has no ${dialogName.value.toLowerCase()} file yet.`,
+    })
+    return
+  }
+  try {
+    const response = await Api.get(
+      `/openc3-api/storage/download_file/${encodeURIComponent(
+        logUrl,
+      )}?bucket=OPENC3_LOGS_BUCKET`,
+    )
+    const filenameParts = logUrl.split('/')
+    dialogFilename.value = filenameParts[filenameParts.length - 1]
+    // Decode Base64 string
+    dialogContent.value = window.atob(response.data.contents)
+    showDialog.value = true
+  } catch {
+    notify.caution({
+      title: `Unable to open ${dialogName.value.toLowerCase()} ${logUrl}`,
+      body: `You may be able to download this ${dialogName.value.toLowerCase()} manually from the 'logs' bucket at ${logUrl}`,
+    })
+  }
+}
+
+async function downloadScriptLog(script, type, format = 'text') {
+  let logUrl = null
+  if (type === 'report') {
+    dialogName.value = 'Report'
+    logUrl = script.report
+  } else {
+    dialogName.value = 'Log'
+    logUrl = script.log
+  }
+  if (!logUrl) {
+    notify.caution({
+      title: `No ${dialogName.value.toLowerCase()} available`,
+      body: `Script ${script.name} has no ${dialogName.value.toLowerCase()} file yet.`,
+    })
+    return
+  }
+  downloadScript.value = script
+
+  try {
+    if (format === 'ctrf' && type === 'report') {
+      // For CTRF format, pass format parameter to backend for conversion
+      const response = await Api.get(
         `/openc3-api/storage/download_file/${encodeURIComponent(
           logUrl,
-        )}?bucket=OPENC3_LOGS_BUCKET`,
-      ).then((response) => {
-        const filenameParts = logUrl.split('/')
-        this.dialogFilename = filenameParts[filenameParts.length - 1]
-        // Decode Base64 string
-        this.dialogContent = window.atob(response.data.contents)
-        this.showDialog = true
+        )}?bucket=OPENC3_LOGS_BUCKET&format=ctrf`,
+      )
+      // Backend returns the converted CTRF content
+      const blob = new Blob([window.atob(response.data.contents)], {
+        type: 'application/json',
       })
-    },
-    downloadScriptLog: function (script, type, format = 'text') {
-      let logUrl = null
-      if (type === 'report') {
-        this.dialogName = 'Report'
-        logUrl = script.report
-      } else {
-        this.dialogName = 'Log'
-        logUrl = script.log
-      }
-      this.downloadScript = script
-
-      if (format === 'ctrf' && type === 'report') {
-        // For CTRF format, pass format parameter to backend for conversion
-        Api.get(
-          `/openc3-api/storage/download_file/${encodeURIComponent(
-            logUrl,
-          )}?bucket=OPENC3_LOGS_BUCKET&format=ctrf`,
-        )
-          .then((response) => {
-            // Backend returns the converted CTRF content
-            const blob = new Blob([window.atob(response.data.contents)], {
-              type: 'application/json',
-            })
-            const link = document.createElement('a')
-            link.href = URL.createObjectURL(blob)
-            link.setAttribute('download', response.data.filename)
-            link.click()
-            this.downloadScript = null
-          })
-          .catch(() => {
-            this.$notify.caution({
-              title: `Unable to download log ${logUrl}`,
-              body: `You may be able to download this log manually from the 'logs' bucket at ${logUrl}`,
-            })
-            this.downloadScript = null
-          })
-      } else {
-        // Original download functionality for text format
-        Api.get(
-          `/openc3-api/storage/download/${encodeURIComponent(
-            logUrl,
-          )}?bucket=OPENC3_LOGS_BUCKET`,
-        )
-          .then((response) => {
-            const filenameParts = logUrl.split('/')
-            const basename = filenameParts[filenameParts.length - 1]
-            // Make a link and then 'click' on it to start the download
-            const link = document.createElement('a')
-            link.href = response.data.url
-            link.setAttribute('download', basename)
-            link.click()
-            this.downloadScript = null
-          })
-          .catch(() => {
-            this.$notify.caution({
-              title: `Unable to download log ${logUrl}`,
-              body: `You may be able to download this log manually from the 'logs' bucket at ${logUrl}`,
-            })
-            this.downloadScript = null
-          })
-      }
-    },
-  },
+      const link = document.createElement('a')
+      link.href = URL.createObjectURL(blob)
+      link.setAttribute('download', response.data.filename)
+      link.click()
+      downloadScript.value = null
+    } else {
+      // Original download functionality for text format
+      const response = await Api.get(
+        `/openc3-api/storage/download/${encodeURIComponent(
+          logUrl,
+        )}?bucket=OPENC3_LOGS_BUCKET`,
+      )
+      const filenameParts = logUrl.split('/')
+      const basename = filenameParts[filenameParts.length - 1]
+      // Make a link and then 'click' on it to start the download
+      const link = document.createElement('a')
+      link.href = response.data.url
+      link.setAttribute('download', basename)
+      link.click()
+      downloadScript.value = null
+    }
+  } catch {
+    notify.caution({
+      title: `Unable to download log ${logUrl}`,
+      body: `You may be able to download this log manually from the 'logs' bucket at ${logUrl}`,
+    })
+    downloadScript.value = null
+  }
 }
 </script>
 <style>

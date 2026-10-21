@@ -6,7 +6,7 @@ sidebar_custom_props:
   myEmoji: 📡
 ---
 
-<!-- Be sure to edit _command.md because command.md is a generated file -->
+{/* Be sure to edit _command.md because command.md is a generated file */}
 
 ## Command Concepts
 
@@ -22,21 +22,21 @@ When defining command parameters you can choose from the following data types: I
 
 ### Naming Convention
 
-Command Packets and Parameters can be named however you want with very few exceptions. The following is not allowed in Command or Parameter names: `__` (double underscore), `[[` or `]]` (double brackets), whitespace, and ending a name with underscore. While not much else is _explicitly_ restricted we've found the following guidelines to be helpful.
+Command Packets and Parameters can be named however you want with very few exceptions. The following is not allowed in Command or Parameter names: `__` (double underscore), `[[` or `]]` (double brackets), whitespace, and ending a name with underscore. Parameter names are also limited to a maximum of 127 characters because they are used as column headers when command data is stored in the time series database (QuestDB). Note that all target, packet, parameter, and state names are automatically converted to uppercase (COSMOS is not case sensitive), so mixed case cannot be used to visually separate words. Use underscores or dashes instead, e.g. `LOW_POWER_MODE` rather than `LowPowerMode` which becomes the harder to read `LOWPOWERMODE`. While not much else is _explicitly_ restricted we've found the following guidelines to be helpful. Note that renaming or changing the type of an existing parameter affects the historical data already stored for it, see [Packet Structure Changes](/docs/guides/packet-structure-changes).
 
-* Use underscores
+- Use underscores
 
-    Command names like `FIRE_THRUSTER` or `SET_MODE` are easy to read and understand. Most parameter names can be a single word like `TYPE`, `DURATION`, or `MODE` because they are unique within each Command.
+  Command names like `FIRE_THRUSTER` or `SET_MODE` are easy to read and understand. Most parameter names can be a single word like `TYPE`, `DURATION`, or `MODE` because they are unique within each Command.
 
-* Be descriptive but succinct
+- Be descriptive but succinct
 
-    A command name like `BUS_FLIGHT_SOFTWARE_ADCS_FIRE_THRUSTER_2` is a valid command name but makes all the drop downs extra long and is a lot to type. A better choice might be `FIRE_THRUSTER with POD 2`. Parameters are a great way to break up complex commands.
+  A command name like `BUS_FLIGHT_SOFTWARE_ADCS_FIRE_THRUSTER_2` is a valid command name but makes all the drop downs extra long and is a lot to type. A better choice might be `FIRE_THRUSTER with POD 2`. Parameters are a great way to break up complex commands.
 
-* Avoid brackets in commands and parameters
+- Avoid brackets in commands and parameters
 
-    Array items use brackets to allow indexing into an individual item. Thus if you use brackets in parameter names it gets confusing as to whether this is a COSMOS [ARRAY_PARAMETER](command#array_parameter) or simply a name with brackets. We support brackets for legacy reasons but avoid them when possible. For example from the Demo: `INST ARYCMD with ARRAY [1, 2, 3, 4]`.
+  Array items use brackets to allow indexing into an individual item. Thus if you use brackets in parameter names it gets confusing as to whether this is a COSMOS [ARRAY_PARAMETER](command#array_parameter) or simply a name with brackets. We support brackets for legacy reasons but avoid them when possible. For example from the Demo: `INST ARYCMD with ARRAY [1, 2, 3, 4]`.
 
-<div style={{"clear": 'both'}}></div>
+<div style={{ clear: "both" }}></div>
 
 ## Command Authority (Enterprise)
 
@@ -61,8 +61,7 @@ COSMOS_META
 
 **Example File: TARGET/cmd_tlm/cmd.txt**
 
-<!-- prettier-ignore -->
-```ruby
+```cosmos
 COMMAND TARGET COLLECT_DATA BIG_ENDIAN "Commands my target to collect data"
   PARAMETER CCSDSVER 0 3 UINT 0 0 0 "CCSDS PRIMARY HEADER VERSION NUMBER"
   PARAMETER CCSDSTYPE 3 1 UINT 1 1 1 "CCSDS PRIMARY HEADER PACKET TYPE"

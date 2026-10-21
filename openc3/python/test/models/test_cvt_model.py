@@ -98,6 +98,18 @@ class TestCvtModel(unittest.TestCase):
             b"\x00\x01\x02\x03\x04",
         )
 
+    def test_build_json_from_packet_passes_include_limits_states(self):
+        packet = Packet("TGT", "PKT", "BIG_ENDIAN", "packet", b"\x01\x02")
+        item = packet.append_item("val", 16, "UINT")
+        item.limits.state = "RED_HIGH"
+
+        json_hash = CvtModel.build_json_from_packet(packet)
+        self.assertEqual(json_hash["VAL__L"], "RED_HIGH")
+
+        json_hash = CvtModel.build_json_from_packet(packet, include_limits_states=False)
+        self.assertNotIn("VAL__L", json_hash)
+        self.assertEqual(json_hash["VAL"], 0x0102)
+
     def test_deletes_a_target_packet_from_the_cvt(self):
         self.update_temp1()
         self.assertIn(b"HEALTH_STATUS", Store.hkeys("DEFAULT__tlm__INST"))
@@ -255,12 +267,12 @@ class TestCvtModel(unittest.TestCase):
         self.assertEqual(CvtModel.get_tlm_values([]), ([]))
 
     def test_gettlm_raises_on_invalid_packets(self):
-        with self.assertRaisesRegex(RuntimeError, "Packet 'NOPE BLAH' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, "Packet 'NOPE BLAH' has no current values in CVT"):
             CvtModel.get_tlm_values([["NOPE", "BLAH", "TEMP1", "RAW"]])
 
     def test_gettlm_raises_on_invalid_items(self):
         self.update_temp1()
-        with self.assertRaisesRegex(RuntimeError, "Item 'INST HEALTH_STATUS NOPE' does not exist"):
+        with self.assertRaisesRegex(RuntimeError, r"Item 'INST HEALTH_STATUS NOPE' does not exist \(get_tlm_values\)"):
             CvtModel.get_tlm_values([["INST", "HEALTH_STATUS", "NOPE", "RAW"]])
 
     def test_gettlm_raises_on_invalid_types(self):

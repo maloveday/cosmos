@@ -17,6 +17,16 @@
 
 require 'openc3/utilities/local_mode'
 require 'openc3/utilities/bucket'
+require 'openc3/utilities/config_overlay'
+require 'openc3/utilities/bucket_utilities'
+require 'openc3/utilities/ctrf'
+require 'openc3/utilities/process_manager'
+require 'openc3/utilities/questdb_client'
+require 'openc3/logs/packet_log_reader'
+require 'openc3/models/reingest_job_model'
+require 'openc3/topics/telemetry_topic'
+require 'fileutils'
+require 'securerandom'
 begin
   require 'openc3-enterprise/version'
   STORAGE_VERSION = OPENC3_ENTERPRISE_VERSION
@@ -27,6 +37,9 @@ end
 
 class StorageController < ApplicationController
   class StorageError < StandardError; end
+
+  VOLUME_DOWNLOAD_KEY_PREFIX = 'openc3_volume_download__'
+  VOLUME_DOWNLOAD_TOKEN_EXPIRE_SECONDS = 60
 
   # Check if a bucket requires RBAC (config and logs do, tools does not)
   def bucket_requires_rbac?(bucket_param)
@@ -271,11 +284,16 @@ class StorageController < ApplicationController
       end
     end
 
-    bucket = OpenC3::Bucket.getClient()
-    # Returns true or false if the object is found
-    result = bucket.check_object(bucket: bucket_name,
-                                 key: path,
-                                 retries: false)
+    if local_only_config_key?(params[:bucket], path)
+      local_path = OpenC3::LocalMode.key_path(path)
+      result = !!(local_path && File.file?(local_path))
+    else
+      bucket = OpenC3::Bucket.getClient()
+      # Returns true or false if the object is found
+      result = bucket.check_object(bucket: bucket_name,
+                                   key: path,
+                                   retries: false)
+    end
     if result
       render json: result
     else
@@ -295,6 +313,13 @@ class StorageController < ApplicationController
       storage_type, storage_name = validate_storage_source
       object_id = sanitize_path(params[:object_id])
 
+      # Guard against a missing / literal 'null' object_id (e.g. frontend sending
+      # an undefined log or report filename). Return 404 instead of a 500.
+      if object_id.empty? || object_id == 'null'
+        render json: { status: 'error', message: "Invalid object_id: #{params[:object_id]}" }, status: :not_found
+        return
+      end
+
       # Check scope-based RBAC for bucket downloads
       if storage_type == :bucket && params[:bucket] && bucket_requires_rbac?(params[:bucket])
         unless authorize_bucket_path(params[:bucket], object_id)
@@ -306,6 +331,9 @@ class StorageController < ApplicationController
 
       filename = if storage_type == :volume
         sanitize_path("/#{storage_name}/#{object_id}")
+      elsif local_only_config_key?(params[:bucket], object_id)
+        # Local only targets are served from the local mode volume
+        OpenC3::LocalMode.key_path(object_id).to_s
       else
         tmp_dir = Dir.mktmpdir
         temp_path = File.join(tmp_dir, object_id)
@@ -314,12 +342,19 @@ class StorageController < ApplicationController
         temp_path
       end
 
+      # get_object returns nil for a missing key (never writes temp_path), and a
+      # volume file may not exist. Return 404 rather than letting File.read 500.
+      unless File.file?(filename)
+        render json: { status: 'error', message: "File not found: #{params[:object_id]}" }, status: :not_found
+        return
+      end
+
       file = File.read(filename, mode: 'rb')
 
       # Check if CTRF conversion is requested
       if params[:format] == 'ctrf'
         file_content = file.force_encoding('UTF-8')
-        ctrf_data = convert_to_ctrf(file_content)
+        ctrf_data = OpenC3::Ctrf.convert_report(file_content, version: STORAGE_VERSION)
         render json: { filename: "#{File.basename(params[:object_id], '.*')}.ctrf.json", contents: Base64.encode64(ctrf_data.to_json) }
       else
         render json: { filename: params[:object_id], contents: Base64.encode64(file) }
@@ -329,8 +364,55 @@ class StorageController < ApplicationController
       OpenC3::Logger.error("Download failed: #{e.message}", user: username())
       render json: { status: 'error', message: e.message }, status: :internal_server_error
     ensure
-      FileUtils.rm_rf(tmp_dir) if tmp_dir
+      FileUtils.remove_entry_secure(tmp_dir, true) if tmp_dir
     end
+  end
+
+  # Volume equivalent of get_download_presigned_request. Returns a short lived,
+  # single use URL the browser can download directly so large files are streamed
+  # rather than base64 encoded into JSON (which fails above ~2GB).
+  def get_volume_download_token
+    return unless authorization('system')
+    params.require(:volume)
+    volume_name = ENV.fetch(params[:volume]) { |name| raise StorageError, "Unknown volume #{name}" }
+    object_id = sanitize_path(params[:object_id])
+    if object_id.empty? || object_id == 'null'
+      render json: { status: 'error', message: "Invalid object_id: #{params[:object_id]}" }, status: :not_found
+      return
+    end
+
+    filename = sanitize_path("/#{volume_name}/#{object_id}")
+    unless File.file?(filename)
+      render json: { status: 'error', message: "File not found: #{params[:object_id]}" }, status: :not_found
+      return
+    end
+
+    token = SecureRandom.urlsafe_base64(32)
+    OpenC3::EphemeralStore.set("#{VOLUME_DOWNLOAD_KEY_PREFIX}#{token}", filename, ex: VOLUME_DOWNLOAD_TOKEN_EXPIRE_SECONDS)
+    render json: { url: "/openc3-api/storage/stream/#{token}" }, status: :created
+  rescue Exception => e
+    log_error(e)
+    OpenC3::Logger.error("Download request failed: #{e.message}", user: username())
+    render json: { status: 'error', message: e.message }, status: :internal_server_error
+  end
+
+  # Streams a volume file previously authorized by get_volume_download_token.
+  # The token is the authorization since browser downloads can't send headers.
+  def stream_volume_file
+    filename = OpenC3::EphemeralStore.getdel("#{VOLUME_DOWNLOAD_KEY_PREFIX}#{params[:token]}")
+    unless filename
+      render json: { status: 'error', message: 'Invalid or expired download token' }, status: :unauthorized
+      return
+    end
+    unless File.file?(filename)
+      render json: { status: 'error', message: "File not found: #{File.basename(filename)}" }, status: :not_found
+      return
+    end
+    send_file(filename, filename: File.basename(filename), type: 'application/octet-stream', disposition: 'attachment')
+  rescue Exception => e
+    log_error(e)
+    OpenC3::Logger.error("Download failed: #{e.message}")
+    render json: { status: 'error', message: e.message }, status: :internal_server_error
   end
 
   def download_multiple_files
@@ -373,7 +455,7 @@ class StorageController < ApplicationController
       OpenC3::Logger.error("Multiple file download failed: #{e.message}", user: username())
       render json: { status: 'error', message: e.message }, status: :internal_server_error
     ensure
-      FileUtils.rm_rf(tmp_dir) if tmp_dir
+      FileUtils.remove_entry_secure(tmp_dir, true) if tmp_dir
     end
   end
 
@@ -390,6 +472,11 @@ class StorageController < ApplicationController
         render json: { status: 'error', message: "Not authorized for scope: #{path_scope}" }, status: :forbidden
         return
       end
+    end
+
+    if local_only_config_key?(params[:bucket], path)
+      render_local_only_error(path)
+      return
     end
 
     bucket = OpenC3::Bucket.getClient()
@@ -409,7 +496,6 @@ class StorageController < ApplicationController
     params.require(:bucket)
     bucket_name = ENV.fetch(params[:bucket]) { |name| raise StorageError, "Unknown bucket #{name}" }
     path = sanitize_path(params[:object_id])
-    key_split = path.split('/')
 
     # Check scope-based RBAC for config and logs buckets
     if bucket_requires_rbac?(params[:bucket])
@@ -420,9 +506,14 @@ class StorageController < ApplicationController
       end
     end
 
-    # Anywhere other than config/SCOPE/targets_modified or config/SCOPE/tmp requires admin
-    if !(params[:bucket] == 'OPENC3_CONFIG_BUCKET' && (key_split[1] == 'targets_modified' || key_split[1] == 'tmp'))
-      return unless authorization('admin')
+    # Non-admins may only write the user-writable overlay (config/SCOPE/targets_modified
+    # or config/SCOPE/tmp), and never the cmd_tlm or tables/config overlay, whose
+    # GENERIC_*_CONVERSION blocks are evaluated as code. Everything else is admin.
+    return if !non_admin_config_overlay_write?(params[:bucket], path) && !authorization('admin')
+
+    if local_only_config_key?(params[:bucket], path)
+      render_local_only_error(path)
+      return
     end
 
     bucket = OpenC3::Bucket.getClient()
@@ -436,6 +527,46 @@ class StorageController < ApplicationController
   rescue Exception => e
     log_error(e)
     OpenC3::Logger.error("Upload request failed: #{e.message}", user: username())
+    render json: { status: 'error', message: e.message }, status: :internal_server_error
+  end
+
+  # Writes a file through the API rather than a presigned URL. Used by scripts
+  # outside the cluster for local only targets, whose files live in the local
+  # mode volume that only the cluster can reach. The contents are base64 in a
+  # JSON body (matching download_file) so binary files survive the JSON clients.
+  def upload_file
+    return unless authorization('system_set')
+    params.require(:bucket)
+    bucket_name = ENV.fetch(params[:bucket]) { |name| raise StorageError, "Unknown bucket #{name}" }
+    path = sanitize_path(params[:object_id])
+    raise StorageError, "Missing contents" unless params.key?(:contents)
+
+    # Check scope-based RBAC for config and logs buckets
+    if bucket_requires_rbac?(params[:bucket]) && !authorize_bucket_path(params[:bucket], path, permission: 'system_set')
+      path_scope = extract_scope_from_path(path)
+      render json: { status: 'error', message: "Not authorized for scope: #{path_scope}" }, status: :forbidden
+      return
+    end
+
+    # Same rule as get_upload_presigned_request: non-admins may only write the
+    # user-writable overlay, and never the cmd_tlm overlay. Everything else is admin.
+    return if !non_admin_config_overlay_write?(params[:bucket], path) && !authorization('admin')
+
+    data = Base64.decode64(params[:contents].to_s)
+    local_only = local_only_config_key?(params[:bucket], path)
+    # Mirror targets_modified writes into the local mode volume like TargetFile.create
+    if local_only || (ENV['OPENC3_LOCAL_MODE'] && params[:bucket] == 'OPENC3_CONFIG_BUCKET' && path.split('/')[1] == 'targets_modified')
+      raise StorageError, "Invalid path: #{path}" unless OpenC3::LocalMode.key_path(path)
+      OpenC3::LocalMode.put_target_file(path, data, scope: path.split('/')[0])
+    end
+    # Local only targets are never stored in the bucket
+    OpenC3::Bucket.getClient().put_object(bucket: bucket_name, key: path, body: data) unless local_only
+
+    OpenC3::Logger.info("Uploaded: #{local_only ? 'local' : bucket_name}/#{path}", scope: params[:scope], user: username())
+    head :ok
+  rescue Exception => e
+    log_error(e)
+    OpenC3::Logger.error("Upload failed: #{e.message}", user: username())
     render json: { status: 'error', message: e.message }, status: :internal_server_error
   end
 
@@ -470,151 +601,150 @@ class StorageController < ApplicationController
     render json: { status: 'error', message: e.message }, status: :internal_server_error
   end
 
-  private
+  def reingest_files
+    return unless authorization('admin')
 
-  # See https://ctrf.io/docs/category/specification
-  def convert_to_ctrf(report_content)
-    lines = report_content.split("\n")
-    tests = []
-    summary = {}
-    settings = {}
-    in_settings = false
-    last_result = nil
-    in_summary = false
+    files = params[:files] || []
+    raise StorageError, "No files specified" if files.empty?
 
-    lines.each do |line|
-      line_clean = line.strip
+    invalid = files.reject { |f| f.end_with?('.bin.gz') }
+    raise StorageError, "Only .bin.gz files can be reingested: #{invalid.join(', ')}" if invalid.any?
 
-      if line_clean == 'Settings:'
-        in_settings = true
-        next
-      end
-      if in_settings
-        if line_clean.include?('Manual')
-          settings[:manual] = line.split('=')[1].strip
-          next
-        elsif line_clean.include?('Pause on Error')
-          settings[:pauseOnError] = line.split('=')[1].strip
-          next
-        elsif line_clean.include?('Continue After Error')
-          settings[:contineAfterError] = line.split('=')[1].strip
-          next
-        elsif line_clean.include?('Abort After Error')
-          settings[:abortAfterError] = line.split('=')[1].strip
-          next
-        elsif line_clean.include?('Loop =')
-          settings[:loop] = line.split('=')[1].strip
-          next
-        elsif line_clean.include?('Break Loop On Error')
-          settings[:breakLoopOnError] = line.split('=')[1].strip
-          in_settings = false
-          next
-        end
-      end
-
-      if line_clean == 'Results:'
-        last_result = line_clean
-        next
-      end
-
-      if last_result
-        # The first line should always have a timestamp and what it is executing
-        if last_result == 'Results:' and line_clean.include?("Executing")
-          summary[:start_time] = DateTime.parse(line_clean.split(':')[0]).to_time.to_f * 1000
-          last_result = line_clean
-          next
-        end
-
-        if line_clean.include?("PASS") or line_clean.include?("SKIP") or line_clean.include?("FAIL")
-          date_time, _example = last_result.split('Z:')
-          start_time = DateTime.parse("#{date_time}Z").to_time.to_f * 1000
-          date_time, example = line_clean.split('Z:')
-          suite_group, name, status = example.strip.split(':')
-          stop_time = DateTime.parse("#{date_time}Z").to_time.to_f * 1000
-          format_status = case status
-          when 'PASS'
-            'passed'
-          when 'SKIP'
-            'skipped'
-          when 'FAIL'
-            'failed'
-          else
-            # Should never get this but 'other' is valid CTRF, only other valid option is 'pending'
-            'other'
-          end
-          # See https://ctrf.io/docs/specification/test
-          tests << {
-            name: "#{suite_group}:#{name}",
-            status: format_status,
-            duration: stop_time - start_time,
-          }
-          last_result = line_clean
-          next
-        end
-
-        if line_clean.include?("Completed")
-          summary[:stop_time] = DateTime.parse(line_clean.split(':')[0]).to_time.to_f * 1000
-          last_result = nil
-          next
-        end
-      end
-
-      if line_clean == '--- Test Summary ---'
-        in_summary = true
-        next
-      end
-
-      if in_summary
-        if line_clean.include?("Total Tests")
-          summary[:total] = line_clean.split(':')[1].to_i
-        end
-        if line_clean.include?("Pass:")
-          summary[:passed] = line_clean.split(':')[1].to_i
-        end
-        if line_clean.include?("Skip:")
-          summary[:skipped] = line_clean.split(':')[1].to_i
-        end
-        if line_clean.include?("Fail:")
-          summary[:failed] = line_clean.split(':')[1].to_i
-        end
-      end
+    # Reject path traversal, absolute paths, or null bytes in filenames before
+    # they reach the job's temp-file layout. sanitize_path already rejects '..'.
+    files = files.map do |f|
+      raise StorageError, "Invalid filename: #{f}" if f.to_s.empty? || f.to_s.start_with?('/') || f.to_s.include?("\0")
+      sanitize_path(f)
     end
 
-    # Build CTRF report
-    return {
-      # See https://ctrf.io/docs/specification/root
-      reportFormat: "CTRF",
-      specVersion: "0.0.0",
-      results: {
-        # See https://ctrf.io/docs/specification/tool
-        tool: {
-          name: "COSMOS Script Runner",
-          version: STORAGE_VERSION,
-        },
-        # See https://ctrf.io/docs/specification/summary
-        summary: {
-          tests: summary[:total],
-          passed: summary[:passed],
-          failed: summary[:failed],
-          pending: 0,
-          skipped: summary[:skipped],
-          other: 0,
-          start: summary[:start_time],
-          stop: summary[:stop_time],
-        },
-        # See https://ctrf.io/docs/specification/tests
-        tests: tests,
-        # See https://ctrf.io/docs/specification/extra
-        extra: {
-          manual: settings[:manual],
-          pauseOnError: settings[:pauseOnError],
-          contineAfterError: settings[:contineAfterError],
-          abortAfterError: settings[:abortAfterError],
-          loop: settings[:loop],
-          breakLoopOnError: settings[:breakLoopOnError],
-        },
-      },
-    }
+    path = sanitize_path(params[:path] || '')
+    storage_type, _storage_name = validate_storage_source
+    raise StorageError, "Reingest only supported for buckets" unless storage_type == :bucket
+
+    scope = params[:scope] || 'DEFAULT'
+
+    if params[:bucket] && bucket_requires_rbac?(params[:bucket]) && !authorize_bucket_path(params[:bucket], path)
+      path_scope = extract_scope_from_path(path)
+      render json: { status: 'error', message: "Not authorized for scope: #{path_scope}" }, status: :forbidden
+      return
+    end
+
+    target_version = params[:target_version].to_s
+    target_version = 'as_logged' if target_version.empty?
+    unless %w[as_logged current].include?(target_version) || target_version.match?(/\A[a-f0-9]{32,}\z/)
+      raise StorageError, "Invalid target_version: #{target_version}"
+    end
+
+    job_id = SecureRandom.uuid
+    job = OpenC3::ReingestJobModel.new(
+      name: job_id,
+      files: files,
+      bucket: params[:bucket],
+      path: path,
+      target_version: target_version,
+      scope: scope,
+    )
+    job.create
+
+    # Run the reingest in its own process so System.reset_instance! / setup_targets
+    # in ReingestJob can't race with the cmd-tlm-api server's System singleton.
+    timeout = (ENV['OPENC3_REINGEST_TIMEOUT_SECS'] || 24 * 3600).to_i
+    OpenC3::ProcessManager.instance.spawn(
+      ["ruby", "/openc3/bin/openc3cli", "reingest", job_id, scope],
+      "reingest", job_id, Time.now + timeout, scope: scope,
+    )
+
+    OpenC3::Logger.info("Reingest job #{job_id} enqueued: #{files.length} file(s)", user: username())
+    render json: { job_id: job_id, state: 'Queued' }, status: :accepted
+  rescue Exception => e
+    log_error(e)
+    OpenC3::Logger.error("Reingest enqueue failed: #{e.message}", user: username())
+    render json: { status: 'error', message: e.message }, status: :internal_server_error
+  end
+
+  def reingest_status
+    return unless authorization('admin')
+    scope = params[:scope] || 'DEFAULT'
+    job = OpenC3::ReingestJobModel.get_model(name: params[:job_id], scope: scope)
+    if job.nil?
+      render json: { status: 'error', message: "Reingest job not found: #{params[:job_id]}" }, status: :not_found
+      return
+    end
+    render json: job.as_json, status: :ok
+  rescue Exception => e
+    log_error(e)
+    render json: { status: 'error', message: e.message }, status: :internal_server_error
+  end
+
+  def repair_candidates
+    return unless authorization('admin')
+    scope = (params[:scope] || 'DEFAULT').to_s
+    target = params[:target].to_s
+    cmd_or_tlm = (params[:cmd_or_tlm] || 'TLM').to_s.upcase
+    raise StorageError, "cmd_or_tlm must be TLM (CMD repair not yet supported)" unless cmd_or_tlm == 'TLM'
+    raise StorageError, "target is required" if target.empty?
+    # scope and target are interpolated into an S3 key prefix below; reject
+    # anything that isn't a plain identifier so path separators, traversal
+    # sequences, and control characters can't reshape the prefix.
+    raise StorageError, "Invalid scope: #{scope}" unless scope.match?(/\A[A-Z0-9_]+\z/i)
+    raise StorageError, "Invalid target: #{target}" unless target.match?(/\A[A-Z0-9_]+\z/i)
+
+    start_time = parse_repair_time(params[:start_time])
+    end_time = parse_repair_time(params[:end_time])
+
+    bucket_env = 'OPENC3_LOGS_BUCKET'
+    bucket_name = ENV.fetch(bucket_env) { |n| raise StorageError, "Unknown bucket #{n}" }
+    prefix = "#{scope}/raw_logs/tlm/#{target}"
+
+    if bucket_requires_rbac?(bucket_env) && !authorize_bucket_path(bucket_env, "#{prefix}/")
+      render json: { status: 'error', message: "Not authorized for scope: #{scope}" }, status: :forbidden
+      return
+    end
+
+    keys = OpenC3::BucketUtilities.files_between_time(
+      bucket_name, prefix, start_time, end_time,
+      file_suffix: '.bin.gz', overlap: true,
+    )
+
+    files = keys.map do |key|
+      basename = key.split('/').last
+      { 'key' => key, 'filename' => basename }
+    end
+
+    render json: {
+      bucket: bucket_env,
+      path: "#{prefix}/",
+      files: files,
+    }, status: :ok
+  rescue Exception => e
+    log_error(e)
+    render json: { status: 'error', message: e.message }, status: :internal_server_error
+  end
+
+  private
+
+  # True if the given config-bucket key is an overlay path a non-admin is allowed
+  # to write. Non-admins may write config/SCOPE/targets_modified/... and
+  # config/SCOPE/tmp/..., but NOT the code areas
+  # (config/SCOPE/targets_modified/TARGET/cmd_tlm/... and .../tables/config/...),
+  # whose GENERIC_*_CONVERSION blocks are evaluated as code.
+  #
+  # The canonical-key and code-area rules live in OpenC3::ConfigOverlay so every
+  # writer that can reach the overlay (this presigned upload, tables_controller,
+  # scripts_controller) enforces exactly the same thing.
+  def non_admin_config_overlay_write?(bucket_param, path)
+    return false unless bucket_param == 'OPENC3_CONFIG_BUCKET'
+    OpenC3::ConfigOverlay.non_admin_writable_key?(path)
+  end
+
+  # True if the config-bucket key belongs to a target in OPENC3_LOCAL_ONLY_TARGETS.
+  # Those files only live in the local mode volume and never in the bucket.
+  def local_only_config_key?(bucket_param, path)
+    bucket_param == 'OPENC3_CONFIG_BUCKET' && OpenC3::LocalMode.local_only_key?(path)
+  end
+
+  def render_local_only_error(path)
+    render json: { status: 'error', message: "#{path} belongs to a local only target (OPENC3_LOCAL_ONLY_TARGETS) and is not stored in the bucket" }, status: :bad_request
   end
 
   def sanitize_path(path)
@@ -635,7 +765,6 @@ class StorageController < ApplicationController
     params.require(:bucket)
     bucket_name = ENV.fetch(params[:bucket]) { |name| raise StorageError, "Unknown bucket #{name}" }
     path = sanitize_path(params[:object_id])
-    key_split = path.split('/')
 
     # Check scope-based RBAC for config and logs buckets
     if bucket_requires_rbac?(params[:bucket])
@@ -646,18 +775,17 @@ class StorageController < ApplicationController
       end
     end
 
-    # Anywhere other than config/SCOPE/targets_modified or config/SCOPE/tmp requires admin
-    authorized = true
-    if !(params[:bucket] == 'OPENC3_CONFIG_BUCKET' && (key_split[1] == 'targets_modified' || key_split[1] == 'tmp'))
-      authorized = false unless authorization('admin')
-    end
+    # Non-admins may only touch the user-writable config overlay (targets_modified or
+    # tmp), never the cmd_tlm overlay which is evaluated as code. Everything else is admin.
+    authorized = non_admin_config_overlay_write?(params[:bucket], path) || authorization('admin')
 
     if authorized
-      if ENV.fetch('OPENC3_LOCAL_MODE', false)
+      if ENV.fetch('OPENC3_LOCAL_MODE', false) || local_only_config_key?(params[:bucket], path)
         OpenC3::LocalMode.delete_local(path)
       end
 
-      OpenC3::Bucket.getClient().delete_object(bucket: bucket_name, key: path)
+      # Local only targets are never stored in the bucket
+      OpenC3::Bucket.getClient().delete_object(bucket: bucket_name, key: path) unless local_only_config_key?(params[:bucket], path)
       OpenC3::Logger.info("Deleted: #{bucket_name}/#{path}", scope: params[:scope], user: username())
       return true
     else
@@ -683,8 +811,10 @@ class StorageController < ApplicationController
     bucket_name = ENV.fetch(params[:bucket]) { |name| raise StorageError, "Unknown bucket #{name}" }
 
     path = sanitize_path(params[:object_id])
+    # Evaluate the overlay check on the canonical (un-slashed) path before appending
+    # the trailing slash, since the helper rejects trailing slashes.
+    overlay_write = non_admin_config_overlay_write?(params[:bucket], path)
     path = "#{path}/" unless path.end_with?('/')
-    key_split = path.split('/')
 
     # Check scope-based RBAC
     if bucket_requires_rbac?(params[:bucket]) && !authorize_bucket_path(params[:bucket], path, permission: 'system_set')
@@ -693,15 +823,26 @@ class StorageController < ApplicationController
       return false
     end
 
-    # Require admin for most bucket directories
-    unless (params[:bucket] == 'OPENC3_CONFIG_BUCKET' && (key_split[1] == 'targets_modified' || key_split[1] == 'tmp'))
-      return false unless authorization('admin')
-    end
+    # Non-admins may only touch the user-writable config overlay (targets_modified or
+    # tmp), never the cmd_tlm overlay which is evaluated as code. Everything else is admin.
+    return false unless overlay_write || authorization('admin')
 
     # List all objects under the prefix (same pattern as TargetModel#undeploy)
     bucket = OpenC3::Bucket.getClient()
     objects = bucket.list_objects(bucket: bucket_name, prefix: path)
-    keys = objects.map(&:key)
+    keys = objects.map(&:key).reject { |key| local_only_config_key?(params[:bucket], key) }
+    if params[:bucket] == 'OPENC3_CONFIG_BUCKET' && !OpenC3::LocalMode.local_only_targets.empty?
+      # Local only target files live only in the local mode volume. Only look at an
+      # existing directory so this never creates directories for arbitrary paths.
+      local_dir = OpenC3::LocalMode.key_path(path.chomp('/'))
+      if local_dir && File.directory?(local_dir)
+        Dir.glob("#{local_dir}/**/*").each do |filename|
+          next if File.directory?(filename)
+          key = "#{path}#{filename[(local_dir.length + 1)..]}"
+          keys << key if OpenC3::LocalMode.local_only_key?(key)
+        end
+      end
+    end
 
     if keys.empty?
       render json: { deleted_count: 0 }
@@ -711,12 +852,15 @@ class StorageController < ApplicationController
     # Delete in batches of 1000 (S3 limit)
     deleted_count = 0
     keys.each_slice(1000) do |key_batch|
-      bucket.delete_objects(bucket: bucket_name, keys: key_batch)
+      remote_keys = key_batch.reject { |key| local_only_config_key?(params[:bucket], key) }
+      bucket.delete_objects(bucket: bucket_name, keys: remote_keys) unless remote_keys.empty?
       deleted_count += key_batch.length
 
       # Handle local mode
-      if ENV.fetch('OPENC3_LOCAL_MODE', false)
-        key_batch.each { |key| OpenC3::LocalMode.delete_local(key) }
+      key_batch.each do |key|
+        if ENV.fetch('OPENC3_LOCAL_MODE', false) || local_only_config_key?(params[:bucket], key)
+          OpenC3::LocalMode.delete_local(key)
+        end
       end
     end
 
@@ -752,6 +896,19 @@ class StorageController < ApplicationController
 
   # Validates and returns storage source information
   # @return [Array<Symbol, String>] Storage type (:volume or :bucket) and storage name
+  # Accepts a time param as nsec-from-epoch integer, an ISO8601 string, or nil.
+  # Returns a Ruby Time (UTC) or nil.
+  def parse_repair_time(value)
+    return nil if value.nil? || value.to_s.empty?
+    s = value.to_s
+    if s.match?(/\A\d+\z/)
+      # Raw logs use nsec-from-epoch throughout the codebase; use that.
+      Time.from_nsec_from_epoch(s.to_i)
+    else
+      Time.parse(s).utc
+    end
+  end
+
   def validate_storage_source
     if params[:volume]
       volume = ENV.fetch(params[:volume]) { |name| raise StorageError, "Unknown volume #{name}" }
@@ -786,7 +943,12 @@ class StorageController < ApplicationController
       key = sanitize_path(key)
       temp_file = File.join(tmp_dir, filename)
       begin
-        bucket.get_object(bucket: bucket_name, key: key, path: temp_file)
+        if local_only_config_key?(params[:bucket], key)
+          temp_file = OpenC3::LocalMode.key_path(key)
+          next unless temp_file && File.file?(temp_file)
+        else
+          bucket.get_object(bucket: bucket_name, key: key, path: temp_file)
+        end
         zipfile.add(filename, temp_file)
       rescue => e
         OpenC3::Logger.warn("Failed to download #{key}: #{e.message}", user: username())
