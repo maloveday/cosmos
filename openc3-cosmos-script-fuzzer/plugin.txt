@@ -1,8 +1,18 @@
 VARIABLE fuzzer_job_queue openc3-script-fuzzer:jobs
+VARIABLE fuzzer_allowed_roots /tmp/openc3-script-fuzzer/procedures
+VARIABLE fuzzer_allow_script_text 0
 
 # Headless Script Runner fuzzer. Jobs are JSON documents pushed onto the
 # Redis list <%= fuzzer_job_queue %>; HTML reports are stored under
 # openc3-script-fuzzer:report:<job_id>.
+#
+# Security: jobs may only reference procedures inside FUZZER_ALLOWED_ROOTS.
+# If the FUZZER_JOB_SECRET secret exists, every job must carry a valid
+# HMAC-SHA256 "signature"; raw script_text additionally requires
+# FUZZER_ALLOW_SCRIPT_TEXT=1.
 MICROSERVICE FUZZER script-fuzzer
   CMD python fuzzer_microservice.py
   ENV FUZZER_JOB_QUEUE <%= fuzzer_job_queue %>
+  ENV FUZZER_ALLOWED_ROOTS <%= fuzzer_allowed_roots %>
+  ENV FUZZER_ALLOW_SCRIPT_TEXT <%= fuzzer_allow_script_text %>
+  SECRET ENV FUZZER_JOB_SECRET FUZZER_JOB_SECRET

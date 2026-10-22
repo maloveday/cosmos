@@ -6,6 +6,7 @@ SPDX-License-Identifier: MIT
 from __future__ import annotations
 
 import os
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Any, Dict
 
@@ -94,6 +95,8 @@ svg .area{fill:rgba(151,189,97,.25)}svg .l1{stroke:#5a8f29;fill:none;stroke-widt
 <tr><th>Elapsed Time:</th><td>{{ elapsed }}</td></tr>
 <tr><th>Telemetry Backend:</th><td>{{ backend }}</td></tr>
 <tr><th>Conclusion:</th><td>{{ conclusion }}</td></tr>
+{% if aborted %}<tr><th>Aborted:</th><td class="fail">{{ aborted }}</td></tr>{% endif %}
+<tr><th>Input corpus:</th><td>{{ corpus_size }} coverage-increasing input trace(s) retained</td></tr>
 <tr><th>Configuration:</th><td>{% for k, v in config.items() if k != 'script_path' %}<code>{{ k }}={{ v }}</code>{{ ', ' if not loop.last }}{% endfor %}</td></tr>
 </table>
 </section>
@@ -157,9 +160,10 @@ svg .area{fill:rgba(151,189,97,.25)}svg .l1{stroke:#5a8f29;fill:none;stroke-widt
  <div class="element test {{ t.status }}" id="test-{{ t.iteration }}">
   <div class="element-header" onclick="tog(this)"><span class="tog">+</span><span class="label {{ t.status }}">{{ t.status }}</span><span class="label test">TEST</span>
    <span class="name">{{ t.name }}</span>
-   <span class="el">strategy={{ t.strategy }} · steps={{ t.steps|length }} · +{{ t.coverage.new_lines }} lines / +{{ t.coverage.new_arcs }} arcs · line {{ t.coverage.line_pct }}% · branch {{ t.coverage.branch_pct }}% · {{ t.elapsed_fmt }}</span></div>
+   <span class="el">strategy={{ t.strategy }} · {{ t.origin }} · steps={{ t.steps|length }} · +{{ t.coverage.new_lines }} lines / +{{ t.coverage.new_arcs }} arcs · line {{ t.coverage.line_pct }}% · branch {{ t.coverage.branch_pct }}% · {{ t.elapsed_fmt }}</span></div>
   <div class="children">
    <table class="info"><tr><th>Start / End</th><td>{{ t.start }} → {{ t.end }}</td></tr>
+   <tr><th>Inputs</th><td>{{ t.origin }} · {{ t.decisions }} decisions, {{ t.reused }} replayed from corpus</td></tr>
    {% if t.event %}<tr><th>Event</th><td><span class="label evt">{{ t.event }}</span></td></tr>{% endif %}
    {% if t.message %}<tr><th>Message</th><td class="fail">{{ t.message }}</td></tr>{% endif %}
    <tr><th>Coverage after run</th><td>{{ t.coverage.total_lines }} lines, {{ t.coverage.total_arcs }} arcs cumulative; stale counter {{ t.coverage.stale_count }}</td></tr></table>
@@ -229,6 +233,7 @@ def render_report(result: Dict[str, Any]) -> str:
         generated=datetime.now().strftime("%Y%m%d %H:%M:%S"),
         started=result["started"], finished=result["finished"], elapsed=_fmt_elapsed(result["elapsed"]),
         backend=result.get("backend", ""), conclusion=result.get("conclusion", ""), config=result.get("config", {}),
+        aborted=result.get("aborted"), corpus_size=result.get("corpus_size", 0),
         summary=result["summary"], coverage=cov, progression=result["progression"], events=result["events"],
         stale_interruptions=result["stale_interruptions"], concluded_early=result["concluded_early"],
         chart=_chart(result["progression"], result["events"]), tests=result["tests"],
@@ -241,4 +246,36 @@ def write_report(result: Dict[str, Any], output_path: str) -> str:
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     with open(out, "w", encoding="utf-8") as fh:
         fh.write(html)
+    return out
+
+
+def write_junit(result: Dict[str, Any], output_path: str) -> str:
+    """JUnit XML (one <testcase> per fuzz iteration) for CI test dashboards."""
+    name = os.path.basename(result["script"])
+    s = result["summary"]
+    suites = ET.Element("testsuites", name="openc3-cosmos-script-fuzzer", tests=str(s["total"]),
+                        failures=str(s["failed"]), errors="1" if result.get("aborted") else "0",
+                        time=f"{result['elapsed']:.3f}")
+    suite = ET.SubElement(suites, "testsuite", name=name, tests=str(s["total"]), failures=str(s["failed"]),
+                          errors="1" if result.get("aborted") else "0", skipped="0",
+                          time=f"{result['elapsed']:.3f}", timestamp=result["started"])
+    props = ET.SubElement(suite, "properties")
+    for k, v in (("line_pct", result["coverage"]["line_pct"]), ("branch_pct", result["coverage"]["branch_pct"]),
+                 ("stale_interruptions", result["stale_interruptions"]), ("conclusion", result["conclusion"])):
+        ET.SubElement(props, "property", name=k, value=str(v))
+    for t in result["tests"]:
+        case = ET.SubElement(suite, "testcase", classname=name.rsplit(".", 1)[0], name=t["name"],
+                             time=f"{t['elapsed']:.3f}")
+        if t["status"] == "FAIL":
+            tag = "error" if t.get("event") == "INFRASTRUCTURE_ERROR" else "failure"
+            el = ET.SubElement(case, tag, message=t["message"][:500], type=t.get("event") or "ProcedureFailure")
+            el.text = t.get("traceback") or t["message"]
+        out_lines = [f"strategy={t['strategy']} origin={t.get('origin', 'fresh')}"]
+        out_lines += [f"{st['timestamp']} {st['status']:4} {st['keyword']} {st['args']} -> {st['result']}"
+                      for st in t["steps"]]
+        ET.SubElement(case, "system-out").text = "\n".join(out_lines)
+    out = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    ET.indent(suites)
+    ET.ElementTree(suites).write(out, encoding="utf-8", xml_declaration=True)
     return out

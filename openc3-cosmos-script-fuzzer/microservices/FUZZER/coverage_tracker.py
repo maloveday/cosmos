@@ -28,6 +28,8 @@ from typing import Any, Dict, Optional, Set, Tuple
 
 import coverage
 
+_real_sleep = time.sleep  # procedures may get a simulated time.sleep; the watchdog never does
+
 STALE_EXECUTION_TIMEOUT = "STALE_EXECUTION_TIMEOUT"
 PROCEDURE_TIMEOUT = "PROCEDURE_TIMEOUT"
 
@@ -164,6 +166,24 @@ class CoverageTracker:
         }
 
 
+    def write_cobertura(self, output_path: str) -> str:
+        """Write a Cobertura XML coverage report (for CI dashboards)."""
+        was_running = self._running
+        self.stop()
+        out = os.path.abspath(output_path)
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        try:
+            self._cov.xml_report(outfile=out, include=[os.path.abspath(self.script_path)])
+        except coverage.exceptions.NoDataError:
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write('<?xml version="1.0" ?>\n<coverage line-rate="0" branch-rate="0" '
+                         'version="' + coverage.__version__ + '"><packages/></coverage>\n')
+        finally:
+            if was_running:
+                self.start()
+        return out
+
+
 # --------------------------------------------------------------------------- #
 class ProgressWatchdog:
     """Detects stalled loops inside a single procedure execution."""
@@ -213,7 +233,7 @@ class ProgressWatchdog:
 
     def _watch(self) -> None:
         while True:
-            time.sleep(0.05)
+            _real_sleep(0.05)
             with self._lock:
                 if not self._armed:
                     return

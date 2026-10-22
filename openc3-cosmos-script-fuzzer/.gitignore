@@ -1,0 +1,10 @@
+# Generated fuzzer outputs
+*.html
+*.xml
+*.json
+!package.json
+.coverage
+.coverage.*
+.pytest_cache/
+__pycache__/
+*.gem

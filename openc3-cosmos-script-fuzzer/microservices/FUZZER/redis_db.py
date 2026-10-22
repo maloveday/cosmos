@@ -11,6 +11,12 @@ Key schema:  tm:<TARGET>:<PACKET>:<ITEM>   (Redis HASH)
     max_value         numeric upper bound   (NUMERIC only)
     calibration_list  JSON array of states  (CALIBRATION only)
 
+Optional command schema:  tc:<TARGET>:<COMMAND>   (Redis HASH)
+
+    success_rate      probability in [0, 1] that the command returns SUCCESS
+                      (default 0.75 when the key or field is absent)
+    description       Free-text description
+
 SPDX-License-Identifier: MIT
 """
 from __future__ import annotations
@@ -32,6 +38,8 @@ VALID_TYPES = {"INT", "UINT", "FLOAT", "STRING"}
 VALID_SUBTYPES = {"NUMERIC", "CALIBRATION"}
 STRATEGIES = ("uniform", "boundary", "edge_heavy")
 KEY_PREFIX = "tm"
+CMD_PREFIX = "tc"
+DEFAULT_SUCCESS_RATE = 0.75
 
 
 class TelemetryDBError(Exception):
@@ -143,6 +151,10 @@ class RedisTelemetryDB:
     def key(target: str, packet: str, item: str) -> str:
         return f"{KEY_PREFIX}:{target.upper()}:{packet.upper()}:{item.upper()}"
 
+    @staticmethod
+    def cmd_key(target: str, command: str) -> str:
+        return f"{CMD_PREFIX}:{target.upper()}:{command.upper()}"
+
     def ping(self) -> bool:
         try:
             return bool(self.client.ping())
@@ -155,8 +167,10 @@ class RedisTelemetryDB:
         except TelemetryDBError:
             raise
         except Exception as exc:
-            if redis is not None and isinstance(exc, (redis.exceptions.ConnectionError,
-                                                      redis.exceptions.TimeoutError)):
+            conn_errors: tuple = (ConnectionError, TimeoutError)
+            if redis is not None:
+                conn_errors += (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)
+            if isinstance(exc, conn_errors):
                 raise RedisUnavailableError(f"Redis error ({self.description}): {exc}") from exc
             raise
 
@@ -178,8 +192,18 @@ class RedisTelemetryDB:
         self._call(self.client.hset, k, mapping=mapping)
         return k
 
+    def put_command(self, target: str, command: str, success_rate: float, description: str = "") -> str:
+        if not 0.0 <= float(success_rate) <= 1.0:
+            raise TelemetryDefinitionError(f"success_rate must be within [0, 1], got {success_rate}")
+        k = self.cmd_key(target, command)
+        self._call(self.client.hset, k, mapping={"success_rate": float(success_rate), "description": description})
+        return k
+
     def seed_demo(self) -> int:
-        """Load a representative INST telemetry dictionary."""
+        """Load a representative INST telemetry dictionary (plus a few command rates)."""
+        self.put_command("INST", "SAFE", 0.95, "Safing is highly reliable")
+        self.put_command("INST", "COLLECT", 0.75, "Nominal collect")
+        self.put_command("INST", "POWER_ON", 0.6, "Power-on sometimes needs retries")
         defs = [
             ("INST", "HEALTH_STATUS", "TEMP1", "FLOAT", "NUMERIC", "Temperature #1 (C)", -100.0, 100.0, None),
             ("INST", "HEALTH_STATUS", "TEMP2", "FLOAT", "NUMERIC", "Temperature #2 (C)", -100.0, 100.0, None),
@@ -288,14 +312,33 @@ class RedisTelemetryDB:
                 value = min(max(value, lo), hi)  # guarantee closed interval despite FP rounding
         return str(value) if ty == "STRING" else value
 
-    @staticmethod
-    def send_command(target: str, command_name: str, params: Optional[Dict[str, Any]] = None,
-                     rng: Optional[random.Random] = None) -> Dict[str, Any]:
-        """Simulate command processing: SUCCESS 75 %, FAILURE 25 %."""
+    def get_command_success_rate(self, target: str, command_name: str,
+                                 default: float = DEFAULT_SUCCESS_RATE) -> float:
+        """Success probability from tc:<TARGET>:<COMMAND>.success_rate, else `default`."""
+        raw = self._call(self.client.hgetall, self.cmd_key(target, command_name))
+        if not raw or raw.get("success_rate") in (None, ""):
+            return float(default)
+        try:
+            rate = float(raw["success_rate"])
+        except ValueError:
+            raise TelemetryDefinitionError(
+                f"{self.cmd_key(target, command_name)}: success_rate is not numeric") from None
+        if not 0.0 <= rate <= 1.0:
+            raise TelemetryDefinitionError(
+                f"{self.cmd_key(target, command_name)}: success_rate {rate} outside [0, 1]")
+        return rate
+
+    def send_command(self, target: str, command_name: str, params: Optional[Dict[str, Any]] = None,
+                     rng: Optional[random.Random] = None, success_rate: Optional[float] = None,
+                     default_success_rate: float = DEFAULT_SUCCESS_RATE) -> Dict[str, Any]:
+        """Simulate command processing. Default SUCCESS 75 % / FAILURE 25 % via random.choices();
+        overridden per command by tc:<TARGET>:<COMMAND>.success_rate."""
+        rate = self.get_command_success_rate(target, command_name, default_success_rate) \
+            if success_rate is None else float(success_rate)
         chooser = rng.choices if rng is not None else random.choices
-        status = chooser(["SUCCESS", "FAILURE"], weights=[75, 25], k=1)[0]
+        status = chooser(["SUCCESS", "FAILURE"], weights=[rate, 1.0 - rate], k=1)[0]
         return {"status": status, "target": target.upper(), "command": command_name.upper(),
-                "params": dict(params or {}),
+                "params": dict(params or {}), "success_rate": rate,
                 "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds")}
 
     @staticmethod

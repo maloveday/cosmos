@@ -1,0 +1,60 @@
+name: Script Fuzzer Plugin
+
+on:
+  push:
+    paths:
+      - "openc3-cosmos-script-fuzzer/**"
+      - ".github/workflows/script-fuzzer.yml"
+  pull_request:
+    paths:
+      - "openc3-cosmos-script-fuzzer/**"
+      - ".github/workflows/script-fuzzer.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    defaults:
+      run:
+        working-directory: openc3-cosmos-script-fuzzer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: openc3-cosmos-script-fuzzer/requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Unit tests
+        env:
+          FUZZER_TEST_REDIS: localhost:6379
+        run: pytest tests -q --junitxml=test-results.xml
+      - name: Fuzz sample procedure against live Redis
+        run: |
+          python microservices/FUZZER/fuzzer_cli.py --script examples/sample_test.py \
+            --redis-host localhost --redis-port 6379 --seed-demo --seed 1 --iterations 60 \
+            --output fuzz-report.html --junit-xml fuzz-junit.xml --cobertura-xml fuzz-coverage.xml \
+            || [ $? -eq 1 ]   # exit 1 = procedure failures found (expected for the sample); 2 = real error
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: script-fuzzer-reports-py${{ matrix.python-version }}
+          path: |
+            openc3-cosmos-script-fuzzer/test-results.xml
+            openc3-cosmos-script-fuzzer/fuzz-report.html
+            openc3-cosmos-script-fuzzer/fuzz-junit.xml
+            openc3-cosmos-script-fuzzer/fuzz-coverage.xml
